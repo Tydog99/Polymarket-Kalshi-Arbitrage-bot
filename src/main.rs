@@ -34,6 +34,7 @@ mod position_tracker;
 mod types;
 
 use anyhow::{Context, Result};
+use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -329,29 +330,37 @@ async fn main() -> Result<()> {
                 }
             }
 
-            info!("💓 System heartbeat | Markets: {} total, {} with Kalshi prices, {} with Polymarket prices, {} with both | threshold={}¢",
-                  market_count, with_kalshi, with_poly, with_both, heartbeat_threshold);
+            let now = chrono::Local::now().format("%H:%M:%S");
+            print!("\r[{}] 💓 {} markets | K:{} P:{} Both:{} | threshold={}¢    ",
+                   now, market_count, with_kalshi, with_poly, with_both, heartbeat_threshold);
+            let _ = std::io::stdout().flush();
 
             if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes)) = best_arb {
                 let gap = cost as i16 - heartbeat_threshold as i16;
-                let desc = heartbeat_state.get_by_id(market_id)
-                    .and_then(|m| m.pair.as_ref())
-                    .map(|p| &*p.description)
-                    .unwrap_or("Unknown");
+                let pair = heartbeat_state.get_by_id(market_id)
+                    .and_then(|m| m.pair.as_ref());
+                let desc = pair
+                    .map(|p| {
+                        if let Some(line) = p.line_value {
+                            format!("{} ({})", p.description, line)
+                        } else {
+                            p.description.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "Unknown".to_string());
                 let leg_breakdown = if is_poly_yes {
                     format!("P_yes({}¢) + K_no({}¢) + K_fee({}¢) = {}¢", p_yes, k_no, fee, cost)
                 } else {
                     format!("K_yes({}¢) + P_no({}¢) + K_fee({}¢) = {}¢", k_yes, p_no, fee, cost)
                 };
-                if gap <= 10 {
-                    info!("   📊 Best opportunity: {} | {} | gap={:+}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
+                if gap < 0 {
+                    println!();  // Move to new line before logging opportunity
+                    info!("📊 Best opportunity: {} | {} | gap={:+}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
                           desc, leg_breakdown, gap, p_yes, k_no, k_yes, p_no);
-                } else {
-                    info!("   📊 Best opportunity: {} | {} | gap={:+}¢ (market efficient)",
-                          desc, leg_breakdown, gap);
                 }
             } else if with_both == 0 {
-                warn!("   ⚠️  No markets with both Kalshi and Polymarket prices - verify WebSocket connections");
+                println!();  // Move to new line before warning
+                warn!("⚠️  No markets with both Kalshi and Polymarket prices - verify WebSocket connections");
             }
         }
     });
