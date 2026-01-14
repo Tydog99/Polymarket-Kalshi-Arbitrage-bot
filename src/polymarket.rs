@@ -8,7 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
@@ -187,6 +187,7 @@ pub async fn run_ws(
     state: Arc<GlobalState>,
     exec_tx: mpsc::Sender<FastExecutionRequest>,
     threshold_cents: PriceCents,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let tokens: Vec<String> = state.markets.iter()
         .take(state.market_count())
@@ -223,6 +224,16 @@ pub async fn run_ws(
 
     loop {
         tokio::select! {
+            biased;
+
+            // Check shutdown signal first
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("[POLY] Shutdown signal received, disconnecting...");
+                    break;
+                }
+            }
+
             _ = ping_interval.tick() => {
                 if let Err(e) = write.send(Message::Ping(vec![])).await {
                     error!("[POLY] Failed to send ping: {}", e);
