@@ -359,12 +359,11 @@ async fn process_price_change(
         let market = &state.markets[market_id as usize];
         let (current_yes, _, current_yes_size, _) = market.poly.load();
 
-        // Only update if new price is better (lower)
-        if price < current_yes || current_yes == 0 {
-            // Keep existing size - it may be stale but FAK orders handle partial fills.
-            // Size is an upper bound anyway; better to attempt arb than miss it.
-            market.poly.update_yes(price, current_yes_size);
+        // Always update cached price to reflect current market state
+        market.poly.update_yes(price, current_yes_size);
 
+        // Only check arbs when price improves (lower = better for buying)
+        if price < current_yes || current_yes == 0 {
             let arb_mask = market.check_arbs(threshold_cents);
             if arb_mask != 0 {
                 send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
@@ -376,9 +375,11 @@ async fn process_price_change(
         let market = &state.markets[market_id as usize];
         let (_, current_no, _, current_no_size) = market.poly.load();
 
-        if price < current_no || current_no == 0 {
-            market.poly.update_no(price, current_no_size);
+        // Always update cached price to reflect current market state
+        market.poly.update_no(price, current_no_size);
 
+        // Only check arbs when price improves (lower = better for buying)
+        if price < current_no || current_no == 0 {
             let arb_mask = market.check_arbs(threshold_cents);
             if arb_mask != 0 {
                 send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;

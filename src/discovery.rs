@@ -348,6 +348,11 @@ impl DiscoveryClient {
         }
         let events = self.kalshi.get_events(series, 50).await?;
 
+        if events.is_empty() {
+            return Ok(vec![]);
+        }
+        info!("  📡 {} {}: {} events from Kalshi", config.league_code, market_type, events.len());
+
         // PHASE 2: Parallel market fetching 
         let kalshi = self.kalshi.clone();
         let limiter = self.kalshi_limiter.clone();
@@ -388,6 +393,7 @@ impl DiscoveryClient {
 
         // Collect all (event, market) pairs
         let mut event_markets = Vec::with_capacity(market_results.len() * 3);
+        let mut cached_count = 0usize;
         for (parsed, event, markets_result) in market_results {
             match markets_result {
                 Ok(markets) => {
@@ -395,6 +401,7 @@ impl DiscoveryClient {
                         // Skip if already in cache
                         if let Some(c) = cache {
                             if c.has_ticker(&market.ticker) {
+                                cached_count += 1;
                                 continue;
                             }
                         }
@@ -406,7 +413,17 @@ impl DiscoveryClient {
                 }
             }
         }
-        
+
+        if event_markets.is_empty() {
+            if cached_count > 0 {
+                info!("  ✅ {} {}: {} markets (all cached)", config.league_code, market_type, cached_count);
+            }
+            return Ok(vec![]);
+        }
+        info!("  🔎 {} {}: looking up {} new markets on Polymarket{}",
+              config.league_code, market_type, event_markets.len(),
+              if cached_count > 0 { format!(" ({} cached)", cached_count) } else { String::new() });
+
         // Parallel Gamma lookups with semaphore
         let lookup_futures: Vec<_> = event_markets
             .into_iter()
@@ -459,7 +476,11 @@ impl DiscoveryClient {
             .filter_map(|x| async { x })
             .collect()
             .await;
-        
+
+        if !pairs.is_empty() {
+            info!("  ✅ {} {}: matched {} pairs", config.league_code, market_type, pairs.len());
+        }
+
         Ok(pairs)
     }
     
