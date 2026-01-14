@@ -306,6 +306,8 @@ cargo bench
 
 ### 🚧 Future Enhancements
 
+- [ ] **Runtime market discovery** - Periodic scanning for new markets without restart (design complete, see `docs/plans/2026-01-13-runtime-market-discovery-design.md`)
+  - *Design note: Uses WebSocket reconnect approach rather than dynamic subscriptions for simplicity. Brief monitoring gap (~2-5s) during reconnect is acceptable trade-off.*
 - [ ] Risk limit configuration UI
 - [ ] Multi-account support
 - [ ] Advanced order routing strategies
