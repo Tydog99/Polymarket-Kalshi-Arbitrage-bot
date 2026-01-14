@@ -4,14 +4,14 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use rsa::{
     pkcs1::DecodeRsaPrivateKey,
-    pkcs1v15::{SigningKey, VerifyingKey},
-    signature::{RandomizedSigner, SignatureEncoding, Verifier},
-    RsaPrivateKey, RsaPublicKey,
+    pkcs1v15::SigningKey,
+    signature::{RandomizedSigner, SignatureEncoding},
+    RsaPrivateKey,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, warn};
+use tracing::debug;
 
 const KALSHI_API_BASE: &str = "https://trading-api.kalshi.com/trade-api/v2";
 const ORDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -63,6 +63,7 @@ pub struct KalshiOrderResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Response shape includes fields we may not read yet
 pub struct KalshiOrder {
     pub order_id: String,
     pub ticker: String,

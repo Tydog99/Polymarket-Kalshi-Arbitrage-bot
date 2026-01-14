@@ -2,9 +2,8 @@
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 use url::Url;
 
@@ -86,7 +85,7 @@ impl WebSocketClient {
                         info!("[WS] Connection closed by server");
                         break;
                     }
-                    Ok(Message::Ping(data)) => {
+                    Ok(Message::Ping(_)) => {
                         // Handle ping (tungstenite handles pong automatically)
                         info!("[WS] Received ping");
                     }
@@ -111,6 +110,7 @@ impl WebSocketClient {
     }
 
     /// Reconnect to the WebSocket server
+    #[allow(dead_code)] // Convenience API; current main loop reconnects externally
     pub async fn reconnect(&mut self) -> Result<()> {
         warn!("[WS] Attempting to reconnect...");
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;

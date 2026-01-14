@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
                                         connection_healthy = false;
                                     }
                                 }
-                                Some(IncomingMessage::Pong { timestamp }) => {
+                                Some(IncomingMessage::Pong { timestamp: _ }) => {
                                     // Host responded to our ping
                                     heartbeat.record_pong();
                                 }

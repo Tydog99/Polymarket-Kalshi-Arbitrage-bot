@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::api::kalshi::{KalshiApiClient, KalshiConfig};
 use crate::config::Config;

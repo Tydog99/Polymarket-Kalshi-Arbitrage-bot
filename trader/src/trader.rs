@@ -1,9 +1,8 @@
 //! Main trader logic and state machine
 
-use anyhow::Result;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::execution::{create_engines, ExecutionEngine, OrderRequest};
@@ -185,6 +184,13 @@ impl Trader {
                     poly_no_token,
                 };
 
+                // Touch optional metadata (keeps warnings clean and helps debugging)
+                debug!(
+                    "[TRADER] Execute metadata: pair_id={:?}, description={:?}",
+                    request.pair_id.as_deref(),
+                    request.description.as_deref()
+                );
+
                 // Determine which engine(s) to use based on arb_type
                 let relevant_engines: Vec<&Box<dyn ExecutionEngine>> = engines
                     .iter()
@@ -218,6 +224,19 @@ impl Trader {
                 // For cross-platform arbs, we need to coordinate execution
                 let mut results = Vec::new();
                 for engine in relevant_engines {
+                    // Optional pre-flight checks (circuit breaker / rate limits / etc.)
+                    let est_size = (request.yes_size.min(request.no_size) / 100) as i64;
+                    if let Err(e) = engine.can_execute(request.market_id, est_size).await {
+                        warn!("[TRADER] Engine pre-check failed: {}", e);
+                        return OutgoingMessage::ExecutionResult {
+                            market_id,
+                            success: false,
+                            profit_cents: 0,
+                            latency_ns: detected_ns,
+                            error: Some(e.to_string()),
+                        };
+                    }
+
                     match engine.execute_order(&request, *dry_run).await {
                         Ok(result) => results.push(result),
                         Err(e) => {
@@ -287,6 +306,7 @@ impl Trader {
     }
 
     /// Get current state
+    #[allow(dead_code)] // Used by some integrations/tests
     pub fn state(&self) -> &TraderState {
         &self.state
     }

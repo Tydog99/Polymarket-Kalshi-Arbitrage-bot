@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::api::polymarket::{PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
 use crate::config::Config;
@@ -96,8 +96,8 @@ impl PolymarketEngine {
         };
 
         info!(
-            "[POLY] Order executed: {} filled, cost={:.4}",
-            fill.filled_size, fill.fill_cost
+            "[POLY] Order executed: id={}, filled={}, cost={:.4}",
+            fill.order_id, fill.filled_size, fill.fill_cost
         );
 
         Ok((fill.filled_size, fill.fill_cost))

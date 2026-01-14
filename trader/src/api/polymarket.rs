@@ -1,20 +1,13 @@
 //! Polymarket API client implementation
 
 use anyhow::{Context, Result};
-use ethers::{
-    core::k256::ecdsa::SigningKey,
-    signers::{LocalWallet, Signer, Wallet},
-    types::{Address, H160, U256},
-    utils::keccak256,
-};
-use serde::{Deserialize, Serialize};
+use ethers::signers::{LocalWallet, Signer};
+use ethers::types::Address;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::RwLock;
-use tracing::{debug, error, warn};
-
-const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
-const POLYGON_CHAIN_ID: u64 = 137;
+use tracing::{debug, warn};
 
 /// Polymarket fill result
 #[derive(Debug, Clone)]
@@ -27,6 +20,7 @@ pub struct PolyFillAsync {
 /// Prepared credentials for Polymarket API
 pub struct PreparedCreds {
     pub api_key: String,
+    #[allow(dead_code)] // Stored for future request signing
     pub api_secret: String,
 }
 
@@ -44,9 +38,13 @@ impl PreparedCreds {
 pub struct PolymarketAsyncClient {
     http: reqwest::Client,
     host: String,
+    #[allow(dead_code)] // Stored for future request signing
     wallet: LocalWallet,
+    #[allow(dead_code)] // Stored for future request signing
     wallet_address: Address,
+    #[allow(dead_code)] // Stored for future request signing
     funder: String,
+    #[allow(dead_code)] // Stored for future request signing
     chain_id: u64,
 }
 
@@ -85,9 +83,9 @@ impl PolymarketAsyncClient {
     /// Build L2 headers for authenticated requests
     fn build_l2_headers(
         &self,
-        method: &str,
-        path: &str,
-        body: Option<&str>,
+        _method: &str,
+        _path: &str,
+        _body: Option<&str>,
         creds: &PreparedCreds,
     ) -> Result<reqwest::header::HeaderMap> {
         use reqwest::header::{HeaderMap, HeaderValue};
@@ -176,6 +174,7 @@ pub struct PolymarketOrderResponse {
 pub struct SharedAsyncClient {
     inner: std::sync::Arc<PolymarketAsyncClient>,
     creds: PreparedCreds,
+    #[allow(dead_code)] // Stored for future request signing
     chain_id: u64,
     neg_risk_cache: RwLock<HashMap<String, bool>>,
 }
@@ -196,6 +195,7 @@ impl SharedAsyncClient {
     }
 
     /// Load neg_risk cache from JSON file
+    #[allow(dead_code)] // Optional optimization hook (used by some deployments)
     pub fn load_cache(&self, path: &str) -> Result<usize> {
         match std::fs::read_to_string(path) {
             Ok(data) => {
@@ -295,7 +295,7 @@ impl SharedAsyncClient {
 
         debug!(
             "[POLY-ASYNC] FAK {} {}: status={}, filled={:.2}/{:.2}, price={:.4}",
-            side, order_id, order_info.status, filled_size, size, order_price
+            side, order_info.order_id, order_info.status, filled_size, size, order_price
         );
 
         Ok(PolyFillAsync {
