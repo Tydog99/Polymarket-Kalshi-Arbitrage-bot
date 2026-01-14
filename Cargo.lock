@@ -494,6 +494,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "245097e9a4535ee1e3e3931fcfcd55a796a44c643e8596ff6566d68f09b87bbc"
 
 [[package]]
+name = "controller"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "arrayvec",
+ "base64 0.22.1",
+ "chrono",
+ "criterion",
+ "dotenvy",
+ "ethers",
+ "futures-util",
+ "governor",
+ "hex",
+ "hmac",
+ "nonzero_ext",
+ "pkcs1",
+ "rand 0.8.5",
+ "reqwest",
+ "rsa",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tiny-keccak",
+ "tokio",
+ "tokio-tungstenite 0.21.0",
+ "tracing",
+ "tracing-subscriber",
+ "wide",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2620,38 +2652,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
-name = "prediction-market-arbitrage"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "arrayvec",
- "base64 0.22.1",
- "chrono",
- "criterion",
- "dotenvy",
- "ethers",
- "futures-util",
- "governor",
- "hex",
- "hmac",
- "nonzero_ext",
- "pkcs1",
- "rand 0.8.5",
- "reqwest",
- "rsa",
- "rustc-hash",
- "serde",
- "serde_json",
- "sha2",
- "tiny-keccak",
- "tokio",
- "tokio-tungstenite 0.21.0",
- "tracing",
- "tracing-subscriber",
- "wide",
-]
-
-[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2889,6 +2889,31 @@ name = "regex-syntax"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
+
+[[package]]
+name = "remote-trader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.21.7",
+ "dotenvy",
+ "ethers",
+ "ethers-core",
+ "futures-util",
+ "rand 0.8.5",
+ "reqwest",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.21.0",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
 
 [[package]]
 name = "reqwest"

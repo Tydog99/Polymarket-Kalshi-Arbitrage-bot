@@ -48,7 +48,8 @@ where
 impl TeamCache {
     /// Load cache from JSON file
     pub fn load() -> Self {
-        Self::load_from(CACHE_FILE)
+        // Cache is shipped with the controller crate, so resolve relative to the crate dir
+        Self::load_from(crate::paths::resolve_controller_asset(CACHE_FILE))
     }
 
     /// Load from specific path
@@ -71,7 +72,7 @@ impl TeamCache {
 
     /// Save cache to JSON file
     pub fn save(&self) -> Result<()> {
-        self.save_to(CACHE_FILE)
+        self.save_to(crate::paths::resolve_controller_asset(CACHE_FILE))
     }
 
     /// Save to specific path

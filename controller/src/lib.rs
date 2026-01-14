@@ -9,6 +9,7 @@ pub mod config;
 pub mod discovery;
 pub mod execution;
 pub mod kalshi;
+pub mod paths;
 pub mod polymarket;
 pub mod polymarket_clob;
 pub mod position_tracker;

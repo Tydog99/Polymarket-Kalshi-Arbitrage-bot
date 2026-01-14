@@ -28,6 +28,7 @@ mod config;
 mod discovery;
 mod execution;
 mod kalshi;
+mod paths;
 mod polymarket;
 mod polymarket_clob;
 mod position_tracker;
@@ -64,6 +65,9 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Load environment variables from `.env` (supports workspace-root `.env`)
+    paths::load_dotenv();
+
     info!("🚀 Prediction Market Arbitrage System v2.0");
     info!("   Profit threshold: <{:.1}¢ ({:.1}% minimum profit)",
           ARB_THRESHOLD * 100.0, (1.0 - ARB_THRESHOLD) * 100.0);
@@ -77,43 +81,19 @@ async fn main() -> Result<()> {
         warn!("   Mode: LIVE EXECUTION");
     }
 
+    // DISCOVERY_ONLY=1 will run market discovery, print results, and exit.
+    // This is useful for validating credentials + cache paths without running websockets/execution.
+    let discovery_only = std::env::var("DISCOVERY_ONLY")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+
     // Load Kalshi credentials
     let kalshi_config = KalshiConfig::from_env()?;
     info!("[KALSHI] API key loaded");
 
-    // Load Polymarket credentials
-    dotenvy::dotenv().ok();
-    let poly_private_key = std::env::var("POLY_PRIVATE_KEY")
-        .context("POLY_PRIVATE_KEY not set")?;
-    let poly_funder = std::env::var("POLY_FUNDER")
-        .context("POLY_FUNDER not set (your wallet address)")?;
-
-    // Create async Polymarket client and derive API credentials
-    info!("[POLYMARKET] Creating async client and deriving API credentials...");
-    let poly_async_client = PolymarketAsyncClient::new(
-        POLY_CLOB_HOST,
-        POLYGON_CHAIN_ID,
-        &poly_private_key,
-        &poly_funder,
-    )?;
-    let api_creds = poly_async_client.derive_api_key(0).await?;
-    let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
-    let poly_async = Arc::new(SharedAsyncClient::new(poly_async_client, prepared_creds, POLYGON_CHAIN_ID));
-
-    // Load neg_risk cache from Python script output
-    match poly_async.load_cache(".clob_market_cache.json") {
-        Ok(count) => info!("[POLYMARKET] Loaded {} neg_risk entries from cache", count),
-        Err(e) => warn!("[POLYMARKET] Could not load neg_risk cache: {}", e),
-    }
-
-    info!("[POLYMARKET] Client ready for {}", &poly_funder[..10]);
-
     // Load team code mapping cache
     let team_cache = TeamCache::load();
     info!("📂 Loaded {} team code mappings", team_cache.len());
-
-    // Create Kalshi API client
-    let kalshi_api = Arc::new(KalshiApiClient::new(kalshi_config));
 
     // Run discovery (with caching support)
     let force_discovery = std::env::var("FORCE_DISCOVERY")
@@ -156,6 +136,41 @@ async fn main() -> Result<()> {
               pair.market_type,
               pair.kalshi_market_ticker);
     }
+
+    if discovery_only {
+        info!("✅ DISCOVERY_ONLY enabled; exiting after discovery.");
+        return Ok(());
+    }
+
+    // Load Polymarket credentials
+    let poly_private_key = std::env::var("POLY_PRIVATE_KEY")
+        .context("POLY_PRIVATE_KEY not set")?;
+    let poly_funder = std::env::var("POLY_FUNDER")
+        .context("POLY_FUNDER not set (your wallet address)")?;
+
+    // Create async Polymarket client and derive API credentials
+    info!("[POLYMARKET] Creating async client and deriving API credentials...");
+    let poly_async_client = PolymarketAsyncClient::new(
+        POLY_CLOB_HOST,
+        POLYGON_CHAIN_ID,
+        &poly_private_key,
+        &poly_funder,
+    )?;
+    let api_creds = poly_async_client.derive_api_key(0).await?;
+    let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
+    let poly_async = Arc::new(SharedAsyncClient::new(poly_async_client, prepared_creds, POLYGON_CHAIN_ID));
+
+    // Load neg_risk cache from Python script output
+    let neg_risk_cache_path = paths::resolve_user_path(".clob_market_cache.json");
+    match poly_async.load_cache(&neg_risk_cache_path.to_string_lossy()) {
+        Ok(count) => info!("[POLYMARKET] Loaded {} neg_risk entries from cache", count),
+        Err(e) => warn!("[POLYMARKET] Could not load neg_risk cache: {}", e),
+    }
+
+    info!("[POLYMARKET] Client ready for {}", &poly_funder[..10]);
+
+    // Create Kalshi API client
+    let kalshi_api = Arc::new(KalshiApiClient::new(kalshi_config));
 
     // Build global state
     let state = Arc::new({
