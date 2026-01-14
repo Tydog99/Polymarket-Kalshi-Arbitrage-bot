@@ -151,9 +151,12 @@ async fn discovery_refresh_task(
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
+    // Note: the binary crate is `controller`, while the shared library crate is `arb_bot`.
+    // If the user doesn't set `RUST_LOG`, we still want `info` logs from both crates.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("controller=info".parse().unwrap())
                 .add_directive("arb_bot=info".parse().unwrap()),
         )
         .init();
