@@ -8,6 +8,10 @@ authors = ["teraus"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/terauss/prediction-market-arbitrage"
 
+[lib]
+name = "arb_bot"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
