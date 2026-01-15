@@ -733,8 +733,9 @@ impl DiscoveryClient {
             }
         };
 
-        // Build lookup: (date:norm_team1:norm_team2) -> (slug, yes_token, no_token)
-        let mut poly_lookup: HashMap<String, (String, String, String)> = HashMap::new();
+        // Build lookup: (date:norm_team1:norm_team2) -> (slug, yes_token, no_token, poly_team1)
+        // poly_team1 is the normalized name of the team that the YES token represents
+        let mut poly_lookup: HashMap<String, (String, String, String, String)> = HashMap::new();
 
         for event in &poly_events {
             let slug = match &event.slug {
@@ -765,10 +766,12 @@ impl DiscoveryClient {
                                 if let Some(tokens) = &market.clob_token_ids {
                                     if let Ok(ids) = serde_json::from_str::<Vec<String>>(tokens) {
                                         if ids.len() >= 2 {
+                                            // Store with both key orderings, but always include poly_team1
+                                            // so we know which team the YES token is for
                                             let key1 = format!("{}:{}:{}", date, norm1, norm2);
                                             let key2 = format!("{}:{}:{}", date, norm2, norm1);
-                                            poly_lookup.insert(key1, (slug.clone(), ids[0].clone(), ids[1].clone()));
-                                            poly_lookup.insert(key2, (slug.clone(), ids[0].clone(), ids[1].clone()));
+                                            poly_lookup.insert(key1, (slug.clone(), ids[0].clone(), ids[1].clone(), norm1.clone()));
+                                            poly_lookup.insert(key2, (slug.clone(), ids[0].clone(), ids[1].clone(), norm1.clone()));
                                         }
                                     }
                                 }
@@ -809,7 +812,7 @@ impl DiscoveryClient {
                     let norm2 = normalize_esports_team(&team2);
                     let key = format!("{}:{}:{}", date, norm1, norm2);
 
-                    if let Some((slug, yes_token, no_token)) = poly_lookup.get(&key) {
+                    if let Some((slug, yes_token, no_token, poly_team1)) = poly_lookup.get(&key) {
                         // Get Kalshi markets for this event
                         let markets = {
                             let _permit = self.kalshi_semaphore.acquire().await.ok();
@@ -820,6 +823,27 @@ impl DiscoveryClient {
                         for market in markets {
                             let team_suffix = extract_team_suffix(&market.ticker);
 
+                            // Determine correct token assignment based on which team this Kalshi market is for
+                            // Polymarket YES token = poly_team1 wins
+                            // Polymarket NO token = poly_team1 loses (other team wins)
+                            //
+                            // If Kalshi market is for poly_team1: use tokens as-is
+                            // If Kalshi market is for the other team: swap tokens
+                            let kalshi_team_norm = team_suffix
+                                .as_ref()
+                                .map(|s| normalize_esports_team(s))
+                                .unwrap_or_default();
+
+                            let (poly_yes, poly_no) = if kalshi_team_norm == *poly_team1 {
+                                // Kalshi "Will Team1 win?" → Poly YES = Team1 wins, Poly NO = Team1 loses
+                                (yes_token.clone(), no_token.clone())
+                            } else {
+                                // Kalshi "Will Team2 win?" → need to swap:
+                                // Poly NO = Team1 loses = Team2 wins (this is our Kalshi YES equivalent)
+                                // Poly YES = Team1 wins = Team2 loses (this is our Kalshi NO equivalent)
+                                (no_token.clone(), yes_token.clone())
+                            };
+
                             pairs.push(MarketPair {
                                 pair_id: format!("{}-{}", slug, market.ticker).into(),
                                 league: config.league_code.into(),
@@ -829,8 +853,8 @@ impl DiscoveryClient {
                                 kalshi_market_ticker: market.ticker.into(),
                                 kalshi_event_slug: config.kalshi_web_slug.into(),
                                 poly_slug: slug.clone().into(),
-                                poly_yes_token: yes_token.clone().into(),
-                                poly_no_token: no_token.clone().into(),
+                                poly_yes_token: poly_yes.into(),
+                                poly_no_token: poly_no.into(),
                                 line_value: market.floor_strike,
                                 team_suffix: team_suffix.map(|s| s.into()),
                             });
