@@ -147,11 +147,14 @@ impl DiscoveryClient {
 
         match cached {
             Some(cache) if !cache.is_expired() => {
-                // Cache is fresh - use it directly
-                info!("📂 Loaded {} pairs from cache (age: {}s)",
-                      cache.pairs.len(), cache.age_secs());
+                // Cache is fresh - filter by enabled leagues and return
+                let age = cache.age_secs();
+                let pairs = filter_pairs_by_leagues(cache.pairs, leagues);
+                info!("📂 Loaded {} pairs from cache (age: {}s){}",
+                      pairs.len(), age,
+                      if !leagues.is_empty() { format!(" [filtered to {:?}]", leagues) } else { String::new() });
                 return DiscoveryResult {
-                    pairs: cache.pairs,
+                    pairs,
                     kalshi_events_found: 0,  // From cache
                     poly_matches: 0,
                     poly_misses: 0,
@@ -847,6 +850,17 @@ impl DiscoveryClient {
 }
 
 // === Helpers ===
+
+/// Filter market pairs by enabled leagues
+/// If leagues is empty, returns all pairs (no filtering)
+fn filter_pairs_by_leagues(pairs: Vec<MarketPair>, leagues: &[&str]) -> Vec<MarketPair> {
+    if leagues.is_empty() {
+        return pairs;
+    }
+    pairs.into_iter()
+        .filter(|p| leagues.iter().any(|l| *l == &*p.league))
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 struct ParsedKalshiTicker {
