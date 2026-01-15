@@ -188,6 +188,34 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: None,
         },
+        // Esports
+        LeagueConfig {
+            league_code: "cs2",
+            poly_prefix: "cs2",
+            kalshi_series_game: "KXCS2GAME",
+            kalshi_series_spread: None,
+            kalshi_series_total: None,
+            kalshi_series_btts: None,
+            poly_series_id: Some("10310"),
+        },
+        LeagueConfig {
+            league_code: "lol",
+            poly_prefix: "lol",
+            kalshi_series_game: "KXLOLGAME",
+            kalshi_series_spread: None,
+            kalshi_series_total: None,
+            kalshi_series_btts: None,
+            poly_series_id: Some("10311"),
+        },
+        LeagueConfig {
+            league_code: "cod",
+            poly_prefix: "codmw",
+            kalshi_series_game: "KXCODGAME",
+            kalshi_series_spread: None,
+            kalshi_series_total: None,
+            kalshi_series_btts: None,
+            poly_series_id: Some("10427"),
+        },
     ]
 }
 
