@@ -41,7 +41,9 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::io::Write;
 use std::sync::Arc;
+use tailscale::beacon::BeaconSender;
 use tokio::sync::{RwLock, watch};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use cache::TeamCache;
@@ -393,6 +395,31 @@ async fn main() -> Result<()> {
                 error!("[REMOTE] server error: {}", e);
             }
         });
+
+        // Start Tailscale beacon sender if Tailscale is available
+        let beacon_cancel = CancellationToken::new();
+        if let Ok(ts_status) = tailscale::verify::verify() {
+            if !ts_status.peers.is_empty() {
+                let ts_config = tailscale::Config::load().unwrap_or_default();
+                info!(
+                    "[BEACON] Starting beacon to {} peers (port {}, ws_port {})",
+                    ts_status.peers.len(),
+                    ts_config.beacon_port,
+                    ts_config.ws_port
+                );
+                let beacon_cancel_clone = beacon_cancel.clone();
+                tokio::spawn(async move {
+                    match BeaconSender::new(ts_status.peers, ts_config.beacon_port, ts_config.ws_port).await {
+                        Ok(sender) => sender.run(beacon_cancel_clone).await,
+                        Err(e) => error!("[BEACON] Failed to create beacon sender: {}", e),
+                    }
+                });
+            } else {
+                info!("[BEACON] No Tailscale peers - beacon disabled");
+            }
+        } else {
+            info!("[BEACON] Tailscale not available - beacon disabled");
+        }
 
         let remote_exec = Arc::new(RemoteExecutor::new(
             state.clone(),
