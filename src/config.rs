@@ -15,6 +15,12 @@ pub const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/
 /// Gamma API base URL (Polymarket market data)
 pub const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 
+/// Kalshi web market URL base (for user-facing links)
+pub const KALSHI_WEB_BASE: &str = "https://kalshi.com/markets";
+
+/// Polymarket web event URL base (for user-facing links)
+pub const POLYMARKET_WEB_BASE: &str = "https://polymarket.com/event";
+
 /// Arb threshold: alert when total cost < this (e.g., 0.995 = 0.5% profit)
 pub const ARB_THRESHOLD: f64 = 0.995;
 
@@ -64,6 +70,8 @@ pub struct LeagueConfig {
     /// Polymarket series ID for event-based discovery (esports).
     /// None for traditional sports that use slug-based matching.
     pub poly_series_id: Option<&'static str>,
+    /// Kalshi web URL slug for this league (e.g., "counterstrike-2-game")
+    pub kalshi_web_slug: &'static str,
 }
 
 /// Get all supported leagues with their configurations
@@ -78,6 +86,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: Some("KXEPLTOTAL"),
             kalshi_series_btts: Some("KXEPLBTTS"),
             poly_series_id: None,
+            kalshi_web_slug: "premier-league-game",
         },
         LeagueConfig {
             league_code: "bundesliga",
@@ -87,6 +96,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: Some("KXBUNDESLIGATOTAL"),
             kalshi_series_btts: Some("KXBUNDESLIGABTTS"),
             poly_series_id: None,
+            kalshi_web_slug: "bundesliga-game",
         },
         LeagueConfig {
             league_code: "laliga",
@@ -96,6 +106,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: Some("KXLALIGATOTAL"),
             kalshi_series_btts: Some("KXLALIGABTTS"),
             poly_series_id: None,
+            kalshi_web_slug: "la-liga-game",
         },
         LeagueConfig {
             league_code: "seriea",
@@ -105,6 +116,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: Some("KXSERIEATOTAL"),
             kalshi_series_btts: Some("KXSERIEABTTS"),
             poly_series_id: None,
+            kalshi_web_slug: "serie-a-game",
         },
         LeagueConfig {
             league_code: "ligue1",
@@ -114,6 +126,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: Some("KXLIGUE1TOTAL"),
             kalshi_series_btts: Some("KXLIGUE1BTTS"),
             poly_series_id: None,
+            kalshi_web_slug: "ligue-1-game",
         },
         LeagueConfig {
             league_code: "ucl",
@@ -123,6 +136,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: Some("KXUCLTOTAL"),
             kalshi_series_btts: Some("KXUCLBTTS"),
             poly_series_id: None,
+            kalshi_web_slug: "champions-league-game",
         },
         // Secondary European leagues (moneyline only)
         LeagueConfig {
@@ -133,6 +147,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: None,
             kalshi_series_btts: None,
             poly_series_id: None,
+            kalshi_web_slug: "europa-league-game",
         },
         LeagueConfig {
             league_code: "eflc",
@@ -142,6 +157,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: None,
             kalshi_series_btts: None,
             poly_series_id: None,
+            kalshi_web_slug: "efl-championship-game",
         },
         // US Sports
         LeagueConfig {
@@ -152,6 +168,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: Some("KXNBATOTAL"),
             kalshi_series_btts: None,
             poly_series_id: None,
+            kalshi_web_slug: "nba-game",
         },
         LeagueConfig {
             league_code: "nfl",
@@ -161,6 +178,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: Some("KXNFLTOTAL"),
             kalshi_series_btts: None,
             poly_series_id: None,
+            kalshi_web_slug: "nfl-game",
         },
         LeagueConfig {
             league_code: "nhl",
@@ -170,6 +188,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: Some("KXNHLTOTAL"),
             kalshi_series_btts: None,
             poly_series_id: None,
+            kalshi_web_slug: "nhl-game",
         },
         LeagueConfig {
             league_code: "mlb",
@@ -179,6 +198,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: Some("KXMLBTOTAL"),
             kalshi_series_btts: None,
             poly_series_id: None,
+            kalshi_web_slug: "mlb-game",
         },
         LeagueConfig {
             league_code: "mls",
@@ -188,6 +208,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: None,
             kalshi_series_btts: None,
             poly_series_id: None,
+            kalshi_web_slug: "mls-game",
         },
         LeagueConfig {
             league_code: "ncaaf",
@@ -197,6 +218,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: Some("KXNCAAFTOTAL"),
             kalshi_series_btts: None,
             poly_series_id: None,
+            kalshi_web_slug: "ncaaf-game",
         },
         // Esports
         LeagueConfig {
@@ -207,6 +229,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: None,
             kalshi_series_btts: None,
             poly_series_id: Some("10310"),
+            kalshi_web_slug: "counterstrike-2-game",
         },
         LeagueConfig {
             league_code: "lol",
@@ -216,6 +239,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: None,
             kalshi_series_btts: None,
             poly_series_id: Some("10311"),
+            kalshi_web_slug: "league-of-legends-game",
         },
         LeagueConfig {
             league_code: "cod",
@@ -225,6 +249,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: None,
             kalshi_series_btts: None,
             poly_series_id: Some("10427"),
+            kalshi_web_slug: "call-of-duty-game",
         },
     ]
 }

@@ -19,6 +19,7 @@ use crate::types::{
 };
 use crate::circuit_breaker::CircuitBreaker;
 use crate::position_tracker::{FillRecord, PositionChannel};
+use crate::config::{KALSHI_WEB_BASE, POLYMARKET_WEB_BASE};
 
 // =============================================================================
 // EXECUTION ENGINE
@@ -177,6 +178,22 @@ impl ExecutionEngine {
             profit_cents,
             max_contracts,
             latency_to_exec / 1000
+        );
+        // Build Kalshi URL: https://kalshi.com/markets/{series}/{slug}/{event_ticker}
+        let kalshi_series = pair.kalshi_event_ticker
+            .split('-')
+            .next()
+            .unwrap_or(&pair.kalshi_event_ticker)
+            .to_lowercase();
+        let kalshi_event_ticker_lower = pair.kalshi_event_ticker.to_lowercase();
+        info!(
+            "[EXEC] 🔗 Kalshi: {}/{}/{}/{} | Polymarket: {}/{}",
+            KALSHI_WEB_BASE,
+            kalshi_series,
+            pair.kalshi_event_slug,
+            kalshi_event_ticker_lower,
+            POLYMARKET_WEB_BASE,
+            pair.poly_slug
         );
 
         if self.dry_run {

@@ -46,6 +46,7 @@ struct GammaLookupTask {
     poly_slug: String,
     market_type: MarketType,
     league: String,
+    kalshi_web_slug: String,
 }
 
 /// Type alias for Kalshi rate limiter
@@ -440,13 +441,14 @@ impl DiscoveryClient {
             .into_iter()
             .map(|(parsed, event, market)| {
                 let poly_slug = self.build_poly_slug(config.poly_prefix, &parsed, market_type, &market);
-                
+
                 GammaLookupTask {
                     event,
                     market,
                     poly_slug,
                     market_type,
                     league: config.league_code.to_string(),
+                    kalshi_web_slug: config.kalshi_web_slug.to_string(),
                 }
             })
             .collect();
@@ -468,6 +470,7 @@ impl DiscoveryClient {
                                 description: format!("{} - {}", task.event.title, task.market.title).into(),
                                 kalshi_event_ticker: task.event.event_ticker.clone().into(),
                                 kalshi_market_ticker: task.market.ticker.into(),
+                                kalshi_event_slug: task.kalshi_web_slug.into(),
                                 poly_slug: task.poly_slug.into(),
                                 poly_yes_token: yes_token.into(),
                                 poly_no_token: no_token.into(),
@@ -700,6 +703,7 @@ impl DiscoveryClient {
             description: format!("{}", market.title).into(),
             kalshi_event_ticker: event_ticker.into(),
             kalshi_market_ticker: market.ticker.clone().into(),
+            kalshi_event_slug: config.kalshi_web_slug.into(),
             poly_slug: poly_slug.into(),
             poly_yes_token: yes_token.into(),
             poly_no_token: no_token.into(),
@@ -823,6 +827,7 @@ impl DiscoveryClient {
                                 description: format!("{} - {}", event.title, market.title).into(),
                                 kalshi_event_ticker: event.event_ticker.clone().into(),
                                 kalshi_market_ticker: market.ticker.into(),
+                                kalshi_event_slug: config.kalshi_web_slug.into(),
                                 poly_slug: slug.clone().into(),
                                 poly_yes_token: yes_token.clone().into(),
                                 poly_no_token: no_token.clone().into(),
