@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
 
-use crate::api::kalshi::{KalshiApiClient, KalshiConfig};
+use trading::kalshi::{KalshiApiClient, KalshiConfig};
 use crate::config::Config;
 use crate::execution::{ExecutionEngine, ExecutionResult, OrderRequest};
 use crate::protocol::{ArbType, Platform};
