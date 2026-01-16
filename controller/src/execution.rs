@@ -116,8 +116,15 @@ impl ExecutionEngine {
         let pair = market.pair()
             .ok_or_else(|| anyhow!("No pair for market_id {}", market_id))?;
 
-        // Calculate profit
+        // Log detection early so we know what arb was found even if checks fail
         let profit_cents = req.profit_cents();
+        info!(
+            "[EXEC] 📡 Detected: {} | {:?} y={}¢ n={}¢ | est_profit={}¢ | size={}¢/{}¢",
+            pair.description, req.arb_type, req.yes_price, req.no_price,
+            profit_cents, req.yes_size, req.no_size
+        );
+
+        // Check profit threshold
         if profit_cents < 1 {
             self.release_in_flight(market_id);
             return Ok(ExecutionResult {
@@ -143,10 +150,11 @@ impl ExecutionEngine {
 
         if max_contracts < 1 {
             warn!(
-                "[EXEC] Liquidity fail: {:?} | yes_size={}¢ no_size={}¢",
+                "[EXEC] Liquidity fail: {:?} | yes_size={}¢ no_size={}¢ | backing off 10s",
                 req.arb_type, req.yes_size, req.no_size
             );
-            self.release_in_flight(market_id);
+            // Use delayed release to avoid spam from low-liquidity markets
+            self.release_in_flight_delayed(market_id);
             return Ok(ExecutionResult {
                 market_id,
                 success: false,
