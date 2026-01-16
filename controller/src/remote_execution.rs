@@ -9,7 +9,8 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::circuit_breaker::CircuitBreaker;
-use crate::config::{KALSHI_WEB_BASE, POLYMARKET_WEB_BASE};
+use crate::config::{KALSHI_WEB_BASE, build_polymarket_url};
+use crate::execution::describe_arb_trade;
 use crate::remote_protocol::{IncomingMessage, OrderAction, OutcomeSide, Platform as WsPlatform};
 use crate::remote_trader::RemoteTraderRouter;
 use crate::types::{ArbType, FastExecutionRequest, GlobalState, MarketPair};
@@ -122,9 +123,18 @@ impl HybridExecutor {
             return Ok(());
         }
 
+        // Describe what tokens are being purchased
+        let trade_description = describe_arb_trade(
+            req.arb_type,
+            &pair.kalshi_market_ticker,
+            &pair.poly_yes_token,
+            &pair.poly_no_token,
+            pair.team_suffix.as_deref(),
+        );
+
         info!(
-            "[HYBRID] arb detected: {} | {:?} y={}c n={}c | profit={}c | {}x",
-            pair.description, req.arb_type, req.yes_price, req.no_price, profit_cents, max_contracts
+            "[HYBRID] arb detected: {} | {} | {:?} y={}c n={}c | profit={}c | {}x",
+            pair.description, trade_description, req.arb_type, req.yes_price, req.no_price, profit_cents, max_contracts
         );
 
         // Build Kalshi URL: https://kalshi.com/markets/{series}/{slug}/{event_ticker}
@@ -134,14 +144,14 @@ impl HybridExecutor {
             .unwrap_or(&pair.kalshi_event_ticker)
             .to_lowercase();
         let kalshi_event_ticker_lower = pair.kalshi_event_ticker.to_lowercase();
+        let poly_url = build_polymarket_url(&pair.league, &pair.poly_slug);
         info!(
-            "[REMOTE_EXEC] 🔗 Kalshi: {}/{}/{}/{} | Polymarket: {}/{}",
+            "[REMOTE_EXEC] 🔗 Kalshi: {}/{}/{}/{} | Polymarket: {}",
             KALSHI_WEB_BASE,
             kalshi_series,
             pair.kalshi_event_slug,
             kalshi_event_ticker_lower,
-            POLYMARKET_WEB_BASE,
-            pair.poly_slug
+            poly_url
         );
 
         if self.dry_run {

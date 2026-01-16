@@ -19,7 +19,48 @@ use crate::types::{
 };
 use crate::circuit_breaker::CircuitBreaker;
 use crate::position_tracker::{FillRecord, PositionChannel};
-use crate::config::{KALSHI_WEB_BASE, POLYMARKET_WEB_BASE};
+use crate::config::{KALSHI_WEB_BASE, build_polymarket_url};
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// Describe what tokens are being purchased for an arb trade
+/// Returns a human-readable description like "BUY Kalshi YES + BUY Poly NO (token:abc...)"
+pub fn describe_arb_trade(
+    arb_type: ArbType,
+    _kalshi_ticker: &str,
+    poly_yes_token: &str,
+    poly_no_token: &str,
+    team_suffix: Option<&str>,
+) -> String {
+    let team_info = team_suffix.map(|t| format!(" [{}]", t)).unwrap_or_default();
+    let poly_yes_short = if poly_yes_token.len() > 8 {
+        format!("{}...", &poly_yes_token[..8])
+    } else {
+        poly_yes_token.to_string()
+    };
+    let poly_no_short = if poly_no_token.len() > 8 {
+        format!("{}...", &poly_no_token[..8])
+    } else {
+        poly_no_token.to_string()
+    };
+
+    match arb_type {
+        ArbType::KalshiYesPolyNo => {
+            format!("BUY Kalshi YES{} + BUY Poly NO ({})", team_info, poly_no_short)
+        }
+        ArbType::PolyYesKalshiNo => {
+            format!("BUY Poly YES ({}) + BUY Kalshi NO{}", poly_yes_short, team_info)
+        }
+        ArbType::PolyOnly => {
+            format!("BUY Poly YES ({}) + BUY Poly NO ({})", poly_yes_short, poly_no_short)
+        }
+        ArbType::KalshiOnly => {
+            format!("BUY Kalshi YES{0} + BUY Kalshi NO{0}", team_info)
+        }
+    }
+}
 
 // =============================================================================
 // EXECUTION ENGINE
@@ -177,9 +218,20 @@ impl ExecutionEngine {
         }
 
         let latency_to_exec = self.clock.now_ns() - req.detected_ns;
+
+        // Describe what tokens are being purchased
+        let trade_description = describe_arb_trade(
+            req.arb_type,
+            &pair.kalshi_market_ticker,
+            &pair.poly_yes_token,
+            &pair.poly_no_token,
+            pair.team_suffix.as_deref(),
+        );
+
         info!(
-            "[EXEC] 🎯 {} | {:?} y={}¢ n={}¢ | profit={}¢ | {}x | {}µs",
+            "[EXEC] 🎯 {} | {} | {:?} y={}¢ n={}¢ | profit={}¢ | {}x | {}µs",
             pair.description,
+            trade_description,
             req.arb_type,
             req.yes_price,
             req.no_price,
@@ -194,14 +246,14 @@ impl ExecutionEngine {
             .unwrap_or(&pair.kalshi_event_ticker)
             .to_lowercase();
         let kalshi_event_ticker_lower = pair.kalshi_event_ticker.to_lowercase();
+        let poly_url = build_polymarket_url(&pair.league, &pair.poly_slug);
         info!(
-            "[EXEC] 🔗 Kalshi: {}/{}/{}/{} | Polymarket: {}/{}",
+            "[EXEC] 🔗 Kalshi: {}/{}/{}/{} | Polymarket: {}",
             KALSHI_WEB_BASE,
             kalshi_series,
             pair.kalshi_event_slug,
             kalshi_event_ticker_lower,
-            POLYMARKET_WEB_BASE,
-            pair.poly_slug
+            poly_url
         );
 
         if self.dry_run {
