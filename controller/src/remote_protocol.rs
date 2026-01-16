@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Platform identifier
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Platform {
     Kalshi,
@@ -23,6 +23,22 @@ pub enum ArbType {
     KalshiOnly,
 }
 
+/// Order action (buy/sell) for single-leg execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OrderAction {
+    Buy,
+    Sell,
+}
+
+/// Outcome side (yes/no) for markets that have binary outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutcomeSide {
+    Yes,
+    No,
+}
+
 /// Incoming messages from host (controller) to trader
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -32,6 +48,28 @@ pub enum IncomingMessage {
         platforms: Vec<Platform>,
         #[serde(default)]
         dry_run: bool,
+    },
+
+    /// Execute a single platform leg.
+    #[serde(rename = "execute_leg")]
+    ExecuteLeg {
+        market_id: u16,
+        leg_id: String,
+        platform: Platform,
+        action: OrderAction,
+        side: OutcomeSide,
+        price: u16,
+        contracts: i64,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kalshi_market_ticker: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        poly_token: Option<String>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pair_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
 
     #[serde(rename = "execute")]
@@ -74,6 +112,17 @@ pub enum OutgoingMessage {
     InitAck {
         success: bool,
         platforms: Vec<Platform>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    #[serde(rename = "leg_result")]
+    LegResult {
+        market_id: u16,
+        leg_id: String,
+        platform: Platform,
+        success: bool,
+        latency_ns: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },

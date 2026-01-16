@@ -2,7 +2,6 @@
 
 mod api;
 mod config;
-mod execution;
 mod heartbeat;
 mod paths;
 mod protocol;

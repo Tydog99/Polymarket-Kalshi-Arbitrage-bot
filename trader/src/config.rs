@@ -3,6 +3,8 @@
 use anyhow::Result;
 use std::env;
 
+use crate::protocol::Platform;
+
 /// Application configuration loaded from environment variables
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -13,6 +15,8 @@ pub struct Config {
     pub polymarket_api_secret: Option<String>,
     pub polymarket_funder: Option<String>,
     pub dry_run: bool,
+    /// Which platform this trader is allowed to execute on.
+    pub platform: Platform,
     /// WebSocket URL - None means use beacon discovery
     pub websocket_url: Option<String>,
 }
@@ -34,6 +38,26 @@ impl Config {
             .map(|v| v == "1" || v == "true" || v == "yes")
             .unwrap_or(false);
 
+        let platform = match env::var("TRADER_PLATFORM").ok().as_deref() {
+            Some("kalshi") => Platform::Kalshi,
+            Some("polymarket") => Platform::Polymarket,
+            Some(other) => anyhow::bail!("Invalid TRADER_PLATFORM: {}", other),
+            None => {
+                // Safe-ish fallback: if credentials clearly indicate one platform, pick it.
+                // If ambiguous, require explicit configuration so we never accidentally trade both.
+                let has_k = kalshi_api_key.is_some() && kalshi_private_key.is_some();
+                let has_p = polymarket_private_key.is_some();
+                match (has_k, has_p, dry_run) {
+                    (true, false, _) => Platform::Kalshi,
+                    (false, true, _) => Platform::Polymarket,
+                    (false, false, true) => Platform::Kalshi,
+                    _ => anyhow::bail!(
+                        "TRADER_PLATFORM must be set to 'kalshi' or 'polymarket' (credentials are ambiguous)"
+                    ),
+                }
+            }
+        };
+
         // WEBSOCKET_URL is now optional - if not set, use beacon discovery
         let websocket_url = env::var("WEBSOCKET_URL").ok();
 
@@ -45,16 +69,19 @@ impl Config {
             polymarket_api_secret,
             polymarket_funder,
             dry_run,
+            platform,
             websocket_url,
         })
     }
 
     /// Check if Kalshi credentials are available
+    #[allow(dead_code)]
     pub fn has_kalshi_creds(&self) -> bool {
         self.kalshi_api_key.is_some() && self.kalshi_private_key.is_some()
     }
 
     /// Check if Polymarket credentials are available
+    #[allow(dead_code)]
     pub fn has_polymarket_creds(&self) -> bool {
         self.polymarket_private_key.is_some()
             && (self.polymarket_api_key.is_some() || self.polymarket_funder.is_some())

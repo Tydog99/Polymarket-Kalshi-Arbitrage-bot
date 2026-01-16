@@ -2,7 +2,6 @@
 
 pub mod api;
 pub mod config;
-pub mod execution;
 pub mod heartbeat;
 pub mod paths;
 pub mod protocol;

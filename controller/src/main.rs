@@ -206,7 +206,7 @@ async fn main() -> Result<()> {
 
         let platforms = parse_ws_platforms();
         let remote_server = RemoteTraderServer::new(bind, platforms, dry_run);
-        let trader_handle = remote_server.handle();
+        let trader_router = remote_server.router();
         tokio::spawn(async move {
             if let Err(e) = remote_server.run().await {
                 error!("[REMOTE] server error: {}", e);
@@ -215,32 +215,45 @@ async fn main() -> Result<()> {
 
         info!("[REMOTE] Waiting for trader connection...");
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+        let mut connected_platform: Option<crate::remote_protocol::Platform> = None;
         loop {
-            if trader_handle.is_connected().await {
-                break;
+            for p in parse_ws_platforms() {
+                if trader_router.is_connected(p).await {
+                    connected_platform = Some(p);
+                    break;
+                }
             }
+            if connected_platform.is_some() { break; }
             if tokio::time::Instant::now() > deadline {
                 anyhow::bail!("Timed out waiting for trader to connect");
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         }
 
-        warn!("[REMOTE] Trader connected; sending synthetic execute");
-        trader_handle
-            .send(crate::remote_protocol::IncomingMessage::Execute {
-                market_id: 0,
-                arb_type: crate::remote_protocol::ArbType::PolyYesKalshiNo,
-                yes_price: 40,
-                no_price: 50,
-                yes_size: 1000,
-                no_size: 1000,
-                pair_id: Some("smoke-test".to_string()),
-                description: Some("Smoke Test Market".to_string()),
-                kalshi_market_ticker: Some("KXSMOKE-YES".to_string()),
-                poly_yes_token: Some("0x_smoke_yes".to_string()),
-                poly_no_token: Some("0x_smoke_no".to_string()),
-            })
-            .await?;
+        let platform = connected_platform.unwrap();
+        warn!("[REMOTE] Trader connected ({:?}); sending synthetic execute_leg", platform);
+        let leg = crate::remote_protocol::IncomingMessage::ExecuteLeg {
+            market_id: 0,
+            leg_id: "smoke-leg-1".to_string(),
+            platform,
+            action: crate::remote_protocol::OrderAction::Buy,
+            side: crate::remote_protocol::OutcomeSide::Yes,
+            price: 40,
+            contracts: 1,
+            kalshi_market_ticker: if platform == crate::remote_protocol::Platform::Kalshi {
+                Some("KXSMOKE-YES".to_string())
+            } else {
+                None
+            },
+            poly_token: if platform == crate::remote_protocol::Platform::Polymarket {
+                Some("0x_smoke_yes".to_string())
+            } else {
+                None
+            },
+            pair_id: Some("smoke-test".to_string()),
+            description: Some("Smoke Test Market".to_string()),
+        };
+        trader_router.send(platform, leg).await?;
 
         info!("[REMOTE] Sent execute; sleeping briefly then exiting");
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -389,7 +402,7 @@ async fn main() -> Result<()> {
         let platforms = parse_ws_platforms();
 
         let remote_server = RemoteTraderServer::new(bind, platforms, dry_run);
-        let trader_handle = remote_server.handle();
+        let trader_router = remote_server.router();
         tokio::spawn(async move {
             if let Err(e) = remote_server.run().await {
                 error!("[REMOTE] server error: {}", e);
@@ -435,7 +448,7 @@ async fn main() -> Result<()> {
         let remote_exec = Arc::new(RemoteExecutor::new(
             state.clone(),
             circuit_breaker.clone(),
-            trader_handle,
+            trader_router,
             dry_run,
         ));
         tokio::spawn(run_remote_execution_loop(exec_rx, remote_exec))
