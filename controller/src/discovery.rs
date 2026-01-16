@@ -817,10 +817,6 @@ impl DiscoveryClient {
                 if let Some(date) = extract_date_from_poly_slug(slug) {
                     let norm1 = normalize_esports_team(&team1);
                     let norm2 = normalize_esports_team(&team2);
-                    // Generate acronyms from ORIGINAL names (before "Esports" is stripped)
-                    // "Top Esports" -> "te", "Weibo Gaming" -> "wg"
-                    let acronym1 = generate_acronym(&team1);
-                    let acronym2 = generate_acronym(&team2);
 
                     // Find moneyline market (no -game, -total, -map suffix)
                     if let Some(markets) = &event.markets {
@@ -838,35 +834,35 @@ impl DiscoveryClient {
                                         serde_json::from_str::<Vec<String>>(outcomes_str)
                                     ) {
                                         if ids.len() >= 2 && outcomes.len() >= 2 {
-                                            // Use outcomes to determine which token belongs to which team
+                                            // Use canonical team lookup to match outcomes to title teams
                                             // outcomes[i] corresponds to ids[i]
+                                            // Use RAW names for canonical lookup, not normalized
+                                            let outcome0_matches_team1 = teams_match_canonical(&outcomes[0], &team1);
+                                            let outcome1_matches_team1 = teams_match_canonical(&outcomes[1], &team1);
+                                            let outcome0_matches_team2 = teams_match_canonical(&outcomes[0], &team2);
+                                            let outcome1_matches_team2 = teams_match_canonical(&outcomes[1], &team2);
+
+                                            // For logging/storage, still normalize
                                             let outcome0_norm = normalize_esports_team(&outcomes[0]);
                                             let outcome1_norm = normalize_esports_team(&outcomes[1]);
-
-                                            // Find which outcome matches team1 (norm1 or acronym1)
-                                            // This determines which token is the "YES" for team1
-                                            // Use teams_match_with_acronym() to handle abbreviations
-                                            let outcome0_matches_team1 = teams_match_with_acronym(&outcome0_norm, &norm1, &acronym1);
-                                            let outcome1_matches_team1 = teams_match_with_acronym(&outcome1_norm, &norm1, &acronym1);
-                                            let outcome0_matches_team2 = teams_match_with_acronym(&outcome0_norm, &norm2, &acronym2);
-                                            let outcome1_matches_team2 = teams_match_with_acronym(&outcome1_norm, &norm2, &acronym2);
 
                                             let (team1_token, team2_token, poly_team1_norm) =
                                                 if outcome0_matches_team1 || outcome1_matches_team2 {
                                                     // outcomes[0] is team1, outcomes[1] is team2
-                                                    (ids[0].clone(), ids[1].clone(), outcome0_norm)
+                                                    (ids[0].clone(), ids[1].clone(), outcome0_norm.clone())
                                                 } else if outcome1_matches_team1 || outcome0_matches_team2 {
                                                     // outcomes[1] is team1, outcomes[0] is team2
-                                                    (ids[1].clone(), ids[0].clone(), outcome1_norm)
+                                                    (ids[1].clone(), ids[0].clone(), outcome1_norm.clone())
                                                 } else {
                                                     // Fallback: use title order (norm1 first)
-                                                    warn!("  ⚠️ Could not match outcomes {:?} to teams {}/{} (outcome0={}, outcome1={}, acronym1={}, acronym2={})",
-                                                          outcomes, norm1, norm2, outcome0_norm, outcome1_norm, acronym1, acronym2);
-                                                    (ids[0].clone(), ids[1].clone(), outcome0_norm)
+                                                    warn!("  ⚠️ Could not match outcomes {:?} to teams {}/{} via canonical lookup",
+                                                          outcomes, team1, team2);
+                                                    (ids[0].clone(), ids[1].clone(), outcome0_norm.clone())
                                                 };
 
-                                            info!("  🔍 {} | outcomes={:?} | team1_token_owner={} | title_teams={}/{}",
-                                                  slug, outcomes, poly_team1_norm, norm1, norm2);
+                                            info!("  🔍 {} | outcomes={:?} | o0_t1={} o1_t1={} o0_t2={} o1_t2={} | team1_tok_owner={} | title={}/{}",
+                                                  slug, outcomes, outcome0_matches_team1, outcome1_matches_team1,
+                                                  outcome0_matches_team2, outcome1_matches_team2, poly_team1_norm, team1, team2);
 
                                             // Store with both key orderings
                                             let key1 = format!("{}:{}:{}", date, norm1, norm2);
@@ -938,9 +934,9 @@ impl DiscoveryClient {
                                 .map(|s| normalize_esports_team(s))
                                 .unwrap_or_default();
 
-                            // Check if kalshi_team matches poly_team1, handling abbreviations
-                            // "lev" should match "leviatan", "gz" should match "ground-zero"
-                            let is_match = teams_match(&kalshi_team_norm, poly_team1);
+                            // Check if kalshi_team matches poly_team1 using canonical lookup
+                            // "tes" should match "top-esports", "wb" should match "weibo-gaming"
+                            let is_match = teams_match_canonical(&kalshi_team_norm, poly_team1);
                             let swapped = !is_match;
                             let (poly_yes, poly_no) = if !swapped {
                                 // Kalshi "Will Team1 win?" → Poly YES = Team1 wins, Poly NO = Team1 loses
@@ -1132,6 +1128,168 @@ fn extract_team_suffix(ticker: &str) -> Option<String> {
 
 // === Esports Discovery Helpers ===
 
+// Static mapping of esports team canonical names to their known aliases/abbreviations
+// This is more reliable than fuzzy matching for the limited set of esports teams
+static ESPORTS_TEAM_ALIASES: &[(&str, &[&str])] = &[
+    // LPL (China LoL)
+    ("top-esports", &["tes", "top", "top esports", "topesports"]),
+    ("weibo-gaming", &["wb", "wbg", "weibo", "weibo gaming"]),
+    ("jd-gaming", &["jdg", "jd", "jd gaming"]),
+    ("bilibili-gaming", &["blg", "bilibili", "bilibili gaming"]),
+    ("lng-esports", &["lng", "lng esports"]),
+    ("rare-atom", &["ra", "rare atom"]),
+    ("anyone-legends", &["al", "anyone", "anyone legends"]),
+    ("oh-my-god", &["omg", "oh my god"]),
+    ("funplus-phoenix", &["fpx", "funplus", "funplus phoenix"]),
+    ("edward-gaming", &["edg", "edward", "edward gaming"]),
+    ("royal-never-give-up", &["rng", "royal", "royal never give up"]),
+    ("ninjas-in-pyjamas", &["nip", "ninjas", "ninjas in pyjamas"]),
+    ("tt-gaming", &["tt", "tt gaming"]),
+    ("ultra-prime", &["up", "ultra prime"]),
+    ("invictus-gaming", &["ig", "invictus", "invictus gaming"]),
+
+    // LCK (Korea LoL)
+    ("t1", &["t1", "skt", "sk telecom"]),
+    ("gen-g", &["gen", "geng", "gen g", "gen.g"]),
+    ("hanwha-life", &["hle", "hanwha", "hanwha life"]),
+    ("dplus-kia", &["dk", "dwg", "dplus", "dplus kia", "damwon"]),
+    ("kt-rolster", &["kt", "ktr", "kt rolster"]),
+    ("drx", &["drx"]),
+    ("kwangdong-freecs", &["kdf", "kwangdong", "freecs"]),
+    ("nongshim-redforce", &["ns", "nongshim", "redforce"]),
+    ("ok-brion", &["bro", "brion", "ok brion"]),
+    ("fearx", &["fox", "fearx"]),
+
+    // LEC (Europe LoL)
+    ("g2-esports", &["g2", "g2 esports"]),
+    ("fnatic", &["fnc", "fnatic"]),
+    ("mad-lions", &["mad", "mad lions"]),
+    ("team-vitality", &["vit", "vitality", "team vitality"]),
+    ("team-heretics", &["th", "heretics", "team heretics"]),
+    ("sk-gaming", &["sk", "sk gaming"]),
+    ("giantx", &["gx", "giantx", "giant x"]),
+    ("karmine-corp", &["kc", "karmine", "karmine corp"]),
+    ("team-bds", &["bds", "team bds"]),
+    ("rogue", &["rge", "rogue"]),
+
+    // LCS (NA LoL)
+    ("cloud9", &["c9", "cloud9", "cloud 9"]),
+    ("team-liquid", &["tl", "liquid", "team liquid"]),
+    ("flyquest", &["fly", "flyquest"]),
+    ("100-thieves", &["100t", "100", "100 thieves"]),
+    ("dignitas", &["dig", "dignitas"]),
+    ("nrg-esports", &["nrg", "nrg esports"]),
+    ("shopify-rebellion", &["sr", "shopify", "rebellion"]),
+    ("immortals", &["imt", "immortals"]),
+
+    // CS2 Teams
+    ("natus-vincere", &["navi", "natus vincere", "na'vi"]),
+    ("faze-clan", &["faze", "faze clan"]),
+    ("g2-esports", &["g2", "g2 esports"]),
+    ("vitality", &["vit", "vitality", "team vitality"]),
+    ("heroic", &["heroic"]),
+    ("furia", &["furia", "furia esports"]),
+    ("mouz", &["mouz", "mousesports"]),
+    ("spirit", &["spirit", "team spirit"]),
+    ("virtus-pro", &["vp", "virtus", "virtus pro", "virtus.pro"]),
+    ("astralis", &["ast", "astralis"]),
+    ("complexity", &["col", "complexity"]),
+    ("liquid", &["tl", "liquid", "team liquid"]),
+    ("eternal-fire", &["ef", "eternal", "eternal fire"]),
+    ("monte", &["monte"]),
+    ("big", &["big", "big clan"]),
+    ("9ine", &["9ine", "9 ine"]),
+    ("3dmax", &["3dmax", "3d max"]),
+    ("apeks", &["apeks"]),
+    ("betboom", &["betboom", "bet boom"]),
+    ("pain-gaming", &["pain", "pain gaming"]),
+    ("imperial", &["imp", "imperial"]),
+    ("mibr", &["mibr"]),
+    ("red-canids", &["red", "rc", "red canids"]),
+    ("leviatan", &["lev", "leviatan"]),
+    ("loud", &["loud"]),
+    ("wildcard", &["wc", "wildcard"]),
+    ("boss", &["boss"]),
+    ("falcons", &["falcons"]),
+    ("sangal", &["sangal"]),
+    ("saw", &["saw"]),
+    ("gamerlegion", &["gl", "gamerlegion"]),
+    ("aurora", &["aurora"]),
+    ("b8", &["b8"]),
+    ("nemiga", &["nemiga"]),
+    ("ecstatic", &["ecstatic"]),
+    ("permitta", &["permitta"]),
+    ("rebels", &["rebels"]),
+    ("passion-ua", &["passion", "passion ua"]),
+    ("tyloo", &["tyloo"]),
+    ("lynn-vision", &["lv", "lynn vision", "lynnvision"]),
+    ("rare-atom", &["ra", "rare atom"]),
+    ("the-mongolz", &["mg", "mongolz", "the mongolz"]),
+    ("flyquest", &["fly", "flyquest"]),
+    ("nouns", &["nouns"]),
+    ("legacy", &["legacy"]),
+    ("m80", &["m80"]),
+    ("nrg", &["nrg"]),
+    ("pgl", &["pgl"]),
+
+    // CoD Teams (partial)
+    ("atlanta-faze", &["faze", "atlanta faze"]),
+    ("optic-texas", &["optic", "optic texas"]),
+    ("toronto-ultra", &["ultra", "toronto ultra"]),
+    ("los-angeles-thieves", &["lat", "thieves", "la thieves"]),
+    ("seattle-surge", &["surge", "seattle surge"]),
+    ("new-york-subliners", &["nysl", "subliners", "new york subliners"]),
+    ("miami-heretics", &["heretics", "miami heretics"]),
+    ("las-vegas-legion", &["legion", "vegas legion"]),
+    ("carolina-royal-ravens", &["ravens", "royal ravens"]),
+    ("boston-breach", &["breach", "boston breach"]),
+    ("los-angeles-guerrillas", &["lag", "guerrillas", "la guerrillas"]),
+    ("minnesota-rokkr", &["rokkr", "minnesota rokkr"]),
+];
+
+/// Look up the canonical team name from any alias
+/// Returns the canonical name if found, or None
+fn lookup_team_canonical(name: &str) -> Option<&'static str> {
+    let lower = name.to_lowercase();
+    let normalized = lower.trim();
+
+    for (canonical, aliases) in ESPORTS_TEAM_ALIASES {
+        // Check canonical name
+        if *canonical == normalized || canonical.replace('-', " ") == normalized {
+            return Some(canonical);
+        }
+        // Check all aliases
+        for alias in *aliases {
+            if *alias == normalized {
+                return Some(canonical);
+            }
+        }
+    }
+    None
+}
+
+/// Match two team names using the canonical lookup
+/// This is much more reliable than fuzzy string matching
+fn teams_match_canonical(team_a: &str, team_b: &str) -> bool {
+    // Try direct match first
+    if team_a == team_b {
+        return true;
+    }
+
+    // Look up canonical names
+    let canonical_a = lookup_team_canonical(team_a);
+    let canonical_b = lookup_team_canonical(team_b);
+
+    match (canonical_a, canonical_b) {
+        (Some(a), Some(b)) => a == b,
+        // If one is found and matches the other's input
+        (Some(a), None) => a == team_b || a.replace('-', " ") == team_b,
+        (None, Some(b)) => team_a == b || team_a == b.replace('-', " "),
+        // Neither found - fall back to fuzzy matching
+        (None, None) => teams_match(team_a, team_b),
+    }
+}
+
 // Static regex patterns compiled once for performance (avoids recompilation on each call)
 static RE_ESPORTS_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\s*(esports|gaming|team|clan)\s*$").unwrap()
@@ -1254,42 +1412,6 @@ fn chars_in_order(needle: &str, haystack: &str) -> bool {
         }
     }
     true
-}
-
-/// Generate an acronym from a team name (first letter of each word)
-/// "Top Esports" -> "te", "Weibo Gaming" -> "wg", "T1" -> "t1"
-fn generate_acronym(name: &str) -> String {
-    name.split_whitespace()
-        .filter_map(|word| word.chars().next())
-        .collect::<String>()
-        .to_lowercase()
-}
-
-/// Enhanced team matching that also considers acronyms from original team name
-/// outcome_norm: normalized outcome (e.g., "tes")
-/// team_norm: normalized team name (e.g., "top")
-/// team_acronym: acronym from original team name (e.g., "te" from "Top Esports")
-fn teams_match_with_acronym(outcome_norm: &str, team_norm: &str, team_acronym: &str) -> bool {
-    // Try regular matching first
-    if teams_match(outcome_norm, team_norm) {
-        return true;
-    }
-    // Try matching outcome against the team acronym
-    if !team_acronym.is_empty() {
-        // Exact match with acronym
-        if outcome_norm == team_acronym {
-            return true;
-        }
-        // Outcome starts with acronym (e.g., "tes" starts with "te")
-        if outcome_norm.starts_with(team_acronym) {
-            return true;
-        }
-        // Acronym starts with outcome
-        if team_acronym.starts_with(outcome_norm) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Parse Polymarket event title to extract team names
@@ -1743,61 +1865,49 @@ mod tests {
     }
 
     #[test]
-    fn test_teams_match_tes_top_esports() {
-        // TES should match "Top Esports" via acronym
-        let outcome_norm = normalize_esports_team("TES");
-        let title_norm = normalize_esports_team("Top Esports");
-        let title_acronym = generate_acronym("Top Esports");
-        assert_eq!(outcome_norm, "tes");
-        assert_eq!(title_norm, "top");
-        assert_eq!(title_acronym, "te");
-        // teams_match alone won't work, but teams_match_with_acronym should
-        assert!(teams_match_with_acronym(&outcome_norm, &title_norm, &title_acronym),
-                "TES should match Top Esports via acronym");
+    fn test_teams_match_canonical_tes_top_esports() {
+        // TES should match "Top Esports" via canonical lookup
+        assert!(teams_match_canonical("TES", "Top Esports"),
+                "TES should match Top Esports via canonical lookup");
+        assert!(teams_match_canonical("tes", "top-esports"),
+                "tes should match top-esports via canonical lookup");
     }
 
     #[test]
-    fn test_weibo_vs_tes_token_mapping() {
+    fn test_teams_match_canonical_wb_weibo() {
+        // WB should match "Weibo Gaming" via canonical lookup
+        assert!(teams_match_canonical("WB", "Weibo Gaming"),
+                "WB should match Weibo Gaming via canonical lookup");
+        assert!(teams_match_canonical("wb", "weibo-gaming"),
+                "wb should match weibo-gaming via canonical lookup");
+    }
+
+    #[test]
+    fn test_weibo_vs_tes_token_mapping_canonical() {
         // This is the actual bug case:
         // Poly title: "Weibo Gaming vs Top Esports"
         // Poly outcomes: ["TES", "WB"]
         // Poly tokens: [TES_TOKEN, WB_TOKEN]
         //
-        // title_team1 = "Weibo Gaming" → norm1 = "weibo", acronym1 = "wg"
-        // title_team2 = "Top Esports" → norm2 = "top", acronym2 = "te"
-        // outcome0 = "TES" → outcome0_norm = "tes"
-        // outcome1 = "WB" → outcome1_norm = "wb"
-        //
-        // With teams_match_with_acronym():
-        // - outcome0 (tes) matches team2 (top, acronym=te)? YES (tes starts with te)
-        // - outcome1 (wb) matches team1 (weibo, acronym=wg)? YES (wb matches weibo via chars_in_order)
-        // So: outcomes are in REVERSED order from title
-        // → team1_token = WB_TOKEN (for Weibo)
-        // → team2_token = TES_TOKEN (for Top Esports)
+        // Using canonical lookup:
+        // - outcome "TES" matches "Top Esports"? YES
+        // - outcome "WB" matches "Weibo Gaming"? YES
+        // - outcome "TES" matches "Weibo Gaming"? NO
+        // - outcome "WB" matches "Top Esports"? NO
 
-        let norm1 = normalize_esports_team("Weibo Gaming");   // "weibo"
-        let norm2 = normalize_esports_team("Top Esports");     // "top"
-        let acronym1 = generate_acronym("Weibo Gaming");       // "wg"
-        let acronym2 = generate_acronym("Top Esports");        // "te"
-        let outcome0_norm = normalize_esports_team("TES");     // "tes"
-        let outcome1_norm = normalize_esports_team("WB");      // "wb"
+        let team1 = "Weibo Gaming";
+        let team2 = "Top Esports";
+        let outcomes = ["TES", "WB"];
 
-        assert_eq!(norm1, "weibo");
-        assert_eq!(norm2, "top");
-        assert_eq!(acronym1, "wg");
-        assert_eq!(acronym2, "te");
-        assert_eq!(outcome0_norm, "tes");
-        assert_eq!(outcome1_norm, "wb");
-
-        // Check what should match using teams_match_with_acronym
-        let outcome0_matches_team1 = teams_match_with_acronym(&outcome0_norm, &norm1, &acronym1); // tes vs weibo/wg = false
-        let outcome1_matches_team1 = teams_match_with_acronym(&outcome1_norm, &norm1, &acronym1); // wb vs weibo/wg = true
-        let outcome0_matches_team2 = teams_match_with_acronym(&outcome0_norm, &norm2, &acronym2); // tes vs top/te = true (tes starts with te)
-        let outcome1_matches_team2 = teams_match_with_acronym(&outcome1_norm, &norm2, &acronym2); // wb vs top/te = false
+        // Check what should match using canonical lookup (same as discovery code)
+        let outcome0_matches_team1 = teams_match_canonical(&outcomes[0], team1); // TES vs Weibo = false
+        let outcome1_matches_team1 = teams_match_canonical(&outcomes[1], team1); // WB vs Weibo = true
+        let outcome0_matches_team2 = teams_match_canonical(&outcomes[0], team2); // TES vs Top Esports = true
+        let outcome1_matches_team2 = teams_match_canonical(&outcomes[1], team2); // WB vs Top Esports = false
 
         assert!(!outcome0_matches_team1, "TES should NOT match Weibo Gaming");
         assert!(outcome1_matches_team1, "WB should match Weibo Gaming");
-        assert!(outcome0_matches_team2, "TES should match Top Esports (via acronym)");
+        assert!(outcome0_matches_team2, "TES should match Top Esports");
         assert!(!outcome1_matches_team2, "WB should NOT match Top Esports");
 
         // Determine token assignment using the same logic as discovery code
@@ -1820,11 +1930,16 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_acronym() {
-        assert_eq!(generate_acronym("Top Esports"), "te");
-        assert_eq!(generate_acronym("Weibo Gaming"), "wg");
-        assert_eq!(generate_acronym("Team Liquid"), "tl");
-        assert_eq!(generate_acronym("T1"), "t");
-        assert_eq!(generate_acronym("G2 Esports"), "ge");
+    fn test_lookup_team_canonical() {
+        // Test the canonical lookup function
+        assert_eq!(lookup_team_canonical("TES"), Some("top-esports"));
+        assert_eq!(lookup_team_canonical("tes"), Some("top-esports"));
+        assert_eq!(lookup_team_canonical("Top Esports"), Some("top-esports"));
+        assert_eq!(lookup_team_canonical("WB"), Some("weibo-gaming"));
+        assert_eq!(lookup_team_canonical("wb"), Some("weibo-gaming"));
+        assert_eq!(lookup_team_canonical("Weibo Gaming"), Some("weibo-gaming"));
+        assert_eq!(lookup_team_canonical("G2"), Some("g2-esports"));
+        assert_eq!(lookup_team_canonical("T1"), Some("t1"));
+        assert_eq!(lookup_team_canonical("unknown_team"), None);
     }
 }
