@@ -1,6 +1,8 @@
-//! Execution path that sends trades to a remote trader over WebSocket.
+//! Execution path that sends trades to a remote trader over WebSocket,
+//! with optional local execution for authorized platforms.
 
 use anyhow::{anyhow, Result};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -11,26 +13,51 @@ use crate::remote_protocol::{IncomingMessage, OrderAction, OutcomeSide, Platform
 use crate::remote_trader::RemoteTraderRouter;
 use crate::types::{ArbType, FastExecutionRequest, GlobalState, MarketPair};
 
-pub struct RemoteExecutor {
+use trading::execution::{
+    execute_leg, ExecutionClients, LegRequest, OrderAction as TradingOrderAction,
+    OutcomeSide as TradingOutcomeSide, Platform as TradingPlatform,
+};
+use trading::kalshi::KalshiApiClient;
+use trading::polymarket::SharedAsyncClient;
+
+pub struct HybridExecutor {
     state: Arc<GlobalState>,
     circuit_breaker: Arc<CircuitBreaker>,
-    trader: RemoteTraderRouter,
+    router: RemoteTraderRouter,
+    local_platforms: HashSet<TradingPlatform>,
+    local_clients: ExecutionClients,
     in_flight: Arc<[AtomicU64; 8]>,
     leg_seq: AtomicU64,
     pub dry_run: bool,
 }
 
-impl RemoteExecutor {
+/// Convert WsPlatform to TradingPlatform.
+fn ws_to_trading_platform(p: WsPlatform) -> TradingPlatform {
+    match p {
+        WsPlatform::Kalshi => TradingPlatform::Kalshi,
+        WsPlatform::Polymarket => TradingPlatform::Polymarket,
+    }
+}
+
+impl HybridExecutor {
     pub fn new(
         state: Arc<GlobalState>,
         circuit_breaker: Arc<CircuitBreaker>,
-        trader: RemoteTraderRouter,
+        router: RemoteTraderRouter,
+        local_platforms: HashSet<TradingPlatform>,
+        kalshi_api: Option<Arc<KalshiApiClient>>,
+        poly_async: Option<Arc<SharedAsyncClient>>,
         dry_run: bool,
     ) -> Self {
         Self {
             state,
             circuit_breaker,
-            trader,
+            router,
+            local_platforms,
+            local_clients: ExecutionClients {
+                kalshi: kalshi_api,
+                polymarket: poly_async,
+            },
             in_flight: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             leg_seq: AtomicU64::new(1),
             dry_run,
@@ -95,54 +122,110 @@ impl RemoteExecutor {
         }
 
         info!(
-            "[REMOTE_EXEC] 🎯 {} | {:?} y={}¢ n={}¢ | profit={}¢ | {}x",
+            "[HYBRID] arb detected: {} | {:?} y={}c n={}c | profit={}c | {}x",
             pair.description, req.arb_type, req.yes_price, req.no_price, profit_cents, max_contracts
         );
 
         if self.dry_run {
             info!(
-                "[REMOTE_EXEC] 🏃 DRY RUN - sending execute to trader (no real orders)"
+                "[HYBRID] DRY RUN - executing legs (no real orders)"
             );
         }
 
-        // Build legs for this arb, then only dispatch if required remote traders are available.
+        // Build legs for this arb
         let legs = build_legs(&req, &pair, max_contracts, &self.leg_seq);
         if legs.is_empty() {
             self.release_in_flight_delayed(market_id);
             return Ok(());
         }
 
-        // Enforce availability: cross-platform arbs require both remote traders.
-        if !can_dispatch(&self.trader, req.arb_type).await {
-            warn!(
-                "[REMOTE_EXEC] Missing remote trader(s) for {:?}; dropping arb market_id={}",
-                req.arb_type, market_id
-            );
-            self.release_in_flight_delayed(market_id);
-            return Ok(());
+        // Phase 1: Verify all legs can execute (either remote or local)
+        for (ws_platform, _) in &legs {
+            let trading_platform = ws_to_trading_platform(*ws_platform);
+            let has_remote = self.router.is_connected(*ws_platform).await;
+            let has_local = self.local_platforms.contains(&trading_platform);
+
+            if !has_remote && !has_local {
+                warn!(
+                    "[HYBRID] Cannot execute {:?} leg - no remote trader and not authorized locally; dropping arb market_id={}",
+                    trading_platform, market_id
+                );
+                self.release_in_flight_delayed(market_id);
+                return Ok(());
+            }
         }
 
-        for (platform, msg) in legs {
-            if !self.trader.try_send(platform, msg).await {
-                warn!(
-                    "[REMOTE_EXEC] Failed to send leg to {:?}; trader not connected? market_id={}",
-                    platform, market_id
-                );
+        // Phase 2: Execute all legs (prefer remote, fallback to local)
+        for (ws_platform, msg) in legs {
+            if self.router.is_connected(ws_platform).await {
+                if !self.router.try_send(ws_platform, msg).await {
+                    warn!(
+                        "[HYBRID] Failed to send leg to remote {:?}; market_id={}",
+                        ws_platform, market_id
+                    );
+                }
+            } else {
+                if let Err(e) = self.execute_local_leg(ws_platform, msg).await {
+                    warn!("[HYBRID] Local execution failed: {}", e);
+                }
             }
         }
 
         self.release_in_flight_delayed(market_id);
         Ok(())
     }
-}
 
-async fn can_dispatch(router: &RemoteTraderRouter, arb_type: ArbType) -> bool {
-    match arb_type {
-        ArbType::PolyYesKalshiNo | ArbType::KalshiYesPolyNo => {
-            router.is_connected(WsPlatform::Kalshi).await && router.is_connected(WsPlatform::Polymarket).await
+    async fn execute_local_leg(&self, ws_platform: WsPlatform, msg: IncomingMessage) -> Result<()> {
+        let IncomingMessage::ExecuteLeg {
+            market_id: _,
+            leg_id,
+            platform: _,
+            action,
+            side,
+            price,
+            contracts,
+            kalshi_market_ticker,
+            poly_token,
+            pair_id: _,
+            description,
+        } = msg
+        else {
+            return Ok(());
+        };
+
+        let trading_platform = ws_to_trading_platform(ws_platform);
+
+        let leg_action = match action {
+            OrderAction::Buy => TradingOrderAction::Buy,
+            OrderAction::Sell => TradingOrderAction::Sell,
+        };
+        let leg_side = match side {
+            OutcomeSide::Yes => TradingOutcomeSide::Yes,
+            OutcomeSide::No => TradingOutcomeSide::No,
+        };
+
+        let req = LegRequest {
+            leg_id: &leg_id,
+            platform: trading_platform,
+            action: leg_action,
+            side: leg_side,
+            price_cents: price,
+            contracts,
+            kalshi_ticker: kalshi_market_ticker.as_deref(),
+            poly_token: poly_token.as_deref(),
+        };
+
+        let result = execute_leg(&req, &self.local_clients, self.dry_run).await;
+
+        if result.success {
+            info!(
+                "[LOCAL] executed {:?} leg_id={} desc={:?} latency={}us",
+                trading_platform, leg_id, description, result.latency_ns / 1000
+            );
+            Ok(())
+        } else {
+            Err(anyhow!(result.error.unwrap_or_else(|| "unknown".into())))
         }
-        ArbType::PolyOnly => router.is_connected(WsPlatform::Polymarket).await,
-        ArbType::KalshiOnly => router.is_connected(WsPlatform::Kalshi).await,
     }
 }
 
@@ -307,13 +390,13 @@ fn build_legs(
     }
 }
 
-/// Remote execution event loop - forwards arbitrage opportunities to the remote trader.
-pub async fn run_remote_execution_loop(
+/// Hybrid execution event loop - forwards arbitrage opportunities to remote traders or executes locally.
+pub async fn run_hybrid_execution_loop(
     mut rx: mpsc::Receiver<FastExecutionRequest>,
-    executor: Arc<RemoteExecutor>,
+    executor: Arc<HybridExecutor>,
 ) {
     info!(
-        "[REMOTE_EXEC] Remote execution loop started (dry_run={})",
+        "[HYBRID] Hybrid execution loop started (dry_run={})",
         executor.dry_run
     );
 
@@ -321,7 +404,7 @@ pub async fn run_remote_execution_loop(
         let exec = executor.clone();
         tokio::spawn(async move {
             if let Err(e) = exec.process(req).await {
-                error!("[REMOTE_EXEC] error: {}", e);
+                error!("[HYBRID] error: {}", e);
             }
         });
     }
@@ -371,7 +454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_platform_requires_both_traders() {
+    async fn cross_platform_requires_both_traders_or_local() {
         let state = make_state_with_pair(make_test_pair());
         let cb = cb_disabled();
 
@@ -380,9 +463,9 @@ mod tests {
         let router = server.router();
 
         let mut kalshi_rx = router.test_register(WsPlatform::Kalshi).await;
-        // No polymarket trader connected
+        // No polymarket trader connected and no local authorization
 
-        let exec = RemoteExecutor::new(state, cb, router, true);
+        let exec = HybridExecutor::new(state, cb, router, HashSet::new(), None, None, true);
         let req = FastExecutionRequest {
             market_id: 0,
             yes_price: 40,
@@ -409,7 +492,7 @@ mod tests {
         let mut kalshi_rx = router.test_register(WsPlatform::Kalshi).await;
         let mut poly_rx = router.test_register(WsPlatform::Polymarket).await;
 
-        let exec = RemoteExecutor::new(state, cb, router, true);
+        let exec = HybridExecutor::new(state, cb, router, HashSet::new(), None, None, true);
         let req = FastExecutionRequest {
             market_id: 0,
             yes_price: 40,
@@ -454,7 +537,7 @@ mod tests {
 
         let mut poly_rx = router.test_register(WsPlatform::Polymarket).await;
 
-        let exec = RemoteExecutor::new(state, cb, router, true);
+        let exec = HybridExecutor::new(state, cb, router, HashSet::new(), None, None, true);
         let req = FastExecutionRequest {
             market_id: 0,
             yes_price: 48,
