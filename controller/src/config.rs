@@ -272,9 +272,33 @@ pub fn discovery_interval_mins() -> u64 {
     })
 }
 
+use std::collections::HashSet;
+use trading::execution::Platform;
+
+/// Parse CONTROLLER_PLATFORMS env var.
+/// Returns empty set if not set (pure router mode).
+pub fn parse_controller_platforms() -> HashSet<Platform> {
+    std::env::var("CONTROLLER_PLATFORMS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|p| match p.trim().to_lowercase().as_str() {
+                    "kalshi" => Some(Platform::Kalshi),
+                    "polymarket" | "poly" => Some(Platform::Polymarket),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Mutex to serialize tests that modify CONTROLLER_PLATFORMS env var
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_discovery_interval_returns_reasonable_value() {
@@ -285,5 +309,34 @@ mod tests {
         let result = discovery_interval_mins();
         // Verify it returns a reasonable interval (up to 24 hours in minutes)
         assert!(result <= 60 * 24, "Should return a reasonable interval");
+    }
+
+    #[test]
+    fn test_parse_controller_platforms_empty() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("CONTROLLER_PLATFORMS");
+        let platforms = parse_controller_platforms();
+        assert!(platforms.is_empty());
+    }
+
+    #[test]
+    fn test_parse_controller_platforms_kalshi() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("CONTROLLER_PLATFORMS", "kalshi");
+        let platforms = parse_controller_platforms();
+        assert_eq!(platforms.len(), 1);
+        assert!(platforms.contains(&Platform::Kalshi));
+        std::env::remove_var("CONTROLLER_PLATFORMS");
+    }
+
+    #[test]
+    fn test_parse_controller_platforms_both() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("CONTROLLER_PLATFORMS", "kalshi,polymarket");
+        let platforms = parse_controller_platforms();
+        assert_eq!(platforms.len(), 2);
+        assert!(platforms.contains(&Platform::Kalshi));
+        assert!(platforms.contains(&Platform::Polymarket));
+        std::env::remove_var("CONTROLLER_PLATFORMS");
     }
 }
