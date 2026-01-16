@@ -165,6 +165,23 @@ impl ExecutionEngine {
             profit_cents, req.yes_size, req.no_size
         );
 
+        // Check if league is disabled (monitor only, no execution)
+        if crate::config::is_league_disabled(&pair.league) {
+            info!(
+                "[EXEC] 🚫 DISABLED LEAGUE: {} | {:?} y={}¢ n={}¢ | est_profit={}¢ | size={}¢/{}¢ | league={}",
+                pair.description, req.arb_type, req.yes_price, req.no_price,
+                profit_cents, req.yes_size, req.no_size, pair.league
+            );
+            self.release_in_flight(market_id);
+            return Ok(ExecutionResult {
+                market_id,
+                success: false,
+                profit_cents: 0,
+                latency_ns: self.clock.now_ns() - req.detected_ns,
+                error: Some("Disabled league"),
+            });
+        }
+
         // Check profit threshold
         if profit_cents < 1 {
             self.release_in_flight(market_id);

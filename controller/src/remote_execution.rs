@@ -137,6 +137,17 @@ impl HybridExecutor {
             pair.description, trade_description, req.arb_type, req.yes_price, req.no_price, profit_cents, max_contracts
         );
 
+        // Check if league is disabled (monitor only, no execution)
+        if crate::config::is_league_disabled(&pair.league) {
+            info!(
+                "[HYBRID] 🚫 DISABLED LEAGUE: {} | {:?} y={}¢ n={}¢ | est_profit={}¢ | league={}",
+                pair.description, req.arb_type, req.yes_price, req.no_price,
+                profit_cents, pair.league
+            );
+            self.release_in_flight_delayed(market_id);
+            return Ok(());
+        }
+
         // Build Kalshi URL: https://kalshi.com/markets/{series}/{slug}/{event_ticker}
         let kalshi_series = pair.kalshi_event_ticker
             .split('-')

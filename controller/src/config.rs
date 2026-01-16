@@ -86,6 +86,24 @@ pub fn enabled_leagues() -> &'static [String] {
     })
 }
 
+/// Which leagues to discover but not trade (monitor only)
+/// Set DISABLED_LEAGUES env var to comma-separated list, e.g., "epl,seriea"
+pub fn disabled_leagues() -> &'static HashSet<String> {
+    static CACHED: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| {
+        std::env::var("DISABLED_LEAGUES")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(',').map(|l| l.trim().to_lowercase()).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// Check if a league is disabled for trading (monitor only)
+pub fn is_league_disabled(league: &str) -> bool {
+    disabled_leagues().contains(&league.to_lowercase())
+}
+
 /// Price logging enabled (set PRICE_LOGGING=1 to enable)
 #[allow(dead_code)]
 pub fn price_logging_enabled() -> bool {
