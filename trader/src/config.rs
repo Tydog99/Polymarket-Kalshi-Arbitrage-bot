@@ -13,6 +13,7 @@ pub struct Config {
     pub polymarket_private_key: Option<String>,
     pub polymarket_api_key: Option<String>,
     pub polymarket_api_secret: Option<String>,
+    pub polymarket_api_passphrase: Option<String>,
     pub polymarket_funder: Option<String>,
     pub dry_run: bool,
     /// Which platform this trader is allowed to execute on.
@@ -30,6 +31,7 @@ impl Config {
         let polymarket_private_key = env::var("POLYMARKET_PRIVATE_KEY").ok();
         let polymarket_api_key = env::var("POLYMARKET_API_KEY").ok();
         let polymarket_api_secret = env::var("POLYMARKET_API_SECRET").ok();
+        let polymarket_api_passphrase = env::var("POLYMARKET_API_PASSPHRASE").ok();
         let polymarket_funder = env::var("POLYMARKET_FUNDER")
             .or_else(|_| env::var("POLY_FUNDER"))
             .ok();
@@ -67,6 +69,7 @@ impl Config {
             polymarket_private_key,
             polymarket_api_key,
             polymarket_api_secret,
+            polymarket_api_passphrase,
             polymarket_funder,
             dry_run,
             platform,

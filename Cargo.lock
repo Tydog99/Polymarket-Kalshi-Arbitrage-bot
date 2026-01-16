@@ -3053,6 +3053,7 @@ dependencies = [
  "ethers",
  "ethers-core",
  "futures-util",
+ "pkcs1",
  "rand 0.8.5",
  "reqwest 0.11.27",
  "rsa",
@@ -3066,6 +3067,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "trading",
  "url",
 ]
 
