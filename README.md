@@ -243,3 +243,27 @@ Example: `ENABLED_LEAGUES=cs2,lol,cod` to monitor only esports.
 | `POLYMARKET_API_SECRET` | Polymarket API secret |
 | `POLYMARKET_FUNDER` | Polymarket wallet address (falls back to `POLY_FUNDER`) |
 
+---
+
+## Known Issues & Technical Notes
+
+### Startup Race Condition (Cached Discovery)
+
+When using cached discovery (`FORCE_DISCOVERY=0`), there's a race condition during WebSocket initialization that can cause arbitrage opportunities to be missed:
+
+**Problem**: When markets are loaded instantly from cache, both WebSockets start simultaneously. During initial snapshot loading:
+
+1. Platform A's snapshots arrive → prices set → `check_arbs()` runs → Platform B prices still 0 → no arb detected
+2. Platform B's snapshots arrive → prices set → `check_arbs()` runs → but Platform A prices might not be fully loaded yet
+
+By the time all prices are populated, no new WebSocket update triggers a recheck because the `process_price_change` path requires prices to *improve* (go lower).
+
+**Current Fix**: A startup sweep runs 10 seconds after launch, scanning all markets with complete price data and triggering any missed arbitrage opportunities.
+
+**Alternative Fixes** (not yet implemented):
+
+| Fix | Description | Trade-off |
+|-----|-------------|-----------|
+| **Remove price improvement filter** | Always recheck arbs on any price update in `process_price_change` | Higher CPU usage, more channel traffic |
+| **Both-platforms-ready gate** | Only start arb checking after both WebSocket connections confirm initial snapshots complete | Requires connection state tracking, slight delay on all arb detection |
+

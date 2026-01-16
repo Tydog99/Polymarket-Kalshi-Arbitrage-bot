@@ -2048,3 +2048,226 @@ mod process_mock_tests {
             "Both cross-platform types should have equal profit");
     }
 }
+
+// ============================================================================
+// STARTUP SWEEP TESTS - Test the startup sweep logic for catching missed arbs
+// ============================================================================
+
+mod startup_sweep_tests {
+    use arb_bot::types::*;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    /// Helper: Create a test MarketPair
+    fn make_pair(id: &str) -> MarketPair {
+        MarketPair {
+            pair_id: id.into(),
+            league: "test".into(),
+            market_type: MarketType::Moneyline,
+            description: format!("Test Market {}", id).into(),
+            kalshi_event_ticker: format!("KXTEST-{}", id).into(),
+            kalshi_market_ticker: format!("KXTEST-{}-YES", id).into(),
+            kalshi_event_slug: format!("test-{}", id).into(),
+            poly_slug: format!("test-{}", id).into(),
+            poly_yes_token: format!("yes-{}", id).into(),
+            poly_no_token: format!("no-{}", id).into(),
+            line_value: None,
+            team_suffix: None,
+        }
+    }
+
+    /// Helper: Create a GlobalState with multiple markets, some with arbs
+    fn setup_markets_for_sweep() -> Arc<GlobalState> {
+        let state = GlobalState::new();
+
+        // Market 0: Has arb (Poly YES 40 + Kalshi NO 50 + fee 2 = 92)
+        let id0 = state.add_pair(make_pair("0")).unwrap();
+        let market0 = state.get_by_id(id0).unwrap();
+        market0.kalshi.store(55, 50, 1000, 1000);  // Kalshi YES=55, NO=50
+        market0.poly.store(40, 65, 1000, 1000);    // Poly YES=40, NO=65
+
+        // Market 1: No arb (prices too high)
+        let id1 = state.add_pair(make_pair("1")).unwrap();
+        let market1 = state.get_by_id(id1).unwrap();
+        market1.kalshi.store(55, 55, 1000, 1000);  // No arb
+        market1.poly.store(55, 55, 1000, 1000);
+
+        // Market 2: Incomplete prices (Poly not loaded)
+        let id2 = state.add_pair(make_pair("2")).unwrap();
+        let market2 = state.get_by_id(id2).unwrap();
+        market2.kalshi.store(40, 50, 1000, 1000);  // Kalshi loaded
+        market2.poly.store(0, 0, 0, 0);            // Poly NOT loaded
+
+        // Market 3: Another arb (KalshiYesPolyNo)
+        let id3 = state.add_pair(make_pair("3")).unwrap();
+        let market3 = state.get_by_id(id3).unwrap();
+        market3.kalshi.store(40, 65, 1000, 1000);  // Kalshi YES=40
+        market3.poly.store(55, 50, 1000, 1000);    // Poly NO=50
+
+        Arc::new(state)
+    }
+
+    /// Test: Startup sweep detects arbs in markets with complete prices
+    #[tokio::test]
+    async fn test_startup_sweep_detects_arbs() {
+        let state = setup_markets_for_sweep();
+        let (tx, mut rx) = mpsc::channel::<FastExecutionRequest>(16);
+        let threshold_cents: PriceCents = 100;
+
+        // Simulate startup sweep logic
+        let market_count = state.market_count();
+        let mut arbs_found = 0;
+        let mut markets_scanned = 0;
+
+        for market in state.markets.iter().take(market_count) {
+            let (k_yes, k_no, _, _) = market.kalshi.load();
+            let (p_yes, p_no, _, _) = market.poly.load();
+
+            // Only check markets with both platforms populated
+            if k_yes == 0 || k_no == 0 || p_yes == 0 || p_no == 0 {
+                continue;
+            }
+            markets_scanned += 1;
+
+            let arb_mask = market.check_arbs(threshold_cents);
+            if arb_mask != 0 {
+                arbs_found += 1;
+
+                let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
+                let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.load();
+
+                let (yes_price, no_price, yes_size, no_size, arb_type) = if arb_mask & 1 != 0 {
+                    (p_yes, k_no, p_yes_size, k_no_size, ArbType::PolyYesKalshiNo)
+                } else if arb_mask & 2 != 0 {
+                    (k_yes, p_no, k_yes_size, p_no_size, ArbType::KalshiYesPolyNo)
+                } else if arb_mask & 4 != 0 {
+                    (p_yes, p_no, p_yes_size, p_no_size, ArbType::PolyOnly)
+                } else if arb_mask & 8 != 0 {
+                    (k_yes, k_no, k_yes_size, k_no_size, ArbType::KalshiOnly)
+                } else {
+                    continue;
+                };
+
+                let req = FastExecutionRequest {
+                    market_id: market.market_id,
+                    yes_price,
+                    no_price,
+                    yes_size,
+                    no_size,
+                    arb_type,
+                    detected_ns: 0,
+                };
+
+                tx.try_send(req).unwrap();
+            }
+        }
+
+        // Should have scanned 3 markets (excluding the one with incomplete prices)
+        assert_eq!(markets_scanned, 3, "Should scan 3 markets with complete prices");
+
+        // Should have found 2 arbs (market 0 and market 3)
+        assert_eq!(arbs_found, 2, "Should find 2 arb opportunities");
+
+        // Verify the requests were sent
+        let req1 = rx.try_recv().expect("Should receive first arb request");
+        assert!(req1.profit_cents() > 0, "First arb should have positive profit");
+
+        let req2 = rx.try_recv().expect("Should receive second arb request");
+        assert!(req2.profit_cents() > 0, "Second arb should have positive profit");
+
+        // No more requests
+        assert!(rx.try_recv().is_err(), "Should only have 2 arb requests");
+    }
+
+    /// Test: Startup sweep skips markets with incomplete prices
+    #[tokio::test]
+    async fn test_startup_sweep_skips_incomplete_markets() {
+        let state = GlobalState::new();
+
+        // Market with only Kalshi prices
+        let id = state.add_pair(make_pair("inc")).unwrap();
+        let market = state.get_by_id(id).unwrap();
+
+        // Only Kalshi prices set (simulates Kalshi loaded before Poly)
+        market.kalshi.store(40, 50, 1000, 1000);
+        market.poly.store(0, 0, 0, 0);  // Poly not loaded
+
+        let (k_yes, k_no, _, _) = market.kalshi.load();
+        let (p_yes, p_no, _, _) = market.poly.load();
+
+        // Should be skipped due to incomplete prices
+        let should_skip = k_yes == 0 || k_no == 0 || p_yes == 0 || p_no == 0;
+        assert!(should_skip, "Market with incomplete prices should be skipped");
+    }
+
+    /// Test: Startup sweep handles zero arb opportunities gracefully
+    #[tokio::test]
+    async fn test_startup_sweep_no_arbs() {
+        let state = GlobalState::new();
+
+        // Market with no arb (prices too high)
+        let id = state.add_pair(make_pair("no-arb")).unwrap();
+        let market = state.get_by_id(id).unwrap();
+        market.kalshi.store(55, 55, 1000, 1000);
+        market.poly.store(55, 55, 1000, 1000);
+
+        let (_tx, mut rx) = mpsc::channel::<FastExecutionRequest>(16);
+        let threshold_cents: PriceCents = 100;
+
+        let market_count = state.market_count();
+        let mut arbs_found = 0;
+
+        for market in state.markets.iter().take(market_count) {
+            let (k_yes, k_no, _, _) = market.kalshi.load();
+            let (p_yes, p_no, _, _) = market.poly.load();
+
+            if k_yes == 0 || k_no == 0 || p_yes == 0 || p_no == 0 {
+                continue;
+            }
+
+            let arb_mask = market.check_arbs(threshold_cents);
+            if arb_mask != 0 {
+                arbs_found += 1;
+            }
+        }
+
+        assert_eq!(arbs_found, 0, "Should find no arb opportunities");
+        assert!(rx.try_recv().is_err(), "Channel should be empty");
+    }
+
+    /// Test: Startup sweep correctly prioritizes cross-platform arbs
+    #[tokio::test]
+    async fn test_startup_sweep_arb_type_priority() {
+        let state = GlobalState::new();
+
+        // Market with multiple arb types possible (cross-platform should win)
+        let id = state.add_pair(make_pair("multi")).unwrap();
+        let market = state.get_by_id(id).unwrap();
+
+        // Set up prices where both PolyYesKalshiNo AND PolyOnly are arbs
+        // Poly YES=40, Poly NO=50 = 90 (Poly only arb)
+        // Poly YES=40, Kalshi NO=50 + fee 2 = 92 (Cross platform arb)
+        market.kalshi.store(55, 50, 1000, 1000);
+        market.poly.store(40, 50, 1000, 1000);
+
+        let arb_mask = market.check_arbs(100);
+
+        // Both bit 0 (PolyYesKalshiNo) and bit 2 (PolyOnly) should be set
+        assert!(arb_mask & 1 != 0, "Should detect PolyYesKalshiNo");
+        assert!(arb_mask & 4 != 0, "Should detect PolyOnly");
+
+        // When building request, PolyYesKalshiNo (bit 0) takes priority
+        let arb_type = if arb_mask & 1 != 0 {
+            ArbType::PolyYesKalshiNo
+        } else if arb_mask & 2 != 0 {
+            ArbType::KalshiYesPolyNo
+        } else if arb_mask & 4 != 0 {
+            ArbType::PolyOnly
+        } else {
+            ArbType::KalshiOnly
+        };
+
+        assert!(matches!(arb_type, ArbType::PolyYesKalshiNo),
+            "Cross-platform arb should take priority");
+    }
+}
