@@ -117,7 +117,7 @@ impl RemoteExecutor {
             poly_no_token: Some(pair.poly_no_token.to_string()),
         };
 
-        if !self.trader.try_send(msg) {
+        if !self.trader.try_send(msg).await {
             warn!("[REMOTE_EXEC] No trader connected; dropping execute");
         }
 
