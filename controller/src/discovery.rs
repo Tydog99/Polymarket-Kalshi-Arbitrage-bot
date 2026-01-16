@@ -1174,7 +1174,7 @@ static ESPORTS_TEAM_ALIASES: &[(&str, &[&str])] = &[
 
     // LCS (NA LoL)
     ("cloud9", &["c9", "cloud9", "cloud 9"]),
-    ("team-liquid", &["tl", "liquid", "team liquid"]),
+    ("team-liquid", &["tl", "tl1", "tl-1", "tl 1", "liquid", "team liquid"]),
     ("flyquest", &["fly", "flyquest"]),
     ("100-thieves", &["100t", "100", "100 thieves"]),
     ("dignitas", &["dig", "dignitas"]),
@@ -1194,7 +1194,8 @@ static ESPORTS_TEAM_ALIASES: &[(&str, &[&str])] = &[
     ("virtus-pro", &["vp", "virtus", "virtus pro", "virtus.pro"]),
     ("astralis", &["ast", "astralis"]),
     ("complexity", &["col", "complexity"]),
-    ("liquid", &["tl", "liquid", "team liquid"]),
+    ("liquid", &["tl", "tl1", "tl-1", "tl 1", "liquid", "team liquid"]),
+    ("gentle-mates", &["m8", "m-8", "m 8", "gentle mates", "gentle-mates", "gentlemates"]),
     ("eternal-fire", &["ef", "eternal", "eternal fire"]),
     ("monte", &["monte"]),
     ("big", &["big", "big clan"]),
@@ -1941,5 +1942,55 @@ mod tests {
         assert_eq!(lookup_team_canonical("G2"), Some("g2-esports"));
         assert_eq!(lookup_team_canonical("T1"), Some("t1"));
         assert_eq!(lookup_team_canonical("unknown_team"), None);
+    }
+
+    #[test]
+    fn test_gentle_mates_m8_canonical() {
+        // Test Gentle Mates (M8) alias lookup
+        assert_eq!(lookup_team_canonical("M8"), Some("gentle-mates"));
+        assert_eq!(lookup_team_canonical("m8"), Some("gentle-mates"));
+        assert_eq!(lookup_team_canonical("M 8"), Some("gentle-mates"));
+        assert_eq!(lookup_team_canonical("m-8"), Some("gentle-mates"));
+        assert_eq!(lookup_team_canonical("Gentle Mates"), Some("gentle-mates"));
+        assert_eq!(lookup_team_canonical("gentle mates"), Some("gentle-mates"));
+    }
+
+    #[test]
+    fn test_team_liquid_tl1_canonical() {
+        // Test Team Liquid with numbered suffix (TL1) used by Polymarket
+        assert_eq!(lookup_team_canonical("TL"), Some("team-liquid"));
+        assert_eq!(lookup_team_canonical("TL1"), Some("team-liquid"));
+        assert_eq!(lookup_team_canonical("tl1"), Some("team-liquid"));
+        assert_eq!(lookup_team_canonical("TL 1"), Some("team-liquid"));
+        assert_eq!(lookup_team_canonical("tl-1"), Some("team-liquid"));
+        assert_eq!(lookup_team_canonical("Liquid"), Some("team-liquid"));
+        assert_eq!(lookup_team_canonical("Team Liquid"), Some("team-liquid"));
+    }
+
+    #[test]
+    fn test_gentle_mates_vs_liquid_matching() {
+        // This is the actual bug case:
+        // Kalshi: "Liquid vs Gentle Mates" with markets for TL and M8
+        // Polymarket: "M 8 vs TL 1" with outcomes ["M 8", "TL 1"]
+
+        // Verify M8 matches Gentle Mates
+        assert!(teams_match_canonical("M8", "Gentle Mates"),
+                "M8 should match Gentle Mates");
+        assert!(teams_match_canonical("M 8", "gentle-mates"),
+                "M 8 should match gentle-mates");
+
+        // Verify TL1 matches Liquid/Team Liquid
+        assert!(teams_match_canonical("TL1", "Liquid"),
+                "TL1 should match Liquid");
+        assert!(teams_match_canonical("TL 1", "Team Liquid"),
+                "TL 1 should match Team Liquid");
+        assert!(teams_match_canonical("tl-1", "liquid"),
+                "tl-1 should match liquid");
+
+        // Verify they don't cross-match
+        assert!(!teams_match_canonical("M8", "Liquid"),
+                "M8 should NOT match Liquid");
+        assert!(!teams_match_canonical("TL1", "Gentle Mates"),
+                "TL1 should NOT match Gentle Mates");
     }
 }
