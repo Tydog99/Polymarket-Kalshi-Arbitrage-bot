@@ -635,6 +635,22 @@ async fn main() -> Result<()> {
                     println!();  // Move to new line before logging opportunity
                     info!("📊 Best opportunity: {} | {} | gap={:+}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
                           desc, leg_breakdown, gap, p_yes, k_no, k_yes, p_no);
+                    // Log URLs for easy access
+                    if let Some(p) = pair.as_ref() {
+                        let kalshi_series = p.kalshi_event_ticker
+                            .split('-')
+                            .next()
+                            .unwrap_or(&p.kalshi_event_ticker)
+                            .to_lowercase();
+                        let kalshi_event_ticker_lower = p.kalshi_event_ticker.to_lowercase();
+                        info!("   🔗 Kalshi: {}/{}/{}/{} | Polymarket: {}/{}",
+                              config::KALSHI_WEB_BASE,
+                              kalshi_series,
+                              p.kalshi_event_slug,
+                              kalshi_event_ticker_lower,
+                              config::POLYMARKET_WEB_BASE,
+                              p.poly_slug);
+                    }
                 }
             } else if with_both == 0 {
                 println!();  // Move to new line before warning
