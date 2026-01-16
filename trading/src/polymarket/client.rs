@@ -50,11 +50,11 @@ fn current_unix_ts() -> u64 {
 
 #[inline(always)]
 fn generate_seed() -> u128 {
-    (SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos()
-        % u128::from(u32::MAX)) as u128
+        % u128::from(u32::MAX)
 }
 
 // ============================================================================

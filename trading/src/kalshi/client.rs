@@ -50,6 +50,7 @@ impl KalshiApiClient {
     }
 
     /// Generic authenticated GET request with retry on rate limit.
+    #[allow(dead_code)]
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let mut retries = 0;
         const MAX_RETRIES: u32 = 5;
@@ -157,7 +158,7 @@ impl KalshiApiClient {
     ) -> Result<KalshiOrderResponse> {
         debug_assert!(!ticker.is_empty(), "ticker must not be empty");
         debug_assert!(
-            price_cents >= 1 && price_cents <= 99,
+            (1..=99).contains(&price_cents),
             "price must be 1-99"
         );
         debug_assert!(count >= 1, "count must be >= 1");
@@ -195,7 +196,7 @@ impl KalshiApiClient {
     ) -> Result<KalshiOrderResponse> {
         debug_assert!(!ticker.is_empty(), "ticker must not be empty");
         debug_assert!(
-            price_cents >= 1 && price_cents <= 99,
+            (1..=99).contains(&price_cents),
             "price must be 1-99"
         );
         debug_assert!(count >= 1, "count must be >= 1");

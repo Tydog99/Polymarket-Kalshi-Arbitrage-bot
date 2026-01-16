@@ -222,7 +222,7 @@ pub fn get_order_amounts_sell(size_micro: u64, price_bps: u64) -> (i32, u128, u1
 /// Price must be >= 0.01 (100 bps) and <= 0.99 (9900 bps).
 #[inline(always)]
 pub fn price_valid(price_bps: u64) -> bool {
-    price_bps >= 100 && price_bps <= 9900
+    (100..=9900).contains(&price_bps)
 }
 
 #[cfg(test)]

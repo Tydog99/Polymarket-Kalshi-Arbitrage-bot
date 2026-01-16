@@ -26,6 +26,9 @@ use rsa::RsaPrivateKey;
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
 const POLYGON_CHAIN_ID: u64 = 137;
 
+/// Type alias for legacy leg vector to reduce complexity
+type LegacyLegVec = Vec<(String, Platform, OrderAction, OutcomeSide, u16, i64, Option<String>, Option<String>)>;
+
 /// Trader state
 pub enum TraderState {
     Uninitialized,
@@ -135,7 +138,7 @@ impl Trader {
 
         // The trader must only ever execute for its configured platform.
         let platform = self.config.platform;
-        if !platforms.iter().any(|p| *p == platform) {
+        if !platforms.contains(&platform) {
             let msg = format!(
                 "Controller did not request our platform {:?} (requested={:?})",
                 platform, platforms
@@ -280,6 +283,7 @@ impl Trader {
     }
 
     /// Handle execute leg request using the trading crate's execute_leg function
+    #[allow(clippy::too_many_arguments)]
     async fn handle_execute_leg(
         &mut self,
         market_id: u16,
@@ -304,24 +308,24 @@ impl Trader {
 
         match &self.state {
             TraderState::Uninitialized => {
-                return OutgoingMessage::LegResult {
+                OutgoingMessage::LegResult {
                     market_id,
                     leg_id,
                     platform,
                     success: false,
                     latency_ns: start.elapsed().as_nanos() as u64,
                     error: Some("Trader not initialized".to_string()),
-                };
+                }
             }
             TraderState::Error { message } => {
-                return OutgoingMessage::LegResult {
+                OutgoingMessage::LegResult {
                     market_id,
                     leg_id,
                     platform,
                     success: false,
                     latency_ns: start.elapsed().as_nanos() as u64,
                     error: Some(format!("Trader error: {}", message)),
-                };
+                }
             }
             TraderState::Initialized {
                 platform: cfg_platform,
@@ -372,6 +376,7 @@ impl Trader {
     }
 
     /// Handle order execution request (legacy)
+    #[allow(clippy::too_many_arguments)]
     async fn handle_execute(
         &mut self,
         market_id: u16,
@@ -500,6 +505,7 @@ impl Trader {
 impl Trader {
     /// Convert legacy Execute messages into single-leg instructions for this trader.
     /// Returns tuples: (leg_id, platform, action, side, price, contracts, kalshi_ticker, poly_token)
+    #[allow(clippy::too_many_arguments)]
     fn legacy_to_legs(
         &self,
         market_id: u16,
@@ -512,7 +518,7 @@ impl Trader {
         poly_no_token: Option<String>,
         _pair_id: Option<String>,
         _description: Option<String>,
-    ) -> Vec<(String, Platform, OrderAction, OutcomeSide, u16, i64, Option<String>, Option<String>)>
+    ) -> LegacyLegVec
     {
         let platform = self.config.platform;
         let mk = |suffix: &str| format!("legacy-m{}-{}", market_id, suffix);

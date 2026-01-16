@@ -58,6 +58,7 @@ impl RemoteTraderRouter {
 impl RemoteTraderRouter {
     /// Test/debug helper: register a fake connected trader for a platform and get a receiver
     /// for messages sent by the controller. Useful for testing and debugging.
+    #[allow(dead_code)] // Used in integration tests
     pub async fn test_register(&self, platform: Platform) -> mpsc::UnboundedReceiver<IncomingMessage> {
         let (tx, rx) = mpsc::unbounded_channel::<IncomingMessage>();
         let mut map = self.outgoing.write().await;
@@ -279,6 +280,6 @@ impl RemoteTraderServer {
 }
 
 fn platforms_allowed(allowed: &[Platform], platform: Platform) -> bool {
-    allowed.iter().any(|p| *p == platform)
+    allowed.contains(&platform)
 }
 

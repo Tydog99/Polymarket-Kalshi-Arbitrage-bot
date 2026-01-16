@@ -702,7 +702,7 @@ impl DiscoveryClient {
             pair_id: format!("{}-{}", poly_slug, market.ticker).into(),
             league: config.league_code.into(),
             market_type,
-            description: format!("{}", market.title).into(),
+            description: market.title.to_string().into(),
             kalshi_event_ticker: event_ticker.into(),
             kalshi_market_ticker: market.ticker.clone().into(),
             kalshi_event_slug: config.kalshi_web_slug.into(),

@@ -164,10 +164,8 @@ impl HybridExecutor {
                         ws_platform, market_id
                     );
                 }
-            } else {
-                if let Err(e) = self.execute_local_leg(ws_platform, msg).await {
-                    warn!("[HYBRID] Local execution failed: {}", e);
-                }
+            } else if let Err(e) = self.execute_local_leg(ws_platform, msg).await {
+                warn!("[HYBRID] Local execution failed: {}", e);
             }
         }
 

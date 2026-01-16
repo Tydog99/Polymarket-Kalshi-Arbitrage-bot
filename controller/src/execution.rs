@@ -246,9 +246,7 @@ impl ExecutionEngine {
                     let kalshi_ticker = pair.kalshi_market_ticker.clone();
                     let original_cost_per_contract = if yes_filled > no_filled {
                         if yes_filled > 0 { yes_cost / yes_filled } else { 0 }
-                    } else {
-                        if no_filled > 0 { no_cost / no_filled } else { 0 }
-                    };
+                    } else if no_filled > 0 { no_cost / no_filled } else { 0 };
 
                     tokio::spawn(async move {
                         Self::auto_close_background(
@@ -478,6 +476,7 @@ impl ExecutionEngine {
     }
 
     /// Background task to automatically close excess exposure from mismatched fills
+    #[allow(clippy::too_many_arguments)]
     async fn auto_close_background(
         kalshi: Arc<KalshiApiClient>,
         poly_async: Arc<SharedAsyncClient>,

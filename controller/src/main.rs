@@ -663,6 +663,7 @@ async fn main() -> Result<()> {
             let mut with_poly = 0;
             let mut with_both = 0;
             // Track best arbitrage opportunity: (total_cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no)
+            #[allow(clippy::type_complexity)]
             let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, bool)> = None;
 
             for market in heartbeat_state.markets.iter().take(market_count) {
