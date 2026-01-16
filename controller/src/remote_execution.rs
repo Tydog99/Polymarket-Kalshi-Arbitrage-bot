@@ -9,13 +9,10 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::circuit_breaker::CircuitBreaker;
+use crate::config::{KALSHI_WEB_BASE, POLYMARKET_WEB_BASE};
 use crate::remote_protocol::{IncomingMessage, OrderAction, OutcomeSide, Platform as WsPlatform};
 use crate::remote_trader::RemoteTraderRouter;
 use crate::types::{ArbType, FastExecutionRequest, GlobalState, MarketPair};
-use crate::config::{KALSHI_WEB_BASE, POLYMARKET_WEB_BASE};
-use crate::remote_protocol::{ArbType as WsArbType, IncomingMessage, Platform as WsPlatform};
-use crate::remote_trader::RemoteTraderHandle;
-use crate::types::{ArbType, FastExecutionRequest, GlobalState};
 
 use trading::execution::{
     execute_leg, ExecutionClients, LegRequest, OrderAction as TradingOrderAction,

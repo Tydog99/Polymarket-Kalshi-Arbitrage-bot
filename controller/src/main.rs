@@ -91,9 +91,6 @@ async fn discovery_refresh_task(
         .unwrap_or_default()
         .as_secs();
 
-    // Convert leagues to &[&str] for API compatibility
-    let leagues_ref: Vec<&str> = leagues.iter().map(|s| s.as_str()).collect();
-
     loop {
         interval.tick().await;
 
@@ -284,7 +281,6 @@ async fn main() -> Result<()> {
         }
     };
     info!("   Monitored leagues: {:?}", leagues);
-    let leagues_owned: Vec<String> = leagues.iter().map(|s| (*s).to_string()).collect();
 
     // Check for dry run mode
     let dry_run = std::env::var("DRY_RUN").map(|v| v == "1" || v == "true").unwrap_or(true);
@@ -329,7 +325,6 @@ async fn main() -> Result<()> {
         team_cache
     );
 
-    let leagues_ref: Vec<&str> = enabled_leagues().iter().map(|s| s.as_str()).collect();
     let result = if force_discovery {
         discovery.discover_all_force(&leagues).await
     } else {
@@ -407,7 +402,6 @@ async fn main() -> Result<()> {
     // Initialize execution infrastructure
     let (exec_tx, exec_rx) = create_execution_channel();
     let circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig::from_env()));
-    let clock = Arc::new(NanoClock::new());
 
     // Create shutdown channel for WebSocket reconnection
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -764,7 +758,7 @@ async fn main() -> Result<()> {
             discovery_state,
             shutdown_tx,
             discovery_interval,
-            enabled_leagues(),
+            enabled_leagues().to_vec(),
         ).await;
     });
 
