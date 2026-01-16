@@ -79,26 +79,27 @@ impl GammaClient {
         }
     }
     
-    /// Look up Polymarket market by slug, return (yes_token, no_token)
+    /// Look up Polymarket market by slug, return (token1, token2, outcomes)
     /// Tries both the exact date and next day (timezone handling)
-    pub async fn lookup_market(&self, slug: &str) -> Result<Option<(String, String)>> {
+    /// Note: token1/token2 are in Gamma API order; caller must use outcomes to determine YES/NO
+    pub async fn lookup_market(&self, slug: &str) -> Result<Option<(String, String, Vec<String>)>> {
         // Try exact slug first
-        if let Some(tokens) = self.try_lookup_slug(slug).await? {
-            return Ok(Some(tokens));
+        if let Some(result) = self.try_lookup_slug(slug).await? {
+            return Ok(Some(result));
         }
-        
+
         // Try with next day (Polymarket may use local time)
         if let Some(next_day_slug) = increment_date_in_slug(slug) {
-            if let Some(tokens) = self.try_lookup_slug(&next_day_slug).await? {
+            if let Some(result) = self.try_lookup_slug(&next_day_slug).await? {
                 info!("  📅 Found with next-day slug: {}", next_day_slug);
-                return Ok(Some(tokens));
+                return Ok(Some(result));
             }
         }
-        
+
         Ok(None)
     }
     
-    async fn try_lookup_slug(&self, slug: &str) -> Result<Option<(String, String)>> {
+    async fn try_lookup_slug(&self, slug: &str) -> Result<Option<(String, String, Vec<String>)>> {
         let url = format!("{}/markets?slug={}", GAMMA_API_BASE, slug);
 
         let resp = self.http.get(&url).send().await?;
@@ -126,8 +127,14 @@ impl GammaClient {
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
 
+        // Parse outcomes JSON array
+        let outcomes: Vec<String> = market.outcomes
+            .as_ref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
         if token_ids.len() >= 2 {
-            Ok(Some((token_ids[0].clone(), token_ids[1].clone())))
+            Ok(Some((token_ids[0].clone(), token_ids[1].clone(), outcomes)))
         } else {
             Ok(None)
         }
@@ -155,6 +162,9 @@ impl GammaClient {
 struct GammaMarket {
     #[serde(rename = "clobTokenIds")]
     clob_token_ids: Option<String>,
+    /// JSON array of outcome names, e.g. '["Team A", "Team B"]'
+    /// Order corresponds to clob_token_ids array
+    outcomes: Option<String>,
     active: Option<bool>,
     closed: Option<bool>,
 }

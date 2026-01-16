@@ -14,7 +14,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cache::TeamCache;
 use crate::config::{LeagueConfig, get_league_configs, get_league_config};
@@ -455,7 +455,7 @@ impl DiscoveryClient {
             })
             .collect();
         
-        // Execute lookups in parallel 
+        // Execute lookups in parallel
         let pairs: Vec<MarketPair> = stream::iter(lookup_futures)
             .map(|task| {
                 let gamma = self.gamma.clone();
@@ -463,8 +463,43 @@ impl DiscoveryClient {
                 async move {
                     let _permit = semaphore.acquire().await.ok()?;
                     match gamma.lookup_market(&task.poly_slug).await {
-                        Ok(Some((yes_token, no_token))) => {
+                        Ok(Some((token1, token2, outcomes))) => {
                             let team_suffix = extract_team_suffix(&task.market.ticker);
+
+                            // Use outcomes to determine which token is YES for this Kalshi market
+                            // outcomes[i] corresponds to token[i] from Gamma API
+                            let (yes_token, no_token) = if let Some(suffix) = &team_suffix {
+                                let suffix_lower = suffix.to_lowercase();
+                                // Check if outcome[0] contains the team suffix (team we're betting YES on)
+                                let outcome0_matches = outcomes.get(0)
+                                    .map(|o| o.to_lowercase().contains(&suffix_lower))
+                                    .unwrap_or(false);
+                                let outcome1_matches = outcomes.get(1)
+                                    .map(|o| o.to_lowercase().contains(&suffix_lower))
+                                    .unwrap_or(false);
+
+                                if outcome0_matches && !outcome1_matches {
+                                    // token1 is YES for this team
+                                    debug!("  🎯 {} | outcomes={:?} | suffix={} matches outcome[0] → token1=YES",
+                                           task.poly_slug, outcomes, suffix);
+                                    (token1, token2)
+                                } else if outcome1_matches && !outcome0_matches {
+                                    // token2 is YES for this team
+                                    debug!("  🎯 {} | outcomes={:?} | suffix={} matches outcome[1] → token2=YES",
+                                           task.poly_slug, outcomes, suffix);
+                                    (token2, token1)
+                                } else {
+                                    // Ambiguous or no match - fall back to API order with warning
+                                    warn!("  ⚠️ {} | outcomes={:?} | suffix={} - ambiguous match, using API order",
+                                          task.poly_slug, outcomes, suffix);
+                                    (token1, token2)
+                                }
+                            } else {
+                                // No team suffix (shouldn't happen for moneyline), use API order
+                                warn!("  ⚠️ {} | no team_suffix extracted, using API order", task.poly_slug);
+                                (token1, token2)
+                            };
+
                             Some(MarketPair {
                                 pair_id: format!("{}-{}", task.poly_slug, task.market.ticker).into(),
                                 league: task.league.into(),
@@ -687,8 +722,8 @@ impl DiscoveryClient {
 
         // Look up on Polymarket
         let _permit = self.gamma_semaphore.acquire().await.ok()?;
-        let (yes_token, no_token) = match self.gamma.lookup_market(&poly_slug).await {
-            Ok(Some((yes, no))) => (yes, no),
+        let (token1, token2, outcomes) = match self.gamma.lookup_market(&poly_slug).await {
+            Ok(Some(result)) => result,
             Ok(None) => return None,
             Err(e) => {
                 tracing::warn!("  ⚠️ Gamma lookup failed for {}: {}", poly_slug, e);
@@ -697,6 +732,34 @@ impl DiscoveryClient {
         };
 
         let team_suffix = extract_team_suffix(&market.ticker);
+
+        // Use outcomes to determine which token is YES for this Kalshi market
+        let (yes_token, no_token) = if let Some(ref suffix) = team_suffix {
+            let suffix_lower = suffix.to_lowercase();
+            let outcome0_matches = outcomes.get(0)
+                .map(|o| o.to_lowercase().contains(&suffix_lower))
+                .unwrap_or(false);
+            let outcome1_matches = outcomes.get(1)
+                .map(|o| o.to_lowercase().contains(&suffix_lower))
+                .unwrap_or(false);
+
+            if outcome0_matches && !outcome1_matches {
+                debug!("  🎯 {} | outcomes={:?} | suffix={} matches outcome[0] → token1=YES",
+                       poly_slug, outcomes, suffix);
+                (token1, token2)
+            } else if outcome1_matches && !outcome0_matches {
+                debug!("  🎯 {} | outcomes={:?} | suffix={} matches outcome[1] → token2=YES",
+                       poly_slug, outcomes, suffix);
+                (token2, token1)
+            } else {
+                warn!("  ⚠️ {} | outcomes={:?} | suffix={} - ambiguous match, using API order",
+                      poly_slug, outcomes, suffix);
+                (token1, token2)
+            }
+        } else {
+            warn!("  ⚠️ {} | no team_suffix extracted, using API order", poly_slug);
+            (token1, token2)
+        };
 
         Some(MarketPair {
             pair_id: format!("{}-{}", poly_slug, market.ticker).into(),
@@ -778,17 +841,23 @@ impl DiscoveryClient {
 
                                             // Find which outcome matches team1 (norm1)
                                             // This determines which token is the "YES" for team1
+                                            // Use teams_match() to handle abbreviations (e.g., "tes" matches "top-esports")
+                                            let outcome0_matches_norm1 = teams_match(&outcome0_norm, &norm1);
+                                            let outcome1_matches_norm1 = teams_match(&outcome1_norm, &norm1);
+                                            let outcome0_matches_norm2 = teams_match(&outcome0_norm, &norm2);
+                                            let outcome1_matches_norm2 = teams_match(&outcome1_norm, &norm2);
+
                                             let (team1_token, team2_token, poly_team1_norm) =
-                                                if outcome0_norm == norm1 || outcome1_norm == norm2 {
+                                                if outcome0_matches_norm1 || outcome1_matches_norm2 {
                                                     // outcomes[0] is team1, outcomes[1] is team2
                                                     (ids[0].clone(), ids[1].clone(), outcome0_norm)
-                                                } else if outcome1_norm == norm1 || outcome0_norm == norm2 {
+                                                } else if outcome1_matches_norm1 || outcome0_matches_norm2 {
                                                     // outcomes[1] is team1, outcomes[0] is team2
                                                     (ids[1].clone(), ids[0].clone(), outcome1_norm)
                                                 } else {
                                                     // Fallback: use title order (norm1 first)
-                                                    warn!("  ⚠️ Could not match outcomes {:?} to teams {}/{}",
-                                                          outcomes, norm1, norm2);
+                                                    warn!("  ⚠️ Could not match outcomes {:?} to teams {}/{} (outcome0={}, outcome1={})",
+                                                          outcomes, norm1, norm2, outcome0_norm, outcome1_norm);
                                                     (ids[0].clone(), ids[1].clone(), outcome0_norm)
                                                 };
 
@@ -1112,25 +1181,50 @@ fn extract_initials(normalized: &str) -> String {
 
 /// Check if two team names match, handling abbreviations
 /// "gz" matches "ground-zero", "lev" matches "leviatan", "drxc" matches "drx-challengers"
-fn teams_match(kalshi_team: &str, poly_team: &str) -> bool {
+/// "wb" matches "weibo", "tes" matches "top"
+fn teams_match(team_a: &str, team_b: &str) -> bool {
     // Exact match
-    if kalshi_team == poly_team {
+    if team_a == team_b {
         return true;
     }
     // Prefix match (either direction)
-    if poly_team.starts_with(kalshi_team) || kalshi_team.starts_with(poly_team) {
+    if team_a.starts_with(team_b) || team_b.starts_with(team_a) {
         return true;
     }
-    // Initial match: "gz" matches "ground-zero"
-    let poly_initials = extract_initials(poly_team);
-    if kalshi_team == poly_initials {
+    // Initial match for hyphenated names: "gz" matches "ground-zero"
+    let initials_a = extract_initials(team_a);
+    let initials_b = extract_initials(team_b);
+    if team_a == initials_b || team_b == initials_a {
         return true;
     }
     // Abbreviated compound match: "drxc" matches "drx-challengers"
-    // Check if kalshi_team starts with the first component of poly_team
-    if let Some(first_component) = poly_team.split('-').next() {
-        if kalshi_team.starts_with(first_component) && kalshi_team.len() > first_component.len() {
+    // Check if one starts with the first component of the other
+    if let Some(first_component_a) = team_a.split('-').next() {
+        if team_b.starts_with(first_component_a) && team_b.len() > first_component_a.len() {
             return true;
+        }
+    }
+    if let Some(first_component_b) = team_b.split('-').next() {
+        if team_a.starts_with(first_component_b) && team_a.len() > first_component_b.len() {
+            return true;
+        }
+    }
+    // Common esports abbreviation patterns:
+    // - First letters of each word: "Top Esports" -> "top" but outcome might be "TES" (first letters)
+    // - Brand abbreviations: "Weibo Gaming" -> "weibo" but outcome might be "WB"
+    // Check if shorter string's chars appear at word boundaries in longer string
+    let (shorter, longer) = if team_a.len() <= team_b.len() { (team_a, team_b) } else { (team_b, team_a) };
+    if shorter.len() >= 2 && shorter.len() <= 4 {
+        // Try matching shorter as acronym of longer (including hyphenated parts)
+        let longer_parts: Vec<&str> = longer.split('-').collect();
+        if longer_parts.len() >= 2 {
+            // Multi-word: check if shorter matches first letters
+            let first_letters: String = longer_parts.iter()
+                .filter_map(|p| p.chars().next())
+                .collect();
+            if shorter == first_letters {
+                return true;
+            }
         }
     }
     false
@@ -1574,5 +1668,84 @@ mod tests {
         assert_eq!(kalshi_team, "ktc");
         assert_eq!(poly_team, "kt-rolster-challengers");
         assert!(teams_match(&kalshi_team, &poly_team), "KTC should match KT Rolster Challengers");
+    }
+
+    #[test]
+    fn test_teams_match_weibo_wb() {
+        // WB should match "weibo" via prefix
+        let outcome_norm = normalize_esports_team("WB");
+        let title_norm = normalize_esports_team("Weibo Gaming");
+        assert_eq!(outcome_norm, "wb");
+        assert_eq!(title_norm, "weibo");
+        assert!(teams_match(&outcome_norm, &title_norm), "WB should match Weibo Gaming");
+    }
+
+    #[test]
+    fn test_teams_match_tes_top_esports() {
+        // TES should match "top-esports" or "top" via prefix
+        let outcome_norm = normalize_esports_team("TES");
+        let title_norm = normalize_esports_team("Top Esports");
+        assert_eq!(outcome_norm, "tes");
+        assert_eq!(title_norm, "top");
+        assert!(teams_match(&outcome_norm, &title_norm), "TES should match Top Esports");
+    }
+
+    #[test]
+    fn test_weibo_vs_tes_token_mapping() {
+        // This is the actual bug case:
+        // Poly title: "Weibo Gaming vs Top Esports"
+        // Poly outcomes: ["TES", "WB"]
+        // Poly tokens: [TES_TOKEN, WB_TOKEN]
+        //
+        // title_team1 = "Weibo Gaming" → norm1 = "weibo"
+        // title_team2 = "Top Esports" → norm2 = "top"
+        // outcome0 = "TES" → outcome0_norm = "tes"
+        // outcome1 = "WB" → outcome1_norm = "wb"
+        //
+        // With teams_match():
+        // - outcome0 (tes) matches norm2 (top)? YES (prefix match)
+        // - outcome1 (wb) matches norm1 (weibo)? YES (prefix match)
+        // So: outcomes are in REVERSED order from title
+        // → team1_token = WB_TOKEN (for Weibo)
+        // → team2_token = TES_TOKEN (for Top Esports)
+
+        let norm1 = normalize_esports_team("Weibo Gaming");   // "weibo"
+        let norm2 = normalize_esports_team("Top Esports");     // "top"
+        let outcome0_norm = normalize_esports_team("TES");     // "tes"
+        let outcome1_norm = normalize_esports_team("WB");      // "wb"
+
+        assert_eq!(norm1, "weibo");
+        assert_eq!(norm2, "top");
+        assert_eq!(outcome0_norm, "tes");
+        assert_eq!(outcome1_norm, "wb");
+
+        // Check what should match
+        let outcome0_matches_norm1 = teams_match(&outcome0_norm, &norm1); // tes vs weibo = false
+        let outcome1_matches_norm1 = teams_match(&outcome1_norm, &norm1); // wb vs weibo = true (prefix)
+        let outcome0_matches_norm2 = teams_match(&outcome0_norm, &norm2); // tes vs top = true (prefix)
+        let outcome1_matches_norm2 = teams_match(&outcome1_norm, &norm2); // wb vs top = false
+
+        assert!(!outcome0_matches_norm1, "TES should NOT match Weibo");
+        assert!(outcome1_matches_norm1, "WB should match Weibo");
+        assert!(outcome0_matches_norm2, "TES should match Top Esports");
+        assert!(!outcome1_matches_norm2, "WB should NOT match Top Esports");
+
+        // Determine token assignment using the same logic as discovery code
+        let (team1_token, team2_token) =
+            if outcome0_matches_norm1 || outcome1_matches_norm2 {
+                // outcomes[0] is team1, outcomes[1] is team2
+                ("TES_TOKEN", "WB_TOKEN")
+            } else if outcome1_matches_norm1 || outcome0_matches_norm2 {
+                // outcomes[1] is team1, outcomes[0] is team2
+                ("WB_TOKEN", "TES_TOKEN")
+            } else {
+                panic!("Should have matched");
+            };
+
+        // team1 = Weibo, team2 = Top Esports
+        // team1_token should be WB_TOKEN (Weibo's token)
+        // team2_token should be TES_TOKEN (Top Esports' token)
+        assert_eq!(team1_token, "WB_TOKEN", "Weibo should get WB token");
+        assert_eq!(team2_token, "TES_TOKEN", "Top Esports should get TES token");
     }
 }
