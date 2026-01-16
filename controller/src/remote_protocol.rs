@@ -31,12 +31,30 @@ pub enum OrderAction {
     Sell,
 }
 
+impl std::fmt::Display for OrderAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OrderAction::Buy => write!(f, "BUY"),
+            OrderAction::Sell => write!(f, "SELL"),
+        }
+    }
+}
+
 /// Outcome side (yes/no) for markets that have binary outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutcomeSide {
     Yes,
     No,
+}
+
+impl std::fmt::Display for OutcomeSide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutcomeSide::Yes => write!(f, "YES"),
+            OutcomeSide::No => write!(f, "NO"),
+        }
+    }
 }
 
 /// Incoming messages from host (controller) to trader
@@ -121,6 +139,10 @@ pub enum OutgoingMessage {
         market_id: u16,
         leg_id: String,
         platform: Platform,
+        action: OrderAction,
+        side: OutcomeSide,
+        price: u16,
+        contracts: i64,
         success: bool,
         latency_ns: u64,
         #[serde(skip_serializing_if = "Option::is_none")]

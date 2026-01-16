@@ -121,6 +121,10 @@ pub enum OutgoingMessage {
         market_id: u16,
         leg_id: String,
         platform: Platform,
+        action: OrderAction,
+        side: OutcomeSide,
+        price: u16,
+        contracts: i64,
         success: bool,
         latency_ns: u64,
         #[serde(skip_serializing_if = "Option::is_none")]

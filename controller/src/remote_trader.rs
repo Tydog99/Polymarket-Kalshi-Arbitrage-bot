@@ -205,19 +205,27 @@ impl RemoteTraderServer {
                                     }
                                     registered_platform = Some(platform);
                                 }
-                                Ok(OutgoingMessage::LegResult { market_id, leg_id, platform, success, latency_ns, error }) => {
+                                Ok(OutgoingMessage::LegResult { market_id, leg_id, platform, action, side, price, contracts, success, latency_ns, error }) => {
                                     if success {
                                         info!(
-                                            "[REMOTE] ✅ trader leg_result platform={:?} market_id={} leg_id={} latency={}µs",
+                                            "[REMOTE] ✅ {:?} {} {:?} {}x @ {}¢ market_id={} leg_id={} latency={}µs",
                                             platform,
+                                            action,
+                                            side,
+                                            contracts,
+                                            price,
                                             market_id,
                                             leg_id,
                                             latency_ns / 1000
                                         );
                                     } else {
                                         warn!(
-                                            "[REMOTE] ❌ trader leg_result platform={:?} market_id={} leg_id={} err={}",
+                                            "[REMOTE] ❌ {:?} {} {:?} {}x @ {}¢ market_id={} leg_id={} err={}",
                                             platform,
+                                            action,
+                                            side,
+                                            contracts,
+                                            price,
                                             market_id,
                                             leg_id,
                                             error.unwrap_or_else(|| "unknown".to_string())
