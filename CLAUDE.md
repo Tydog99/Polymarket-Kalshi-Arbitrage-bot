@@ -90,6 +90,22 @@ Position Tracking (position_tracker.rs)
 
 **Execution:** `DRY_RUN` (default: 1), `RUST_LOG` (default: info)
 
+**Hybrid execution:** `CONTROLLER_PLATFORMS` - comma-separated list of platforms the controller executes locally
+- `kalshi` - Execute Kalshi orders locally
+- `polymarket` or `poly` - Execute Polymarket orders locally
+- Empty/unset - Pure router mode (all trades sent to remote trader)
+
+```bash
+# Execute on Kalshi only (Polymarket sent to remote trader)
+CONTROLLER_PLATFORMS=kalshi dotenvx run -- cargo run --release
+
+# Execute on both platforms locally
+CONTROLLER_PLATFORMS=kalshi,polymarket dotenvx run -- cargo run --release
+
+# Pure router mode (no local execution)
+dotenvx run -- cargo run --release
+```
+
 **Circuit breaker:** `CB_ENABLED`, `CB_MAX_POSITION_PER_MARKET`, `CB_MAX_TOTAL_POSITION`, `CB_MAX_DAILY_LOSS`, `CB_MAX_CONSECUTIVE_ERRORS`, `CB_COOLDOWN_SECS`
 
 ## Tailscale Setup (Remote Trading)
