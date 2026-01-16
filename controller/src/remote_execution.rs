@@ -343,6 +343,7 @@ mod tests {
             description: "Test Market".into(),
             kalshi_event_ticker: "KXTEST".into(),
             kalshi_market_ticker: "KXTEST-MKT".into(),
+            kalshi_event_slug: "test-market".into(),
             poly_slug: "test".into(),
             poly_yes_token: "0x_yes".into(),
             poly_no_token: "0x_no".into(),

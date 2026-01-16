@@ -50,6 +50,8 @@ pub struct MarketPair {
     pub kalshi_event_ticker: Arc<str>,
     /// Kalshi market ticker identifier
     pub kalshi_market_ticker: Arc<str>,
+    /// Kalshi event slug for web URLs (e.g., "counterstrike-2-game")
+    pub kalshi_event_slug: Arc<str>,
     /// Polymarket market slug
     pub poly_slug: Arc<str>,
     /// Polymarket YES outcome token address
@@ -844,6 +846,7 @@ mod tests {
             description: format!("Test Market {}", id).into(),
             kalshi_event_ticker: format!("KXEPLGAME-{}", id).into(),
             kalshi_market_ticker: format!("KXEPLGAME-{}-YES", id).into(),
+            kalshi_event_slug: format!("test-market-{}", id).into(),
             poly_slug: format!("test-{}", id).into(),
             poly_yes_token: format!("yes_token_{}", id).into(),
             poly_no_token: format!("no_token_{}", id).into(),
@@ -1127,6 +1130,7 @@ mod tests {
             description: "Chelsea vs Arsenal".into(),
             kalshi_event_ticker: "KXEPLGAME-25DEC27CFCARS".into(),
             kalshi_market_ticker: "KXEPLGAME-25DEC27CFCARS-CFC".into(),
+            kalshi_event_slug: "chelsea-vs-arsenal".into(),
             poly_slug: "chelsea-vs-arsenal".into(),
             poly_yes_token: "yes_token_cfc".into(),
             poly_no_token: "no_token_cfc".into(),
