@@ -74,6 +74,7 @@ impl PolymarketAsyncClient {
     }
 
     /// Derive API key from wallet (simplified - in production this would use the actual API)
+    #[allow(dead_code)]
     pub async fn derive_api_key(&self, _nonce: u64) -> Result<(String, String)> {
         // In a real implementation, this would call Polymarket's API key derivation endpoint
         // For now, we'll use a placeholder that requires the API key to be provided
