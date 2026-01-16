@@ -279,7 +279,7 @@ pub fn parse_price(s: &str) -> PriceCents {
     }
     // Fallback to standard parse
     s.parse::<f64>()
-        .map(|p| price_to_cents(p))
+        .map(price_to_cents)
         .unwrap_or(0)
 }
 

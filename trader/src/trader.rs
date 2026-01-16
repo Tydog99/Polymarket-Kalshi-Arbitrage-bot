@@ -5,21 +5,36 @@ use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
-use crate::protocol::{ArbType, IncomingMessage, OrderAction, OutcomeSide, OutgoingMessage, Platform};
+use crate::protocol::{
+    ArbType, IncomingMessage, OrderAction, OutcomeSide, OutgoingMessage, Platform,
+};
 
-use crate::api::kalshi::{KalshiApiClient, KalshiConfig};
-use crate::api::polymarket::{PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
+// Use trading crate for execution
+use trading::execution::{
+    execute_leg, ExecutionClients, LegRequest,
+    OrderAction as TradingOrderAction, OutcomeSide as TradingOutcomeSide,
+    Platform as TradingPlatform,
+};
+use trading::kalshi::KalshiConfig;
+use trading::kalshi::KalshiApiClient;
+use trading::polymarket::{ApiCreds, PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
+
+// RSA for parsing private keys
+use rsa::pkcs1::DecodeRsaPrivateKey;
+use rsa::RsaPrivateKey;
 
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
 const POLYGON_CHAIN_ID: u64 = 137;
+
+/// Type alias for legacy leg vector to reduce complexity
+type LegacyLegVec = Vec<(String, Platform, OrderAction, OutcomeSide, u16, i64, Option<String>, Option<String>)>;
 
 /// Trader state
 pub enum TraderState {
     Uninitialized,
     Initialized {
         platform: Platform,
-        kalshi: Option<Arc<KalshiApiClient>>,
-        poly: Option<Arc<SharedAsyncClient>>,
+        clients: ExecutionClients,
         dry_run: bool,
     },
     Error {
@@ -123,7 +138,7 @@ impl Trader {
 
         // The trader must only ever execute for its configured platform.
         let platform = self.config.platform;
-        if !platforms.iter().any(|p| *p == platform) {
+        if !platforms.contains(&platform) {
             let msg = format!(
                 "Controller did not request our platform {:?} (requested={:?})",
                 platform, platforms
@@ -139,74 +154,13 @@ impl Trader {
 
         let effective_dry_run = dry_run || self.config.dry_run;
 
-        let init_res =
-            (|| -> anyhow::Result<(Option<Arc<KalshiApiClient>>, Option<Arc<SharedAsyncClient>>)> {
-                match platform {
-                    Platform::Kalshi => {
-                        if effective_dry_run {
-                            return Ok((None, None));
-                        }
-                        let api_key = self
-                            .config
-                            .kalshi_api_key
-                            .clone()
-                            .ok_or_else(|| anyhow::anyhow!("Missing KALSHI_API_KEY"))?;
-                        let private_key = self
-                            .config
-                            .kalshi_private_key
-                            .clone()
-                            .ok_or_else(|| anyhow::anyhow!("Missing KALSHI_PRIVATE_KEY"))?;
-                        let kalshi_cfg = KalshiConfig::new(api_key, &private_key)?;
-                        let kalshi = Arc::new(KalshiApiClient::new(kalshi_cfg));
-                        Ok((Some(kalshi), None))
-                    }
-                    Platform::Polymarket => {
-                        if effective_dry_run {
-                            return Ok((None, None));
-                        }
-                        let private_key = self
-                            .config
-                            .polymarket_private_key
-                            .clone()
-                            .ok_or_else(|| anyhow::anyhow!("Missing POLYMARKET_PRIVATE_KEY"))?;
-                        let funder = self
-                            .config
-                            .polymarket_funder
-                            .clone()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("Missing POLYMARKET_FUNDER (or POLY_FUNDER)")
-                            })?;
-                        let api_key = self
-                            .config
-                            .polymarket_api_key
-                            .clone()
-                            .ok_or_else(|| anyhow::anyhow!("Missing POLYMARKET_API_KEY"))?;
-                        let api_secret = self
-                            .config
-                            .polymarket_api_secret
-                            .clone()
-                            .ok_or_else(|| anyhow::anyhow!("Missing POLYMARKET_API_SECRET"))?;
-
-                        let poly_async = PolymarketAsyncClient::new(
-                            POLY_CLOB_HOST,
-                            POLYGON_CHAIN_ID,
-                            &private_key,
-                            &funder,
-                        )?;
-                        let creds = PreparedCreds::new(api_key, api_secret);
-                        let shared =
-                            Arc::new(SharedAsyncClient::new(poly_async, creds, POLYGON_CHAIN_ID));
-                        Ok((None, Some(shared)))
-                    }
-                }
-            })();
+        let init_res = self.init_clients(platform, effective_dry_run);
 
         match init_res {
-            Ok((kalshi, poly)) => {
+            Ok(clients) => {
                 self.state = TraderState::Initialized {
                     platform,
-                    kalshi,
-                    poly,
+                    clients,
                     dry_run: effective_dry_run,
                 };
                 info!("[TRADER] Initialized successfully for platform {:?}", platform);
@@ -230,6 +184,106 @@ impl Trader {
         }
     }
 
+    /// Initialize execution clients based on platform
+    fn init_clients(
+        &self,
+        platform: Platform,
+        dry_run: bool,
+    ) -> anyhow::Result<ExecutionClients> {
+        match platform {
+            Platform::Kalshi => {
+                if dry_run {
+                    return Ok(ExecutionClients {
+                        kalshi: None,
+                        polymarket: None,
+                    });
+                }
+                let api_key = self
+                    .config
+                    .kalshi_api_key
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Missing KALSHI_API_KEY"))?;
+                let private_key_pem = self
+                    .config
+                    .kalshi_private_key
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Missing KALSHI_PRIVATE_KEY"))?;
+
+                // Parse the private key PEM
+                let private_key = RsaPrivateKey::from_pkcs1_pem(private_key_pem.trim())
+                    .map_err(|e| anyhow::anyhow!("Failed to parse Kalshi private key: {}", e))?;
+
+                let kalshi_cfg = KalshiConfig {
+                    api_key_id: api_key,
+                    private_key,
+                };
+                let kalshi = Arc::new(KalshiApiClient::new(kalshi_cfg));
+
+                Ok(ExecutionClients {
+                    kalshi: Some(kalshi),
+                    polymarket: None,
+                })
+            }
+            Platform::Polymarket => {
+                if dry_run {
+                    return Ok(ExecutionClients {
+                        kalshi: None,
+                        polymarket: None,
+                    });
+                }
+                let private_key = self
+                    .config
+                    .polymarket_private_key
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Missing POLYMARKET_PRIVATE_KEY"))?;
+                let funder = self
+                    .config
+                    .polymarket_funder
+                    .clone()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Missing POLYMARKET_FUNDER (or POLY_FUNDER)")
+                    })?;
+                let api_key = self
+                    .config
+                    .polymarket_api_key
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Missing POLYMARKET_API_KEY"))?;
+                let api_secret = self
+                    .config
+                    .polymarket_api_secret
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Missing POLYMARKET_API_SECRET"))?;
+                let api_passphrase = self
+                    .config
+                    .polymarket_api_passphrase
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Missing POLYMARKET_API_PASSPHRASE"))?;
+
+                let poly_async = PolymarketAsyncClient::new(
+                    POLY_CLOB_HOST,
+                    POLYGON_CHAIN_ID,
+                    &private_key,
+                    &funder,
+                )?;
+
+                let api_creds = ApiCreds {
+                    api_key,
+                    api_secret,
+                    api_passphrase,
+                };
+                let creds = PreparedCreds::from_api_creds(&api_creds)?;
+                let shared = Arc::new(SharedAsyncClient::new(poly_async, creds, POLYGON_CHAIN_ID));
+
+                Ok(ExecutionClients {
+                    kalshi: None,
+                    polymarket: Some(shared),
+                })
+            }
+        }
+    }
+
+    /// Handle execute leg request using the trading crate's execute_leg function
+    #[allow(clippy::too_many_arguments)]
     async fn handle_execute_leg(
         &mut self,
         market_id: u16,
@@ -246,7 +300,7 @@ impl Trader {
     ) -> OutgoingMessage {
         let start = Instant::now();
 
-        // Log helpful metadata (also avoids unused-variable warnings in future changes)
+        // Log helpful metadata
         debug!(
             "[TRADER] execute_leg: market_id={} leg_id={} platform={:?} action={:?} side={:?} price={} contracts={} pair_id={:?} desc={:?}",
             market_id, leg_id, platform, action, side, price, contracts, pair_id.as_deref(), description.as_deref()
@@ -254,157 +308,91 @@ impl Trader {
 
         match &self.state {
             TraderState::Uninitialized => {
-                return OutgoingMessage::LegResult {
+                OutgoingMessage::LegResult {
                     market_id,
                     leg_id,
                     platform,
+                    action,
+                    side,
+                    price,
+                    contracts,
                     success: false,
                     latency_ns: start.elapsed().as_nanos() as u64,
                     error: Some("Trader not initialized".to_string()),
-                };
+                }
             }
             TraderState::Error { message } => {
-                return OutgoingMessage::LegResult {
+                OutgoingMessage::LegResult {
                     market_id,
                     leg_id,
                     platform,
+                    action,
+                    side,
+                    price,
+                    contracts,
                     success: false,
                     latency_ns: start.elapsed().as_nanos() as u64,
                     error: Some(format!("Trader error: {}", message)),
-                };
+                }
             }
-            TraderState::Initialized { platform: cfg_platform, dry_run, kalshi, poly } => {
+            TraderState::Initialized {
+                platform: cfg_platform,
+                dry_run,
+                clients,
+            } => {
                 if *cfg_platform != platform {
                     return OutgoingMessage::LegResult {
                         market_id,
                         leg_id,
                         platform,
+                        action,
+                        side,
+                        price,
+                        contracts,
                         success: false,
                         latency_ns: start.elapsed().as_nanos() as u64,
                         error: Some(format!("Trader is configured for {:?} only", cfg_platform)),
                     };
                 }
 
-                // Execute the single leg on our platform.
-                let res: anyhow::Result<()> = async {
-                    match platform {
-                        Platform::Kalshi => {
-                            let ticker = kalshi_market_ticker
-                                .as_deref()
-                                .ok_or_else(|| anyhow::anyhow!("Missing kalshi_market_ticker"))?;
-                            let side_str = match side {
-                                OutcomeSide::Yes => "yes",
-                                OutcomeSide::No => "no",
-                            };
-                            if *dry_run {
-                                info!(
-                                    "[KALSHI] DRY RUN leg_id={} {} {} {}x @ {}¢",
-                                    leg_id,
-                                    match action {
-                                        OrderAction::Buy => "buy",
-                                        OrderAction::Sell => "sell",
-                                    },
-                                    side_str,
-                                    contracts,
-                                    price
-                                );
-                                Ok(())
-                            } else {
-                                let client = kalshi
-                                    .as_ref()
-                                    .ok_or_else(|| anyhow::anyhow!("Kalshi client not initialized"))?;
-                                match action {
-                                    OrderAction::Buy => {
-                                        let resp = client
-                                            .buy_ioc(ticker, side_str, price as i64, contracts)
-                                            .await?;
-                                        info!(
-                                            "[KALSHI] leg_id={} order_id={} filled={} cost={}¢",
-                                            leg_id,
-                                            resp.order.order_id,
-                                            resp.order.filled_count(),
-                                            resp.order.taker_fill_cost.unwrap_or(0)
-                                                + resp.order.maker_fill_cost.unwrap_or(0)
-                                        );
-                                    }
-                                    OrderAction::Sell => {
-                                        let resp = client
-                                            .sell_ioc(ticker, side_str, price as i64, contracts)
-                                            .await?;
-                                        info!(
-                                            "[KALSHI] leg_id={} order_id={} filled={} cost={}¢",
-                                            leg_id,
-                                            resp.order.order_id,
-                                            resp.order.filled_count(),
-                                            resp.order.taker_fill_cost.unwrap_or(0)
-                                                + resp.order.maker_fill_cost.unwrap_or(0)
-                                        );
-                                    }
-                                }
-                                Ok(())
-                            }
-                        }
-                        Platform::Polymarket => {
-                            let token = poly_token
-                                .as_deref()
-                                .ok_or_else(|| anyhow::anyhow!("Missing poly_token"))?;
-                            let p = (price as f64) / 100.0;
-                            if *dry_run {
-                                info!(
-                                    "[POLY] DRY RUN leg_id={} {:?} {:?} {}x @ {:.4}",
-                                    leg_id, action, side, contracts, p
-                                );
-                                Ok(())
-                            } else {
-                                let client = poly
-                                    .as_ref()
-                                    .ok_or_else(|| anyhow::anyhow!("Polymarket client not initialized"))?;
-                                match action {
-                                    OrderAction::Buy => {
-                                        let fill = client.buy_fak(token, p, contracts as f64).await?;
-                                        info!(
-                                            "[POLY] leg_id={} order_id={} filled={:.2} cost={:.4}",
-                                            leg_id, fill.order_id, fill.filled_size, fill.fill_cost
-                                        );
-                                    }
-                                    OrderAction::Sell => {
-                                        let fill = client.sell_fak(token, p, contracts as f64).await?;
-                                        info!(
-                                            "[POLY] leg_id={} order_id={} filled={:.2} cost={:.4}",
-                                            leg_id, fill.order_id, fill.filled_size, fill.fill_cost
-                                        );
-                                    }
-                                }
-                                Ok(())
-                            }
-                        }
-                    }
-                }
-                .await;
+                // Convert protocol types to trading crate types
+                let trading_platform = convert_platform(platform);
+                let trading_action = convert_action(action);
+                let trading_side = convert_side(side);
 
-                match res {
-                    Ok(()) => OutgoingMessage::LegResult {
-                        market_id,
-                        leg_id,
-                        platform,
-                        success: true,
-                        latency_ns: start.elapsed().as_nanos() as u64,
-                        error: None,
-                    },
-                    Err(e) => OutgoingMessage::LegResult {
-                        market_id,
-                        leg_id,
-                        platform,
-                        success: false,
-                        latency_ns: start.elapsed().as_nanos() as u64,
-                        error: Some(e.to_string()),
-                    },
+                // Build the leg request
+                let leg_request = LegRequest {
+                    leg_id: &leg_id,
+                    platform: trading_platform,
+                    action: trading_action,
+                    side: trading_side,
+                    price_cents: price,
+                    contracts,
+                    kalshi_ticker: kalshi_market_ticker.as_deref(),
+                    poly_token: poly_token.as_deref(),
+                };
+
+                // Execute using the shared execute_leg function
+                let result = execute_leg(&leg_request, clients, *dry_run).await;
+
+                OutgoingMessage::LegResult {
+                    market_id,
+                    leg_id,
+                    platform,
+                    action,
+                    side,
+                    price,
+                    contracts,
+                    success: result.success,
+                    latency_ns: result.latency_ns,
+                    error: result.error,
                 }
             }
         }
     }
 
-    /// Handle order execution request
+    /// Handle order execution request (legacy)
+    #[allow(clippy::too_many_arguments)]
     async fn handle_execute(
         &mut self,
         market_id: u16,
@@ -533,6 +521,7 @@ impl Trader {
 impl Trader {
     /// Convert legacy Execute messages into single-leg instructions for this trader.
     /// Returns tuples: (leg_id, platform, action, side, price, contracts, kalshi_ticker, poly_token)
+    #[allow(clippy::too_many_arguments)]
     fn legacy_to_legs(
         &self,
         market_id: u16,
@@ -545,7 +534,8 @@ impl Trader {
         poly_no_token: Option<String>,
         _pair_id: Option<String>,
         _description: Option<String>,
-    ) -> Vec<(String, Platform, OrderAction, OutcomeSide, u16, i64, Option<String>, Option<String>)> {
+    ) -> LegacyLegVec
+    {
         let platform = self.config.platform;
         let mk = |suffix: &str| format!("legacy-m{}-{}", market_id, suffix);
 
@@ -649,5 +639,27 @@ impl Trader {
                 ]
             }
         }
+    }
+}
+
+// Conversion functions from protocol types to trading crate types
+fn convert_platform(p: Platform) -> TradingPlatform {
+    match p {
+        Platform::Kalshi => TradingPlatform::Kalshi,
+        Platform::Polymarket => TradingPlatform::Polymarket,
+    }
+}
+
+fn convert_action(a: OrderAction) -> TradingOrderAction {
+    match a {
+        OrderAction::Buy => TradingOrderAction::Buy,
+        OrderAction::Sell => TradingOrderAction::Sell,
+    }
+}
+
+fn convert_side(s: OutcomeSide) -> TradingOutcomeSide {
+    match s {
+        OutcomeSide::Yes => TradingOutcomeSide::Yes,
+        OutcomeSide::No => TradingOutcomeSide::No,
     }
 }

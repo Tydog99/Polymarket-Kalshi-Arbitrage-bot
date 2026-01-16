@@ -48,15 +48,16 @@ use tracing::{error, info, warn};
 
 use cache::TeamCache;
 use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use config::{ARB_THRESHOLD, enabled_leagues, get_league_configs, WS_RECONNECT_DELAY_SECS};
+use config::{ARB_THRESHOLD, enabled_leagues, get_league_configs, parse_controller_platforms, WS_RECONNECT_DELAY_SECS};
 use discovery::DiscoveryClient;
 use execution::{ExecutionEngine, NanoClock, create_execution_channel, run_execution_loop};
 use kalshi::{KalshiConfig, KalshiApiClient};
 use polymarket_clob::{PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
 use position_tracker::{PositionTracker, create_position_channel, position_writer_loop};
-use crate::remote_execution::{RemoteExecutor, run_remote_execution_loop};
+use crate::remote_execution::{HybridExecutor, run_hybrid_execution_loop};
 use crate::remote_protocol::Platform as WsPlatform;
 use crate::remote_trader::RemoteTraderServer;
+use trading::execution::Platform as TradingPlatform;
 use types::{GlobalState, PriceCents};
 
 /// Polymarket CLOB API host
@@ -293,6 +294,14 @@ async fn main() -> Result<()> {
         warn!("   Mode: LIVE EXECUTION");
     }
 
+    // Parse which platforms the controller can execute locally
+    let local_platforms = parse_controller_platforms();
+    if local_platforms.is_empty() {
+        info!("   Mode: PURE ROUTER (no local execution)");
+    } else {
+        info!("   Local platforms: {:?}", local_platforms);
+    }
+
     // DISCOVERY_ONLY=1 will run market discovery, print results, and exit.
     // This is useful for validating credentials + cache paths without running websockets/execution.
     let discovery_only = std::env::var("DISCOVERY_ONLY")
@@ -470,13 +479,52 @@ async fn main() -> Result<()> {
             }
         }
 
-        let remote_exec = Arc::new(RemoteExecutor::new(
+        // Create trading crate clients for local execution based on CONTROLLER_PLATFORMS
+        let trading_kalshi: Option<Arc<trading::kalshi::KalshiApiClient>> =
+            if local_platforms.contains(&TradingPlatform::Kalshi) {
+                info!("[HYBRID] Creating Kalshi client for local execution");
+                Some(Arc::new(trading::kalshi::KalshiApiClient::new(
+                    trading::kalshi::KalshiConfig::from_env()?,
+                )))
+            } else {
+                None
+            };
+
+        let trading_poly: Option<Arc<trading::polymarket::SharedAsyncClient>> =
+            if local_platforms.contains(&TradingPlatform::Polymarket) {
+                info!("[HYBRID] Creating Polymarket client for local execution");
+                let client = trading::polymarket::PolymarketAsyncClient::new(
+                    POLY_CLOB_HOST,
+                    POLYGON_CHAIN_ID,
+                    &poly_private_key,
+                    &poly_funder,
+                )?;
+                let api_creds = client.derive_api_key(0).await?;
+                let prepared = trading::polymarket::PreparedCreds::from_api_creds(&api_creds)?;
+                let shared = Arc::new(trading::polymarket::SharedAsyncClient::new(
+                    client,
+                    prepared,
+                    POLYGON_CHAIN_ID,
+                ));
+                // Load neg_risk cache
+                if let Err(e) = shared.load_cache(&neg_risk_cache_path.to_string_lossy()) {
+                    warn!("[HYBRID] Could not load neg_risk cache: {}", e);
+                }
+                Some(shared)
+            } else {
+                None
+            };
+
+        let hybrid_exec = Arc::new(HybridExecutor::new(
             state.clone(),
             circuit_breaker.clone(),
             trader_router,
+            local_platforms,
+            trading_kalshi,
+            trading_poly,
             dry_run,
         ));
-        tokio::spawn(run_remote_execution_loop(exec_rx, remote_exec))
+        tokio::spawn(run_hybrid_execution_loop(exec_rx, hybrid_exec))
     } else {
         let engine = Arc::new(ExecutionEngine::new(
             kalshi_api.clone(),
@@ -623,6 +671,7 @@ async fn main() -> Result<()> {
             let mut with_poly = 0;
             let mut with_both = 0;
             // Track best arbitrage opportunity: (total_cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no)
+            #[allow(clippy::type_complexity)]
             let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, bool)> = None;
 
             for market in heartbeat_state.markets.iter().take(market_count) {

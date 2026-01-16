@@ -404,6 +404,7 @@ pub struct FillRecord {
 }
 
 impl FillRecord {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         market_id: &str,
         description: &str,

@@ -346,7 +346,7 @@ impl KalshiApiClient {
         count: i64,
     ) -> Result<KalshiOrderResponse> {
         debug_assert!(!ticker.is_empty(), "ticker must not be empty");
-        debug_assert!(price_cents >= 1 && price_cents <= 99, "price must be 1-99");
+        debug_assert!((1..=99).contains(&price_cents), "price must be 1-99");
         debug_assert!(count >= 1, "count must be >= 1");
 
         let side_static: &'static str = if side == "yes" { "yes" } else { "no" };
@@ -373,7 +373,7 @@ impl KalshiApiClient {
         count: i64,
     ) -> Result<KalshiOrderResponse> {
         debug_assert!(!ticker.is_empty(), "ticker must not be empty");
-        debug_assert!(price_cents >= 1 && price_cents <= 99, "price must be 1-99");
+        debug_assert!((1..=99).contains(&price_cents), "price must be 1-99");
         debug_assert!(count >= 1, "count must be >= 1");
 
         let side_static: &'static str = if side == "yes" { "yes" } else { "no" };
@@ -523,7 +523,7 @@ pub async fn run_ws(
                                             // Check for arbs
                                             let arb_mask = market.check_arbs(threshold_cents);
                                             if arb_mask != 0 {
-                                                send_kalshi_arb_request(market_id, market, arb_mask, &exec_tx, &*clock).await;
+                                                send_kalshi_arb_request(market_id, market, arb_mask, &exec_tx, &clock).await;
                                             }
                                         }
                                     }
@@ -533,7 +533,7 @@ pub async fn run_ws(
 
                                             let arb_mask = market.check_arbs(threshold_cents);
                                             if arb_mask != 0 {
-                                                send_kalshi_arb_request(market_id, market, arb_mask, &exec_tx, &*clock).await;
+                                                send_kalshi_arb_request(market_id, market, arb_mask, &exec_tx, &clock).await;
                                             }
                                         }
                                     }

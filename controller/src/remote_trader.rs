@@ -55,10 +55,10 @@ impl RemoteTraderRouter {
     }
 }
 
-#[cfg(test)]
 impl RemoteTraderRouter {
-    /// Test helper: register a fake connected trader for a platform and get a receiver
-    /// for messages sent by the controller.
+    /// Test/debug helper: register a fake connected trader for a platform and get a receiver
+    /// for messages sent by the controller. Useful for testing and debugging.
+    #[allow(dead_code)] // Used in integration tests
     pub async fn test_register(&self, platform: Platform) -> mpsc::UnboundedReceiver<IncomingMessage> {
         let (tx, rx) = mpsc::unbounded_channel::<IncomingMessage>();
         let mut map = self.outgoing.write().await;
@@ -205,19 +205,27 @@ impl RemoteTraderServer {
                                     }
                                     registered_platform = Some(platform);
                                 }
-                                Ok(OutgoingMessage::LegResult { market_id, leg_id, platform, success, latency_ns, error }) => {
+                                Ok(OutgoingMessage::LegResult { market_id, leg_id, platform, action, side, price, contracts, success, latency_ns, error }) => {
                                     if success {
                                         info!(
-                                            "[REMOTE] ✅ trader leg_result platform={:?} market_id={} leg_id={} latency={}µs",
+                                            "[REMOTE] ✅ {:?} {} {:?} {}x @ {}¢ market_id={} leg_id={} latency={}µs",
                                             platform,
+                                            action,
+                                            side,
+                                            contracts,
+                                            price,
                                             market_id,
                                             leg_id,
                                             latency_ns / 1000
                                         );
                                     } else {
                                         warn!(
-                                            "[REMOTE] ❌ trader leg_result platform={:?} market_id={} leg_id={} err={}",
+                                            "[REMOTE] ❌ {:?} {} {:?} {}x @ {}¢ market_id={} leg_id={} err={}",
                                             platform,
+                                            action,
+                                            side,
+                                            contracts,
+                                            price,
                                             market_id,
                                             leg_id,
                                             error.unwrap_or_else(|| "unknown".to_string())
@@ -280,6 +288,6 @@ impl RemoteTraderServer {
 }
 
 fn platforms_allowed(allowed: &[Platform], platform: Platform) -> bool {
-    allowed.iter().any(|p| *p == platform)
+    allowed.contains(&platform)
 }
 

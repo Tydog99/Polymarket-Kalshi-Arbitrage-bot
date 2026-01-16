@@ -63,6 +63,12 @@ pub struct GammaClient {
     http: reqwest::Client,
 }
 
+impl Default for GammaClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GammaClient {
     pub fn new() -> Self {
         Self {
@@ -285,7 +291,7 @@ pub async fn run_ws(
                         // Try book snapshot first
                         if let Ok(books) = serde_json::from_str::<Vec<BookSnapshot>>(&text) {
                             for book in &books {
-                                process_book(&state, book, &exec_tx, threshold_cents, &*clock).await;
+                                process_book(&state, book, &exec_tx, threshold_cents, &clock).await;
                             }
                         }
                         // Try price change event
@@ -293,7 +299,7 @@ pub async fn run_ws(
                             if event.event_type.as_deref() == Some("price_change") {
                                 if let Some(changes) = &event.price_changes {
                                     for change in changes {
-                                        process_price_change(&state, change, &exec_tx, threshold_cents, &*clock).await;
+                                        process_price_change(&state, change, &exec_tx, threshold_cents, &clock).await;
                                     }
                                 }
                             }

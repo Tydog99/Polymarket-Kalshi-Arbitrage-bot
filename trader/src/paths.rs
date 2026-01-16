@@ -36,11 +36,9 @@ pub fn load_dotenv() {
         candidates.push(trader_dir().join(".env"));
 
         for p in candidates {
-            if p.exists() {
-                if dotenvy::from_path(&p).is_ok() {
-                    tracing::debug!("Loaded .env from {}", p.display());
-                    return;
-                }
+            if p.exists() && dotenvy::from_path(&p).is_ok() {
+                tracing::debug!("Loaded .env from {}", p.display());
+                return;
             }
         }
 

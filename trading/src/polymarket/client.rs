@@ -1,102 +1,37 @@
-//! Polymarket CLOB (Central Limit Order Book) order execution client.
+//! Polymarket CLOB async client for order execution.
 //!
-//! This module provides high-performance order execution for the Polymarket CLOB,
-//! including pre-computed authentication credentials and optimized request handling.
+//! This module provides:
+//! - `PolymarketAsyncClient` - Low-level async HTTP client with EIP-712 signing
+//! - `SharedAsyncClient` - Higher-level client with credential caching and order execution
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use anyhow::{Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE;
-use ethers::signers::{LocalWallet, Signer};
-use ethers::types::H256;
-use ethers::types::transaction::eip712::{Eip712, TypedData};
-use ethers::types::U256;
-use hmac::{Hmac, Mac};
-use reqwest::header::{HeaderMap, HeaderValue};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, Result};
+use ethers::signers::{LocalWallet, Signer};
+use ethers::types::transaction::eip712::{Eip712, TypedData};
+use ethers::types::{H256, U256};
+use reqwest::header::{HeaderMap, HeaderValue};
+use serde::Serialize;
+use serde_json::json;
+
+use super::types::{
+    get_order_amounts_buy, get_order_amounts_sell, price_to_bps, price_valid, size_to_micro,
+    ApiCreds, PolyFillAsync, PolyOrderType, PolymarketOrderResponse, PreparedCreds,
+};
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
 
 const USER_AGENT: &str = "py_clob_client";
 const MSG_TO_SIGN: &str = "This message attests that I control the given wallet";
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
 // ============================================================================
-// PRE-COMPUTED EIP712 CONSTANTS
+// HELPER FUNCTIONS
 // ============================================================================
-
-type HmacSha256 = Hmac<Sha256>;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiCreds {
-    #[serde(rename = "apiKey")]
-    pub api_key: String,
-    #[serde(rename = "secret")]
-    pub api_secret: String,
-    #[serde(rename = "passphrase")]
-    pub api_passphrase: String,
-}
-
-// ============================================================================
-// PREPARED CREDENTIALS
-// ============================================================================
-
-#[derive(Clone)]
-pub struct PreparedCreds {
-    pub api_key: String,
-    hmac_template: HmacSha256,
-    api_key_header: HeaderValue,
-    passphrase_header: HeaderValue,
-}
-
-impl PreparedCreds {
-    pub fn from_api_creds(creds: &ApiCreds) -> Result<Self> {
-        let decoded_secret = URL_SAFE.decode(&creds.api_secret)?;
-        let hmac_template = HmacSha256::new_from_slice(&decoded_secret)
-            .map_err(|e| anyhow!("Invalid HMAC key: {}", e))?;
-
-        let api_key_header = HeaderValue::from_str(&creds.api_key)
-            .map_err(|e| anyhow!("Invalid API key for header: {}", e))?;
-        let passphrase_header = HeaderValue::from_str(&creds.api_passphrase)
-            .map_err(|e| anyhow!("Invalid passphrase for header: {}", e))?;
-
-        Ok(Self {
-            api_key: creds.api_key.clone(),
-            hmac_template,
-            api_key_header,
-            passphrase_header,
-        })
-    }
-
-    /// Sign message using prewarmed HMAC
-    #[inline]
-    pub fn sign(&self, message: &[u8]) -> Vec<u8> {
-        let mut mac = self.hmac_template.clone();
-        mac.update(message);
-        mac.finalize().into_bytes().to_vec()
-    }
-
-    /// Sign and return base64 (for L2 headers)
-    #[inline]
-    pub fn sign_b64(&self, message: &[u8]) -> String {
-        URL_SAFE.encode(self.sign(message))
-    }
-
-    /// Get cached API key header
-    #[inline]
-    pub fn api_key_header(&self) -> HeaderValue {
-        self.api_key_header.clone()
-    }
-
-    /// Get cached passphrase header
-    #[inline]
-    pub fn passphrase_header(&self) -> HeaderValue {
-        self.passphrase_header.clone()
-    }
-}
 
 fn add_default_headers(headers: &mut HeaderMap) {
     headers.insert("User-Agent", HeaderValue::from_static(USER_AGENT));
@@ -107,10 +42,31 @@ fn add_default_headers(headers: &mut HeaderMap) {
 
 #[inline(always)]
 fn current_unix_ts() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
-fn clob_auth_digest(chain_id: u64, address_str: &str, timestamp: u64, nonce: u64) -> Result<H256> {
+#[inline(always)]
+fn generate_seed() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        % u128::from(u32::MAX)
+}
+
+// ============================================================================
+// EIP-712 SIGNING
+// ============================================================================
+
+fn clob_auth_digest(
+    chain_id: u64,
+    address_str: &str,
+    timestamp: u64,
+    nonce: u64,
+) -> Result<H256> {
     let typed_json = json!({
         "types": {
             "EIP712Domain": [
@@ -133,20 +89,17 @@ fn clob_auth_digest(chain_id: u64, address_str: &str, timestamp: u64, nonce: u64
     Ok(typed.encode_eip712()?.into())
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct OrderArgs {
-    pub token_id: String,
-    pub price: f64,
-    pub size: f64,
-    pub side: String,
-    pub fee_rate_bps: Option<i64>,
-    pub nonce: Option<i64>,
-    pub expiration: Option<String>,
-    pub taker: Option<String>,
+fn get_exchange_address(chain_id: u64, neg_risk: bool) -> Result<String> {
+    match (chain_id, neg_risk) {
+        (137, true) => Ok("0xC5d563A36AE78145C45a50134d48A1215220f80a".into()),
+        (137, false) => Ok("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".into()),
+        (80002, true) => Ok("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296".into()),
+        (80002, false) => Ok("0xdFE02Eb6733538f8Ea35D585af8DE5958AD99E40".into()),
+        _ => Err(anyhow!("unsupported chain")),
+    }
 }
 
-/// Order data for EIP712 signing (references to avoid clones in hot path)
+/// Order data for EIP712 signing (references to avoid clones in hot path).
 struct OrderData<'a> {
     maker: &'a str,
     taker: &'a str,
@@ -159,127 +112,7 @@ struct OrderData<'a> {
     signer: &'a str,
     expiration: &'a str,
     signature_type: i32,
-    salt: u128
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct OrderStruct {
-    pub salt: u128, 
-    pub maker: String, 
-    pub signer: String, 
-    pub taker: String,
-    #[serde(rename = "tokenId")] 
-    pub token_id: String,
-    #[serde(rename = "makerAmount")] 
-    pub maker_amount: String,
-    #[serde(rename = "takerAmount")] 
-    pub taker_amount: String,
-    pub expiration: String, 
-    pub nonce: String,
-    #[serde(rename = "feeRateBps")] 
-    pub fee_rate_bps: String,
-    pub side: i32,
-    #[serde(rename = "signatureType")] 
-    pub signature_type: i32,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SignedOrder { 
-    pub order: OrderStruct, 
-    pub signature: String 
-}
-
-impl SignedOrder {
-    pub fn post_body(&self, owner: &str, order_type: &str) -> String {
-        let side_str = if self.order.side == 0 { "BUY" } else { "SELL" };
-        let mut buf = String::with_capacity(512);
-        buf.push_str(r#"{"order":{"salt":"#);
-        buf.push_str(&self.order.salt.to_string());
-        buf.push_str(r#","maker":""#);
-        buf.push_str(&self.order.maker);
-        buf.push_str(r#"","signer":""#);
-        buf.push_str(&self.order.signer);
-        buf.push_str(r#"","taker":""#);
-        buf.push_str(&self.order.taker);
-        buf.push_str(r#"","tokenId":""#);
-        buf.push_str(&self.order.token_id);
-        buf.push_str(r#"","makerAmount":""#);
-        buf.push_str(&self.order.maker_amount);
-        buf.push_str(r#"","takerAmount":""#);
-        buf.push_str(&self.order.taker_amount);
-        buf.push_str(r#"","expiration":""#);
-        buf.push_str(&self.order.expiration);
-        buf.push_str(r#"","nonce":""#);
-        buf.push_str(&self.order.nonce);
-        buf.push_str(r#"","feeRateBps":""#);
-        buf.push_str(&self.order.fee_rate_bps);
-        buf.push_str(r#"","side":""#);
-        buf.push_str(side_str);
-        buf.push_str(r#"","signatureType":"#);
-        buf.push_str(&self.order.signature_type.to_string());
-        buf.push_str(r#","signature":""#);
-        buf.push_str(&self.signature);
-        buf.push_str(r#""},"owner":""#);
-        buf.push_str(owner);
-        buf.push_str(r#"","orderType":""#);
-        buf.push_str(order_type);
-        buf.push_str(r#""}"#);
-        buf
-    }
-}
-
-#[inline(always)]
-fn generate_seed() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() % u128::from(u32::MAX)
-}
-
-// ============================================================================
-// ORDER CALCULATIONS
-// ============================================================================
-
-/// Convert f64 price (0.0-1.0) to basis points (0-10000)
-/// e.g., 0.65 -> 6500
-#[inline(always)]
-pub fn price_to_bps(price: f64) -> u64 {
-    ((price * 10000.0).round() as i64).max(0) as u64
-}
-
-/// Convert f64 size to micro-units (6 decimal places)
-/// e.g., 100.5 -> 100_500_000
-#[inline(always)]
-pub fn size_to_micro(size: f64) -> u64 {
-    ((size * 1_000_000.0).floor() as i64).max(0) as u64
-}
-
-/// BUY order calculation
-/// Input: size in micro-units, price in basis points
-/// Output: (side=0, maker_amount, taker_amount) in token decimals (6 dp)
-#[inline(always)]
-pub fn get_order_amounts_buy(size_micro: u64, price_bps: u64) -> (i32, u128, u128) {
-    // For BUY: taker = size (what we receive), maker = size * price (what we pay)
-    let taker = size_micro as u128;
-    // maker = size * price / 10000 (convert bps to ratio)
-    let maker = (size_micro as u128 * price_bps as u128) / 10000;
-    (0, maker, taker)
-}
-
-/// SELL order calculation
-/// Input: size in micro-units, price in basis points
-/// Output: (side=1, maker_amount, taker_amount) in token decimals (6 dp)
-#[inline(always)]
-pub fn get_order_amounts_sell(size_micro: u64, price_bps: u64) -> (i32, u128, u128) {
-    // For SELL: maker = size (what we give), taker = size * price (what we receive)
-    let maker = size_micro as u128;
-    // taker = size * price / 10000 (convert bps to ratio)
-    let taker = (size_micro as u128 * price_bps as u128) / 10000;
-    (1, maker, taker)
-}
-
-/// Validate price is within allowed range for tick=0.01
-#[inline(always)]
-pub fn price_valid(price_bps: u64) -> bool {
-    // For tick=0.01: price must be >= 0.01 (100 bps) and <= 0.99 (9900 bps)
-    (100..=9900).contains(&price_bps)
+    salt: u128,
 }
 
 fn order_typed_data(chain_id: u64, exchange: &str, data: &OrderData<'_>) -> Result<TypedData> {
@@ -326,84 +159,104 @@ fn order_typed_data(chain_id: u64, exchange: &str, data: &OrderData<'_>) -> Resu
     Ok(serde_json::from_value(typed_json)?)
 }
 
-fn get_exchange_address(chain_id: u64, neg_risk: bool) -> Result<String> {
-    match (chain_id, neg_risk) {
-        (137, true) => Ok("0xC5d563A36AE78145C45a50134d48A1215220f80a".into()),
-        (137, false) => Ok("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".into()),
-        (80002, true) => Ok("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296".into()),
-        (80002, false) => Ok("0xdFE02Eb6733538f8Ea35D585af8DE5958AD99E40".into()),
-        _ => Err(anyhow!("unsupported chain")),
-    }
-}
-
 // ============================================================================
-// ORDER TYPES FOR FAK/FOK
+// ORDER STRUCTURES
 // ============================================================================
 
-/// Order type for Polymarket
-#[derive(Debug, Clone, Copy)]
+/// Order arguments for creating a new order.
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
-#[allow(clippy::upper_case_acronyms)]
-pub enum PolyOrderType {
-    /// Good Till Cancelled (default)
-    GTC,
-    /// Good Till Time
-    GTD,
-    /// Fill Or Kill - must fill entirely or cancel
-    FOK,
-    /// Fill And Kill - fill what you can, cancel rest
-    FAK,
-}
-
-impl PolyOrderType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            PolyOrderType::GTC => "GTC",
-            PolyOrderType::GTD => "GTD",
-            PolyOrderType::FOK => "FOK",
-            PolyOrderType::FAK => "FAK",
-        }
-    }
-}
-
-// ============================================================================
-// GET ORDER RESPONSE
-// ============================================================================
-
-/// Response from GET /data/order/{order_id}
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct PolymarketOrderResponse {
-    pub id: String,
-    pub status: String,
-    pub market: Option<String>,
-    pub outcome: Option<String>,
-    pub price: String,
+pub struct OrderArgs {
+    pub token_id: String,
+    pub price: f64,
+    pub size: f64,
     pub side: String,
-    pub size_matched: String,
-    pub original_size: String,
-    pub maker_address: Option<String>,
-    pub asset_id: Option<String>,
-    #[serde(default)]
-    pub associate_trades: Vec<serde_json::Value>,
-    #[serde(default)]
-    pub created_at: Option<serde_json::Value>,  // Can be string or integer
-    #[serde(default)]
-    pub expiration: Option<serde_json::Value>,  // Can be string or integer
-    #[serde(rename = "type")]
-    pub order_type: Option<String>,
-    pub owner: Option<String>,
+    pub fee_rate_bps: Option<i64>,
+    pub nonce: Option<i64>,
+    pub expiration: Option<String>,
+    pub taker: Option<String>,
+}
+
+/// Order structure for serialization.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrderStruct {
+    pub salt: u128,
+    pub maker: String,
+    pub signer: String,
+    pub taker: String,
+    #[serde(rename = "tokenId")]
+    pub token_id: String,
+    #[serde(rename = "makerAmount")]
+    pub maker_amount: String,
+    #[serde(rename = "takerAmount")]
+    pub taker_amount: String,
+    pub expiration: String,
+    pub nonce: String,
+    #[serde(rename = "feeRateBps")]
+    pub fee_rate_bps: String,
+    pub side: i32,
+    #[serde(rename = "signatureType")]
+    pub signature_type: i32,
+}
+
+/// Signed order ready for submission.
+#[derive(Debug, Clone, Serialize)]
+pub struct SignedOrder {
+    pub order: OrderStruct,
+    pub signature: String,
+}
+
+impl SignedOrder {
+    /// Build the POST body for order submission.
+    pub fn post_body(&self, owner: &str, order_type: &str) -> String {
+        let side_str = if self.order.side == 0 { "BUY" } else { "SELL" };
+        let mut buf = String::with_capacity(512);
+        buf.push_str(r#"{"order":{"salt":"#);
+        buf.push_str(&self.order.salt.to_string());
+        buf.push_str(r#","maker":""#);
+        buf.push_str(&self.order.maker);
+        buf.push_str(r#"","signer":""#);
+        buf.push_str(&self.order.signer);
+        buf.push_str(r#"","taker":""#);
+        buf.push_str(&self.order.taker);
+        buf.push_str(r#"","tokenId":""#);
+        buf.push_str(&self.order.token_id);
+        buf.push_str(r#"","makerAmount":""#);
+        buf.push_str(&self.order.maker_amount);
+        buf.push_str(r#"","takerAmount":""#);
+        buf.push_str(&self.order.taker_amount);
+        buf.push_str(r#"","expiration":""#);
+        buf.push_str(&self.order.expiration);
+        buf.push_str(r#"","nonce":""#);
+        buf.push_str(&self.order.nonce);
+        buf.push_str(r#"","feeRateBps":""#);
+        buf.push_str(&self.order.fee_rate_bps);
+        buf.push_str(r#"","side":""#);
+        buf.push_str(side_str);
+        buf.push_str(r#"","signatureType":"#);
+        buf.push_str(&self.order.signature_type.to_string());
+        buf.push_str(r#","signature":""#);
+        buf.push_str(&self.signature);
+        buf.push_str(r#""},"owner":""#);
+        buf.push_str(owner);
+        buf.push_str(r#"","orderType":""#);
+        buf.push_str(order_type);
+        buf.push_str(r#""}"#);
+        buf
+    }
 }
 
 // ============================================================================
 // ASYNC CLIENT
 // ============================================================================
 
-/// Async Polymarket client for execution
+/// Async Polymarket client for execution.
+///
+/// Handles L1/L2 authentication and HTTP requests to the CLOB API.
 pub struct PolymarketAsyncClient {
     host: String,
     chain_id: u64,
-    http: reqwest::Client,  // Async client with connection pooling
+    http: reqwest::Client,
     wallet: Arc<LocalWallet>,
     funder: String,
     wallet_address_str: String,
@@ -411,6 +264,13 @@ pub struct PolymarketAsyncClient {
 }
 
 impl PolymarketAsyncClient {
+    /// Create a new async client.
+    ///
+    /// # Arguments
+    /// * `host` - CLOB API host (e.g., "https://clob.polymarket.com")
+    /// * `chain_id` - Polygon chain ID (137 for mainnet, 80002 for Amoy testnet)
+    /// * `private_key` - 0x-prefixed private key
+    /// * `funder` - Wallet address that funds trades
     pub fn new(host: &str, chain_id: u64, private_key: &str, funder: &str) -> Result<Self> {
         let wallet = private_key.parse::<LocalWallet>()?.with_chain_id(chain_id);
         let wallet_address_str = format!("{:?}", wallet.address());
@@ -437,22 +297,29 @@ impl PolymarketAsyncClient {
         })
     }
 
-    /// Build L1 headers for authentication (derive-api-key)
-    /// wallet.sign_hash() is CPU-bound (~1ms), safe to call in async context
+    /// Build L1 headers for authentication (derive-api-key).
+    ///
+    /// wallet.sign_hash() is CPU-bound (~1ms), safe to call in async context.
     fn build_l1_headers(&self, nonce: u64) -> Result<HeaderMap> {
         let timestamp = current_unix_ts();
         let digest = clob_auth_digest(self.chain_id, &self.wallet_address_str, timestamp, nonce)?;
         let sig = self.wallet.sign_hash(digest)?;
         let mut headers = HeaderMap::new();
         headers.insert("POLY_ADDRESS", self.address_header.clone());
-        headers.insert("POLY_SIGNATURE", HeaderValue::from_str(&format!("0x{}", sig))?);
-        headers.insert("POLY_TIMESTAMP", HeaderValue::from_str(&timestamp.to_string())?);
+        headers.insert(
+            "POLY_SIGNATURE",
+            HeaderValue::from_str(&format!("0x{}", sig))?,
+        );
+        headers.insert(
+            "POLY_TIMESTAMP",
+            HeaderValue::from_str(&timestamp.to_string())?,
+        );
         headers.insert("POLY_NONCE", HeaderValue::from_str(&nonce.to_string())?);
         add_default_headers(&mut headers);
         Ok(headers)
     }
 
-    /// Derive API credentials from L1 wallet signature
+    /// Derive API credentials from L1 wallet signature.
     pub async fn derive_api_key(&self, nonce: u64) -> Result<ApiCreds> {
         let url = format!("{}/auth/derive-api-key", self.host);
         let headers = self.build_l1_headers(nonce)?;
@@ -465,51 +332,61 @@ impl PolymarketAsyncClient {
         Ok(resp.json().await?)
     }
 
-    /// Build L2 headers for authenticated requests
-    fn build_l2_headers(&self, method: &str, path: &str, body: Option<&str>, creds: &PreparedCreds) -> Result<HeaderMap> {
+    /// Build L2 headers for authenticated requests.
+    fn build_l2_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        creds: &PreparedCreds,
+    ) -> Result<HeaderMap> {
         let timestamp = current_unix_ts();
         let mut message = format!("{}{}{}", timestamp, method, path);
-        if let Some(b) = body { message.push_str(b); }
+        if let Some(b) = body {
+            message.push_str(b);
+        }
 
         let sig_b64 = creds.sign_b64(message.as_bytes());
 
         let mut headers = HeaderMap::with_capacity(9);
         headers.insert("POLY_ADDRESS", self.address_header.clone());
         headers.insert("POLY_SIGNATURE", HeaderValue::from_str(&sig_b64)?);
-        headers.insert("POLY_TIMESTAMP", HeaderValue::from_str(&timestamp.to_string())?);
+        headers.insert(
+            "POLY_TIMESTAMP",
+            HeaderValue::from_str(&timestamp.to_string())?,
+        );
         headers.insert("POLY_API_KEY", creds.api_key_header());
         headers.insert("POLY_PASSPHRASE", creds.passphrase_header());
         add_default_headers(&mut headers);
         Ok(headers)
     }
 
-    /// Post order 
-    pub async fn post_order_async(&self, body: String, creds: &PreparedCreds) -> Result<reqwest::Response> {
+    /// Post order to CLOB.
+    pub async fn post_order_async(
+        &self,
+        body: String,
+        creds: &PreparedCreds,
+    ) -> Result<reqwest::Response> {
         let path = "/order";
         let url = format!("{}{}", self.host, path);
         let headers = self.build_l2_headers("POST", path, Some(&body), creds)?;
 
-        let resp = self.http
-            .post(&url)
-            .headers(headers)
-            .body(body)
-            .send()
-            .await?;
+        let resp = self.http.post(&url).headers(headers).body(body).send().await?;
 
         Ok(resp)
     }
 
-    /// Get order by ID 
-    pub async fn get_order_async(&self, order_id: &str, creds: &PreparedCreds) -> Result<PolymarketOrderResponse> {
+    /// Get order by ID.
+    pub async fn get_order_async(
+        &self,
+        order_id: &str,
+        creds: &PreparedCreds,
+    ) -> Result<PolymarketOrderResponse> {
         let path = format!("/data/order/{}", order_id);
         let url = format!("{}{}", self.host, path);
         let headers = self.build_l2_headers("GET", &path, None, creds)?;
 
-        let resp = self.http
-            .get(&url)
-            .headers(headers)
-            .send()
-            .await?;
+        let resp = self.http.get(&url).headers(headers).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -520,10 +397,11 @@ impl PolymarketAsyncClient {
         Ok(resp.json().await?)
     }
 
-    /// Check neg_risk for token - with caching
+    /// Check neg_risk for token.
     pub async fn check_neg_risk(&self, token_id: &str) -> Result<bool> {
         let url = format!("{}/neg-risk?token_id={}", self.host, token_id);
-        let resp = self.http
+        let resp = self
+            .http
             .get(&url)
             .header("User-Agent", USER_AGENT)
             .send()
@@ -533,32 +411,45 @@ impl PolymarketAsyncClient {
         Ok(val["neg_risk"].as_bool().unwrap_or(false))
     }
 
+    /// Get wallet address as string.
     #[allow(dead_code)]
     pub fn wallet_address(&self) -> &str {
         &self.wallet_address_str
     }
 
+    /// Get funder address.
     #[allow(dead_code)]
     pub fn funder(&self) -> &str {
         &self.funder
     }
 
+    /// Get reference to wallet.
     #[allow(dead_code)]
     pub fn wallet(&self) -> &LocalWallet {
         &self.wallet
     }
 }
 
-/// Shared async client wrapper for use in execution engine
+// ============================================================================
+// SHARED ASYNC CLIENT
+// ============================================================================
+
+/// Shared async client wrapper for use in execution engine.
+///
+/// This provides a higher-level interface with:
+/// - Pre-cached credentials
+/// - Neg-risk caching
+/// - FAK order execution methods
 pub struct SharedAsyncClient {
     inner: Arc<PolymarketAsyncClient>,
     creds: PreparedCreds,
     chain_id: u64,
-    /// Pre-cached neg_risk lookups
+    /// Pre-cached neg_risk lookups.
     neg_risk_cache: std::sync::RwLock<HashMap<String, bool>>,
 }
 
 impl SharedAsyncClient {
+    /// Create a new shared client.
     pub fn new(client: PolymarketAsyncClient, creds: PreparedCreds, chain_id: u64) -> Self {
         Self {
             inner: Arc::new(client),
@@ -568,7 +459,7 @@ impl SharedAsyncClient {
         }
     }
 
-    /// Load neg_risk cache from JSON file (output of build_sports_cache.py)
+    /// Load neg_risk cache from JSON file (output of build_sports_cache.py).
     pub fn load_cache(&self, path: &str) -> Result<usize> {
         let data = std::fs::read_to_string(path)?;
         let map: HashMap<String, bool> = serde_json::from_str(&data)?;
@@ -578,7 +469,7 @@ impl SharedAsyncClient {
         Ok(count)
     }
 
-    /// Execute FAK buy order - 
+    /// Execute FAK buy order.
     pub async fn buy_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         debug_assert!(!token_id.is_empty(), "token_id must not be empty");
         debug_assert!(price > 0.0 && price < 1.0, "price must be 0 < p < 1");
@@ -586,7 +477,7 @@ impl SharedAsyncClient {
         self.execute_order(token_id, price, size, "BUY").await
     }
 
-    /// Execute FAK sell order - 
+    /// Execute FAK sell order.
     pub async fn sell_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         debug_assert!(!token_id.is_empty(), "token_id must not be empty");
         debug_assert!(price > 0.0 && price < 1.0, "price must be 0 < p < 1");
@@ -594,7 +485,13 @@ impl SharedAsyncClient {
         self.execute_order(token_id, price, size, "SELL").await
     }
 
-    async fn execute_order(&self, token_id: &str, price: f64, size: f64, side: &str) -> Result<PolyFillAsync> {
+    async fn execute_order(
+        &self,
+        token_id: &str,
+        price: f64,
+        size: f64,
+        side: &str,
+    ) -> Result<PolyFillAsync> {
         // Check neg_risk cache first
         let neg_risk = {
             let cache = self.neg_risk_cache.read().unwrap();
@@ -626,7 +523,10 @@ impl SharedAsyncClient {
         }
 
         let resp_json: serde_json::Value = resp.json().await?;
-        let order_id = resp_json["orderID"].as_str().unwrap_or("unknown").to_string();
+        let order_id = resp_json["orderID"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
 
         // Query fill status
         let order_info = self.inner.get_order_async(&order_id, &self.creds).await?;
@@ -635,7 +535,12 @@ impl SharedAsyncClient {
 
         tracing::debug!(
             "[POLY-ASYNC] FAK {} {}: status={}, filled={:.2}/{:.2}, price={:.4}",
-            side, order_id, order_info.status, filled_size, size, order_price
+            side,
+            order_id,
+            order_info.status,
+            filled_size,
+            size,
+            order_price
         );
 
         Ok(PolyFillAsync {
@@ -645,7 +550,7 @@ impl SharedAsyncClient {
         })
     }
 
-    /// Build a signed order
+    /// Build a signed order.
     fn build_signed_order(
         &self,
         token_id: &str,
@@ -658,7 +563,11 @@ impl SharedAsyncClient {
         let size_micro = size_to_micro(size);
 
         if !price_valid(price_bps) {
-            return Err(anyhow!("price {} ({}bps) outside allowed range", price, price_bps));
+            return Err(anyhow!(
+                "price {} ({}bps) outside allowed range",
+                price,
+                price_bps
+            ));
         }
 
         let (side_code, maker_amt, taker_amt) = if side.eq_ignore_ascii_case("BUY") {
@@ -673,7 +582,7 @@ impl SharedAsyncClient {
         let maker_amount_str = maker_amt.to_string();
         let taker_amount_str = taker_amt.to_string();
 
-        // Use references for EIP712 signing 
+        // Use references for EIP712 signing
         let data = OrderData {
             maker: &self.inner.funder,
             taker: ZERO_ADDRESS,
@@ -713,12 +622,16 @@ impl SharedAsyncClient {
             signature: format!("0x{}", sig),
         })
     }
-}
 
-/// Async fill result
-#[derive(Debug, Clone)]
-pub struct PolyFillAsync {
-    pub order_id: String,
-    pub filled_size: f64,
-    pub fill_cost: f64,
+    /// Get reference to the inner client.
+    #[allow(dead_code)]
+    pub fn inner(&self) -> &PolymarketAsyncClient {
+        &self.inner
+    }
+
+    /// Get reference to prepared credentials.
+    #[allow(dead_code)]
+    pub fn creds(&self) -> &PreparedCreds {
+        &self.creds
+    }
 }

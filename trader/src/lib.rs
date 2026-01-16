@@ -1,6 +1,5 @@
 //! Remote trading bot library
 
-pub mod api;
 pub mod config;
 pub mod heartbeat;
 pub mod paths;

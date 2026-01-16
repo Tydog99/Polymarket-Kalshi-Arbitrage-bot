@@ -1,6 +1,5 @@
 //! Remote trading bot - receives trading instructions via WebSocket
 
-mod api;
 mod config;
 mod heartbeat;
 mod paths;
