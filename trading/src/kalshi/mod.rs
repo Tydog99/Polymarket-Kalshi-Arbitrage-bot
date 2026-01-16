@@ -3,3 +3,5 @@
 pub mod client;
 pub mod config;
 pub mod types;
+
+pub use types::*;
