@@ -25,8 +25,8 @@ impl RemoteTraderHandle {
     }
 
     /// Send a message to the currently connected trader (if any).
-    pub fn try_send(&self, msg: IncomingMessage) -> bool {
-        if let Some(tx) = self.outgoing.blocking_read().as_ref() {
+    pub async fn try_send(&self, msg: IncomingMessage) -> bool {
+        if let Some(tx) = self.outgoing.read().await.as_ref() {
             tx.send(msg).is_ok()
         } else {
             false

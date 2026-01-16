@@ -9,7 +9,7 @@ use tracing::{error, info, warn};
 use crate::circuit_breaker::CircuitBreaker;
 use crate::remote_protocol::{ArbType as WsArbType, IncomingMessage, Platform as WsPlatform};
 use crate::remote_trader::RemoteTraderHandle;
-use crate::types::{ArbType, FastExecutionRequest, GlobalState, PriceCents};
+use crate::types::{ArbType, FastExecutionRequest, GlobalState};
 
 pub struct RemoteExecutor {
     state: Arc<GlobalState>,
@@ -117,7 +117,7 @@ impl RemoteExecutor {
             poly_no_token: Some(pair.poly_no_token.to_string()),
         };
 
-        if !self.trader.try_send(msg) {
+        if !self.trader.try_send(msg).await {
             warn!("[REMOTE_EXEC] No trader connected; dropping execute");
         }
 
@@ -164,10 +164,5 @@ pub async fn run_remote_execution_loop(
             }
         });
     }
-}
-
-/// Helper to compute threshold cents from ARB_THRESHOLD float.
-pub fn threshold_cents(threshold: f64) -> PriceCents {
-    ((threshold * 100.0).round() as u16).max(1)
 }
 

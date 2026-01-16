@@ -30,22 +30,52 @@ async fn resolve_websocket_url(config: &Config) -> Result<String> {
     info!("[MAIN] No WEBSOCKET_URL set, using Tailscale beacon discovery...");
 
     // Verify Tailscale is connected
-    let status = tailscale::verify::verify()
-        .context("Tailscale verification failed - run bootstrap first or set WEBSOCKET_URL")?;
+    let status = match tailscale::verify::verify() {
+        Ok(s) => s,
+        Err(e) => {
+            error!("[MAIN] Tailscale not available: {}", e);
+            error!("[MAIN] To use auto-discovery, set up Tailscale:");
+            error!("[MAIN]   1. Install: brew install tailscale");
+            error!("[MAIN]   2. Start:   sudo tailscaled");
+            error!("[MAIN]   3. Login:   tailscale up");
+            error!("[MAIN]   4. Verify:  tailscale status");
+            error!("[MAIN] Or set WEBSOCKET_URL to connect directly:");
+            error!("[MAIN]   WEBSOCKET_URL=ws://<controller-ip>:9001");
+            anyhow::bail!("Tailscale verification failed");
+        }
+    };
     info!("[MAIN] Tailscale connected as {}", status.self_ip);
 
     // Load beacon config
-    let ts_config = tailscale::Config::load()
-        .context("Could not load ~/.arb/config.toml - run bootstrap first")?;
+    let ts_config = match tailscale::Config::load() {
+        Ok(c) => c,
+        Err(_) => {
+            error!("[MAIN] Config file ~/.arb/config.toml not found");
+            error!("[MAIN] Run the bootstrap tool to create it:");
+            error!("[MAIN]   cargo run -p bootstrap");
+            error!("[MAIN] Or set WEBSOCKET_URL to skip auto-discovery:");
+            error!("[MAIN]   WEBSOCKET_URL=ws://<controller-ip>:9001");
+            anyhow::bail!("Config file not found - run bootstrap first");
+        }
+    };
 
     // Listen for controller beacon
     info!("[MAIN] Waiting for controller beacon on port {}...", ts_config.beacon_port);
     let listener = tailscale::BeaconListener::new(ts_config.beacon_port).await?;
 
-    let controller = listener
+    let controller = match listener
         .wait_for_controller_timeout(std::time::Duration::from_secs(300))
         .await
-        .context("Timeout waiting for controller - ensure controller is running")?;
+    {
+        Ok(c) => c,
+        Err(_) => {
+            error!("[MAIN] Timeout waiting for controller beacon");
+            error!("[MAIN] Ensure the controller is running with REMOTE_TRADER=1");
+            error!("[MAIN] Or set WEBSOCKET_URL to connect directly:");
+            error!("[MAIN]   WEBSOCKET_URL=ws://<controller-ip>:9001");
+            anyhow::bail!("Timeout waiting for controller");
+        }
+    };
 
     let url = format!("ws://{}:{}", controller.ip, controller.ws_port);
     info!("[MAIN] Discovered controller at {}", url);
