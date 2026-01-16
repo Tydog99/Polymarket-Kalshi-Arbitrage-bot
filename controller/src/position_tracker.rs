@@ -220,7 +220,7 @@ impl PositionTracker {
     
     /// Load from file or create new
     pub fn load() -> Self {
-        Self::load_from(POSITION_FILE)
+        Self::load_from(crate::paths::resolve_workspace_file(POSITION_FILE))
     }
     
     pub fn load_from<P: AsRef<Path>>(path: P) -> Self {
@@ -254,7 +254,7 @@ impl PositionTracker {
     
     /// Save to file
     pub fn save(&self) -> Result<()> {
-        self.save_to(POSITION_FILE)
+        self.save_to(crate::paths::resolve_workspace_file(POSITION_FILE))
     }
     
     pub fn save_to<P: AsRef<Path>>(&self, path: P) -> Result<()> {
@@ -273,14 +273,15 @@ impl PositionTracker {
             all_time_pnl: self.all_time_pnl,
         };
         // Try to spawn on runtime; if no runtime, save synchronously
+        let path = crate::paths::resolve_workspace_file(POSITION_FILE);
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(async move {
                 if let Ok(json) = serde_json::to_string_pretty(&data) {
-                    let _ = tokio::fs::write(POSITION_FILE, json).await;
+                    let _ = tokio::fs::write(&path, json).await;
                 }
             });
         } else if let Ok(json) = serde_json::to_string_pretty(&data) {
-            let _ = std::fs::write(POSITION_FILE, json);
+            let _ = std::fs::write(&path, json);
         }
     }
     

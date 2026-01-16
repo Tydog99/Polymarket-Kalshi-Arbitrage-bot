@@ -124,14 +124,16 @@ impl DiscoveryClient {
 
     /// Load cache from disk (async)
     async fn load_cache() -> Option<DiscoveryCache> {
-        let data = tokio::fs::read_to_string(DISCOVERY_CACHE_PATH).await.ok()?;
+        let path = crate::paths::resolve_workspace_file(DISCOVERY_CACHE_PATH);
+        let data = tokio::fs::read_to_string(&path).await.ok()?;
         serde_json::from_str(&data).ok()
     }
 
     /// Save cache to disk (async)
     async fn save_cache(cache: &DiscoveryCache) -> Result<()> {
         let data = serde_json::to_string_pretty(cache)?;
-        tokio::fs::write(DISCOVERY_CACHE_PATH, data).await?;
+        let path = crate::paths::resolve_workspace_file(DISCOVERY_CACHE_PATH);
+        tokio::fs::write(&path, data).await?;
         Ok(())
     }
     

@@ -471,7 +471,6 @@ mod infra_integration_tests {
             description: "Test Market".into(),
             kalshi_event_ticker: "KXEPLGAME-25DEC27CFCARS".into(),
             kalshi_market_ticker: "KXEPLGAME-25DEC27CFCARS-CFC".into(),
-            kalshi_event_slug: "test-market".into(),
             poly_slug: "arb-test".into(),
             poly_yes_token: "arb_yes_token".into(),
             poly_no_token: "arb_no_token".into(),
@@ -686,7 +685,6 @@ mod infra_integration_tests {
                 description: format!("Market {}", i).into(),
                 kalshi_event_ticker: format!("KXTEST-{}", i).into(),
                 kalshi_market_ticker: format!("KXTEST-{}-YES", i).into(),
-                kalshi_event_slug: format!("market-{}", i).into(),
                 poly_slug: format!("test-{}", i).into(),
                 poly_yes_token: format!("yes_{}", i).into(),
                 poly_no_token: format!("no_{}", i).into(),
@@ -768,7 +766,8 @@ mod infra_integration_tests {
         assert!(req.profit_cents() > 0, "Should have positive profit");
 
         // 6. Verify we can access market pair for execution
-        let pair = market.pair().expect("Should have pair");
+        let pair_opt = market.pair();
+        let pair = pair_opt.as_ref().expect("Should have pair");
         assert!(!pair.kalshi_market_ticker.is_empty());
         assert!(!pair.poly_yes_token.is_empty());
         assert!(!pair.poly_no_token.is_empty());
@@ -1320,7 +1319,6 @@ mod process_mock_tests {
             description: "Process Fast Test Market".into(),
             kalshi_event_ticker: "KXTEST-PROCESS".into(),
             kalshi_market_ticker: "KXTEST-PROCESS-YES".into(),
-            kalshi_event_slug: "process-fast-test-market".into(),
             poly_slug: "process-fast-test".into(),
             poly_yes_token: "pf_yes_token".into(),
             poly_no_token: "pf_no_token".into(),

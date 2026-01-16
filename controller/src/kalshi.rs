@@ -160,14 +160,21 @@ pub struct KalshiConfig {
 
 impl KalshiConfig {
     pub fn from_env() -> Result<Self> {
-        dotenvy::dotenv().ok();
+        crate::paths::load_dotenv();
         let api_key_id = std::env::var("KALSHI_API_KEY_ID").context("KALSHI_API_KEY_ID not set")?;
         // Support both KALSHI_PRIVATE_KEY_PATH and KALSHI_PRIVATE_KEY_FILE for compatibility
         let key_path = std::env::var("KALSHI_PRIVATE_KEY_PATH")
             .or_else(|_| std::env::var("KALSHI_PRIVATE_KEY_FILE"))
             .unwrap_or_else(|_| "kalshi_private_key.txt".to_string());
-        let private_key_pem = std::fs::read_to_string(&key_path)
-            .with_context(|| format!("Failed to read private key from {}", key_path))?
+        let resolved_key_path = crate::paths::resolve_user_path(&key_path);
+        let private_key_pem = std::fs::read_to_string(&resolved_key_path)
+            .with_context(|| {
+                format!(
+                    "Failed to read private key from {} (resolved to {})",
+                    key_path,
+                    resolved_key_path.display()
+                )
+            })?
             .trim()
             .to_owned();
         let private_key = RsaPrivateKey::from_pkcs1_pem(&private_key_pem)

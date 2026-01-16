@@ -28,26 +28,35 @@ mod config;
 mod discovery;
 mod execution;
 mod kalshi;
+mod paths;
 mod polymarket;
 mod polymarket_clob;
 mod position_tracker;
+mod remote_execution;
+mod remote_protocol;
+mod remote_trader;
 mod types;
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::io::Write;
 use std::sync::Arc;
+use tailscale::beacon::BeaconSender;
 use tokio::sync::{RwLock, watch};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use cache::TeamCache;
 use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use config::{ARB_THRESHOLD, enabled_leagues, WS_RECONNECT_DELAY_SECS};
+use config::{ARB_THRESHOLD, ENABLED_LEAGUES, WS_RECONNECT_DELAY_SECS};
 use discovery::DiscoveryClient;
 use execution::{ExecutionEngine, create_execution_channel, run_execution_loop};
 use kalshi::{KalshiConfig, KalshiApiClient};
 use polymarket_clob::{PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
 use position_tracker::{PositionTracker, create_position_channel, position_writer_loop};
+use crate::remote_execution::{RemoteExecutor, run_remote_execution_loop};
+use crate::remote_protocol::Platform as WsPlatform;
+use crate::remote_trader::RemoteTraderServer;
 use types::{GlobalState, PriceCents};
 
 /// Polymarket CLOB API host
@@ -61,11 +70,8 @@ async fn discovery_refresh_task(
     state: Arc<GlobalState>,
     shutdown_tx: watch::Sender<bool>,
     interval_mins: u64,
+    leagues: &'static [&'static str],
 ) {
-    // Get leagues from env (cached)
-    let enabled = enabled_leagues();
-    let leagues_vec: Vec<&str> = enabled.iter().map(|s| s.as_str()).collect();
-    let leagues: &[&str] = &leagues_vec;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     if interval_mins == 0 {
@@ -150,28 +156,101 @@ async fn discovery_refresh_task(
     }
 }
 
+fn parse_bool_env(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| v == "1" || v.to_lowercase() == "true" || v.to_lowercase() == "yes")
+        .unwrap_or(false)
+}
+
+fn parse_ws_platforms() -> Vec<WsPlatform> {
+    // Default to both platforms.
+    let raw =
+        std::env::var("TRADER_PLATFORMS").unwrap_or_else(|_| "kalshi,polymarket".to_string());
+    raw.split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter_map(|s| match s.as_str() {
+            "kalshi" => Some(WsPlatform::Kalshi),
+            "polymarket" | "poly" => Some(WsPlatform::Polymarket),
+            _ => None,
+        })
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
+    // Note: the binary crate is `controller`, while the shared library crate is `arb_bot`.
+    // If the user doesn't set `RUST_LOG`, we still want `info` logs from both crates.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("arb_bot=info".parse().unwrap()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info")
+                    .add_directive("controller=info".parse().unwrap())
+                    .add_directive("arb_bot=info".parse().unwrap())
+            }),
         )
         .init();
+
+    // Load environment variables from `.env` (supports workspace-root `.env`)
+    paths::load_dotenv();
+
+    // === Remote smoke test mode ===
+    // Runs only the controller-hosted WS server, waits for a trader to connect,
+    // sends a single synthetic execute message, then exits.
+    if parse_bool_env("REMOTE_SMOKE_TEST") {
+        let dry_run = std::env::var("DRY_RUN").map(|v| v == "1" || v == "true").unwrap_or(true);
+        let bind: std::net::SocketAddr = std::env::var("REMOTE_TRADER_BIND")
+            .unwrap_or_else(|_| "127.0.0.1:9001".to_string())
+            .parse()
+            .context("REMOTE_TRADER_BIND must be a SocketAddr, e.g. 127.0.0.1:9001")?;
+
+        let platforms = parse_ws_platforms();
+        let remote_server = RemoteTraderServer::new(bind, platforms, dry_run);
+        let trader_handle = remote_server.handle();
+        tokio::spawn(async move {
+            if let Err(e) = remote_server.run().await {
+                error!("[REMOTE] server error: {}", e);
+            }
+        });
+
+        info!("[REMOTE] Waiting for trader connection...");
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+        loop {
+            if trader_handle.is_connected().await {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                anyhow::bail!("Timed out waiting for trader to connect");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+
+        warn!("[REMOTE] Trader connected; sending synthetic execute");
+        trader_handle
+            .send(crate::remote_protocol::IncomingMessage::Execute {
+                market_id: 0,
+                arb_type: crate::remote_protocol::ArbType::PolyYesKalshiNo,
+                yes_price: 40,
+                no_price: 50,
+                yes_size: 1000,
+                no_size: 1000,
+                pair_id: Some("smoke-test".to_string()),
+                description: Some("Smoke Test Market".to_string()),
+                kalshi_market_ticker: Some("KXSMOKE-YES".to_string()),
+                poly_yes_token: Some("0x_smoke_yes".to_string()),
+                poly_no_token: Some("0x_smoke_no".to_string()),
+            })
+            .await?;
+
+        info!("[REMOTE] Sent execute; sleeping briefly then exiting");
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        return Ok(());
+    }
 
     info!("🚀 Prediction Market Arbitrage System v2.0");
     info!("   Profit threshold: <{:.1}¢ ({:.1}% minimum profit)",
           ARB_THRESHOLD * 100.0, (1.0 - ARB_THRESHOLD) * 100.0);
-
-    // Get enabled leagues (convert &[String] to Vec<&str> for API compatibility)
-    let enabled = enabled_leagues();
-    let leagues: Vec<&str> = enabled.iter().map(|s| s.as_str()).collect();
-    let leagues: &[&str] = if leagues.is_empty() { &[] } else { &leagues };
-    info!("   Monitored leagues: {:?}", if leagues.is_empty() { "all" } else { "filtered" });
-    if !leagues.is_empty() {
-        info!("   Enabled: {:?}", leagues);
-    }
+    info!("   Monitored leagues: {:?}", ENABLED_LEAGUES);
 
     // Check for dry run mode
     let dry_run = std::env::var("DRY_RUN").map(|v| v == "1" || v == "true").unwrap_or(true);
@@ -181,43 +260,19 @@ async fn main() -> Result<()> {
         warn!("   Mode: LIVE EXECUTION");
     }
 
+    // DISCOVERY_ONLY=1 will run market discovery, print results, and exit.
+    // This is useful for validating credentials + cache paths without running websockets/execution.
+    let discovery_only = std::env::var("DISCOVERY_ONLY")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+
     // Load Kalshi credentials
     let kalshi_config = KalshiConfig::from_env()?;
     info!("[KALSHI] API key loaded");
 
-    // Load Polymarket credentials
-    dotenvy::dotenv().ok();
-    let poly_private_key = std::env::var("POLY_PRIVATE_KEY")
-        .context("POLY_PRIVATE_KEY not set")?;
-    let poly_funder = std::env::var("POLY_FUNDER")
-        .context("POLY_FUNDER not set (your wallet address)")?;
-
-    // Create async Polymarket client and derive API credentials
-    info!("[POLYMARKET] Creating async client and deriving API credentials...");
-    let poly_async_client = PolymarketAsyncClient::new(
-        POLY_CLOB_HOST,
-        POLYGON_CHAIN_ID,
-        &poly_private_key,
-        &poly_funder,
-    )?;
-    let api_creds = poly_async_client.derive_api_key(0).await?;
-    let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
-    let poly_async = Arc::new(SharedAsyncClient::new(poly_async_client, prepared_creds, POLYGON_CHAIN_ID));
-
-    // Load neg_risk cache from Python script output
-    match poly_async.load_cache(".clob_market_cache.json") {
-        Ok(count) => info!("[POLYMARKET] Loaded {} neg_risk entries from cache", count),
-        Err(e) => warn!("[POLYMARKET] Could not load neg_risk cache: {}", e),
-    }
-
-    info!("[POLYMARKET] Client ready for {}", &poly_funder[..10]);
-
     // Load team code mapping cache
     let team_cache = TeamCache::load();
     info!("📂 Loaded {} team code mappings", team_cache.len());
-
-    // Create Kalshi API client
-    let kalshi_api = Arc::new(KalshiApiClient::new(kalshi_config));
 
     // Run discovery (with caching support)
     let force_discovery = std::env::var("FORCE_DISCOVERY")
@@ -233,9 +288,9 @@ async fn main() -> Result<()> {
     );
 
     let result = if force_discovery {
-        discovery.discover_all_force(leagues).await
+        discovery.discover_all_force(ENABLED_LEAGUES).await
     } else {
-        discovery.discover_all(leagues).await
+        discovery.discover_all(ENABLED_LEAGUES).await
     };
 
     info!("📊 Market discovery complete:");
@@ -260,6 +315,41 @@ async fn main() -> Result<()> {
               pair.market_type,
               pair.kalshi_market_ticker);
     }
+
+    if discovery_only {
+        info!("✅ DISCOVERY_ONLY enabled; exiting after discovery.");
+        return Ok(());
+    }
+
+    // Load Polymarket credentials
+    let poly_private_key = std::env::var("POLY_PRIVATE_KEY")
+        .context("POLY_PRIVATE_KEY not set")?;
+    let poly_funder = std::env::var("POLY_FUNDER")
+        .context("POLY_FUNDER not set (your wallet address)")?;
+
+    // Create async Polymarket client and derive API credentials
+    info!("[POLYMARKET] Creating async client and deriving API credentials...");
+    let poly_async_client = PolymarketAsyncClient::new(
+        POLY_CLOB_HOST,
+        POLYGON_CHAIN_ID,
+        &poly_private_key,
+        &poly_funder,
+    )?;
+    let api_creds = poly_async_client.derive_api_key(0).await?;
+    let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
+    let poly_async = Arc::new(SharedAsyncClient::new(poly_async_client, prepared_creds, POLYGON_CHAIN_ID));
+
+    // Load neg_risk cache from Python script output
+    let neg_risk_cache_path = paths::resolve_user_path(".clob_market_cache.json");
+    match poly_async.load_cache(&neg_risk_cache_path.to_string_lossy()) {
+        Ok(count) => info!("[POLYMARKET] Loaded {} neg_risk entries from cache", count),
+        Err(e) => warn!("[POLYMARKET] Could not load neg_risk cache: {}", e),
+    }
+
+    info!("[POLYMARKET] Client ready for {}", &poly_funder[..10]);
+
+    // Create Kalshi API client
+    let kalshi_api = Arc::new(KalshiApiClient::new(kalshi_config));
 
     // Build global state
     let state = Arc::new({
@@ -286,20 +376,69 @@ async fn main() -> Result<()> {
     let threshold_cents: PriceCents = ((ARB_THRESHOLD * 100.0).round() as u16).max(1);
     info!("   Execution threshold: {} cents", threshold_cents);
 
-    // Shared clock for accurate latency measurement across all components
-    let clock = Arc::new(execution::NanoClock::new());
+    // Remote trader mode: controller hosts a WS server and forwards executions.
+    // Set REMOTE_TRADER_BIND (e.g. "0.0.0.0:9001") to enable.
+    let remote_bind = std::env::var("REMOTE_TRADER_BIND").ok();
+    let remote_mode = remote_bind.is_some() || parse_bool_env("REMOTE_TRADER");
 
-    let engine = Arc::new(ExecutionEngine::new(
-        kalshi_api.clone(),
-        poly_async,
-        state.clone(),
-        circuit_breaker.clone(),
-        position_channel,
-        dry_run,
-        clock.clone(),
-    ));
+    let exec_handle = if remote_mode {
+        let bind = remote_bind
+            .unwrap_or_else(|| "0.0.0.0:9001".to_string())
+            .parse()
+            .context("REMOTE_TRADER_BIND must be a SocketAddr, e.g. 0.0.0.0:9001")?;
+        let platforms = parse_ws_platforms();
 
-    let exec_handle = tokio::spawn(run_execution_loop(exec_rx, engine));
+        let remote_server = RemoteTraderServer::new(bind, platforms, dry_run);
+        let trader_handle = remote_server.handle();
+        tokio::spawn(async move {
+            if let Err(e) = remote_server.run().await {
+                error!("[REMOTE] server error: {}", e);
+            }
+        });
+
+        // Start Tailscale beacon sender if Tailscale is available
+        let beacon_cancel = CancellationToken::new();
+        if let Ok(ts_status) = tailscale::verify::verify() {
+            if !ts_status.peers.is_empty() {
+                let ts_config = tailscale::Config::load().unwrap_or_default();
+                info!(
+                    "[BEACON] Starting beacon to {} peers (port {}, ws_port {})",
+                    ts_status.peers.len(),
+                    ts_config.beacon_port,
+                    ts_config.ws_port
+                );
+                let beacon_cancel_clone = beacon_cancel.clone();
+                tokio::spawn(async move {
+                    match BeaconSender::new(ts_status.peers, ts_config.beacon_port, ts_config.ws_port).await {
+                        Ok(sender) => sender.run(beacon_cancel_clone).await,
+                        Err(e) => error!("[BEACON] Failed to create beacon sender: {}", e),
+                    }
+                });
+            } else {
+                info!("[BEACON] No Tailscale peers - beacon disabled");
+            }
+        } else {
+            info!("[BEACON] Tailscale not available - beacon disabled");
+        }
+
+        let remote_exec = Arc::new(RemoteExecutor::new(
+            state.clone(),
+            circuit_breaker.clone(),
+            trader_handle,
+            dry_run,
+        ));
+        tokio::spawn(run_remote_execution_loop(exec_rx, remote_exec))
+    } else {
+        let engine = Arc::new(ExecutionEngine::new(
+            kalshi_api.clone(),
+            poly_async,
+            state.clone(),
+            circuit_breaker.clone(),
+            position_channel,
+            dry_run,
+        ));
+        tokio::spawn(run_execution_loop(exec_rx, engine))
+    };
 
     // === TEST MODE: Synthetic arbitrage injection ===
     // TEST_ARB=1 to enable, TEST_ARB_TYPE=poly_yes_kalshi_no|kalshi_yes_poly_no|poly_only|kalshi_only
@@ -308,7 +447,6 @@ async fn main() -> Result<()> {
         let test_state = state.clone();
         let test_exec_tx = exec_tx.clone();
         let test_dry_run = dry_run;
-        let test_clock = clock.clone();
 
         // Parse arb type from environment (default: poly_yes_kalshi_no)
         let arb_type_str = std::env::var("TEST_ARB_TYPE").unwrap_or_else(|_| "poly_yes_kalshi_no".to_string());
@@ -354,7 +492,7 @@ async fn main() -> Result<()> {
                             yes_size: 1000,  // 1000¢ = 10 contracts
                             no_size: 1000,   // 1000¢ = 10 contracts
                             arb_type,
-                            detected_ns: test_clock.now_ns(),
+                            detected_ns: 0,
                         };
 
                         warn!("[TEST] 🧪 Injecting synthetic {:?} arbitrage for: {}", arb_type, pair.description);
@@ -378,11 +516,10 @@ async fn main() -> Result<()> {
     let kalshi_threshold = threshold_cents;
     let kalshi_ws_config = KalshiConfig::from_env()?;
     let kalshi_shutdown_rx = shutdown_rx.clone();
-    let kalshi_clock = clock.clone();
     let kalshi_handle = tokio::spawn(async move {
         loop {
             let shutdown_rx = kalshi_shutdown_rx.clone();
-            if let Err(e) = kalshi::run_ws(&kalshi_ws_config, kalshi_state.clone(), kalshi_exec_tx.clone(), kalshi_threshold, shutdown_rx, kalshi_clock.clone()).await {
+            if let Err(e) = kalshi::run_ws(&kalshi_ws_config, kalshi_state.clone(), kalshi_exec_tx.clone(), kalshi_threshold, shutdown_rx).await {
                 error!("[KALSHI] WebSocket disconnected: {} - reconnecting...", e);
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
@@ -394,11 +531,10 @@ async fn main() -> Result<()> {
     let poly_exec_tx = exec_tx.clone();
     let poly_threshold = threshold_cents;
     let poly_shutdown_rx = shutdown_rx.clone();
-    let poly_clock = clock.clone();
     let poly_handle = tokio::spawn(async move {
         loop {
             let shutdown_rx = poly_shutdown_rx.clone();
-            if let Err(e) = polymarket::run_ws(poly_state.clone(), poly_exec_tx.clone(), poly_threshold, shutdown_rx, poly_clock.clone()).await {
+            if let Err(e) = polymarket::run_ws(poly_state.clone(), poly_exec_tx.clone(), poly_threshold, shutdown_rx).await {
                 error!("[POLYMARKET] WebSocket disconnected: {} - reconnecting...", e);
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
@@ -494,6 +630,7 @@ async fn main() -> Result<()> {
             discovery_state,
             shutdown_tx,
             discovery_interval,
+            ENABLED_LEAGUES,
         ).await;
     });
 
