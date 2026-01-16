@@ -5,6 +5,7 @@ members = [
   "controller",
   "tailscale",
   "trader",
+  "trading",
 ]
 
 [profile.release]
