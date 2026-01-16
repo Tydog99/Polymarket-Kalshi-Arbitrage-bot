@@ -1361,18 +1361,38 @@ static ESPORTS_TEAM_ALIASES: &[(&str, &[&str])] = &[
 
 /// Look up the canonical team name from any alias
 /// Returns the canonical name if found, or None
+/// Handles both space and hyphen variants (e.g., "inner-circle" matches "inner circle")
 fn lookup_team_canonical(name: &str) -> Option<&'static str> {
     let lower = name.to_lowercase();
     let normalized = lower.trim();
 
+    // Generate both space and hyphen variants for matching
+    let with_spaces = normalized.replace('-', " ");
+    let with_hyphens = normalized.replace(' ', "-");
+
     for (canonical, aliases) in ESPORTS_TEAM_ALIASES {
-        // Check canonical name
-        if *canonical == normalized || canonical.replace('-', " ") == normalized {
+        // Check canonical name (with both variants)
+        let canonical_with_spaces = canonical.replace('-', " ");
+        if *canonical == normalized
+            || *canonical == with_spaces
+            || *canonical == with_hyphens
+            || canonical_with_spaces == normalized
+            || canonical_with_spaces == with_spaces
+        {
             return Some(canonical);
         }
-        // Check all aliases
+        // Check all aliases (with both variants)
         for alias in *aliases {
-            if *alias == normalized {
+            let alias_with_hyphens = alias.replace(' ', "-");
+            let alias_with_spaces = alias.replace('-', " ");
+            if *alias == normalized
+                || *alias == with_spaces
+                || *alias == with_hyphens
+                || alias_with_hyphens == normalized
+                || alias_with_hyphens == with_hyphens
+                || alias_with_spaces == normalized
+                || alias_with_spaces == with_spaces
+            {
                 return Some(canonical);
             }
         }
@@ -2103,5 +2123,33 @@ mod tests {
                 "M8 should NOT match Liquid");
         assert!(!teams_match_canonical("TL1", "Gentle Mates"),
                 "TL1 should NOT match Gentle Mates");
+    }
+
+    #[test]
+    fn test_space_hyphen_variant_matching() {
+        // This tests the fix for the Inner Circle bug where:
+        // - normalize_esports_team("Inner Circle Esports") = "inner-circle" (hyphens)
+        // - alias in map is "inner circle" (spaces)
+        // The lookup should match both variants
+
+        // Inner Circle with hyphens should find the alias with spaces
+        assert_eq!(lookup_team_canonical("inner-circle"), Some("inner-circle-esports"),
+                   "inner-circle (hyphen) should match inner circle (space) alias");
+
+        // ICE should still work
+        assert_eq!(lookup_team_canonical("ICE"), Some("inner-circle-esports"),
+                   "ICE should match inner-circle-esports");
+
+        // Full matching should work
+        assert!(teams_match_canonical("ice", "inner-circle"),
+                "ice should match inner-circle via canonical lookup");
+        assert!(teams_match_canonical("ICE", "Inner Circle Esports"),
+                "ICE should match Inner Circle Esports");
+
+        // Test other teams with spaces in their names
+        assert_eq!(lookup_team_canonical("los-ratones"), Some("los-ratones"),
+                   "los-ratones should match");
+        assert_eq!(lookup_team_canonical("los ratones"), Some("los-ratones"),
+                   "los ratones (spaces) should match los-ratones");
     }
 }
