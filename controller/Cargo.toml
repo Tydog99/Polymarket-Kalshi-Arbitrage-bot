@@ -9,6 +9,10 @@ license = "MIT OR Apache-2.0"
 name = "arb_bot"
 path = "src/lib.rs"
 
+[[bin]]
+name = "generate-aliases"
+path = "src/bin/generate_aliases.rs"
+
 [dependencies]
 anyhow = "1.0"
 arrayvec = "0.7"
