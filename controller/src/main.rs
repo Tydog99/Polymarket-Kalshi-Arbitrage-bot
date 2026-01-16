@@ -91,6 +91,9 @@ async fn discovery_refresh_task(
         .unwrap_or_default()
         .as_secs();
 
+    // Convert leagues to &[&str] for API compatibility
+    let leagues_ref: Vec<&str> = leagues.iter().map(|s| s.as_str()).collect();
+
     loop {
         interval.tick().await;
 
@@ -182,10 +185,11 @@ fn parse_ws_platforms() -> Vec<WsPlatform> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
+    // Initialize logging with compact local time format [HH:MM:SS]
     // Note: the binary crate is `controller`, while the shared library crate is `arb_bot`.
     // If the user doesn't set `RUST_LOG`, we still want `info` logs from both crates.
     tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new("[%H:%M:%S]".to_string()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 tracing_subscriber::EnvFilter::new("info")
@@ -325,6 +329,7 @@ async fn main() -> Result<()> {
         team_cache
     );
 
+    let leagues_ref: Vec<&str> = enabled_leagues().iter().map(|s| s.as_str()).collect();
     let result = if force_discovery {
         discovery.discover_all_force(&leagues).await
     } else {
@@ -414,6 +419,9 @@ async fn main() -> Result<()> {
 
     let threshold_cents: PriceCents = ((ARB_THRESHOLD * 100.0).round() as u16).max(1);
     info!("   Execution threshold: {} cents", threshold_cents);
+
+    // Shared clock for latency measurement across all components
+    let clock = Arc::new(NanoClock::new());
 
     // Remote trader mode: controller hosts a WS server and forwards executions.
     // Set REMOTE_TRADER_BIND (e.g. "0.0.0.0:9001") to enable.
@@ -695,7 +703,7 @@ async fn main() -> Result<()> {
             }
 
             let now = chrono::Local::now().format("%H:%M:%S");
-            print!("\r[{}] 💓 {} markets | K:{} P:{} Both:{} | threshold={}¢    ",
+            print!("\r[{}]  INFO 💓 {} markets | K:{} P:{} Both:{} | threshold={}¢    ",
                    now, market_count, with_kalshi, with_poly, with_both, heartbeat_threshold);
             let _ = std::io::stdout().flush();
 
@@ -722,6 +730,22 @@ async fn main() -> Result<()> {
                     println!();  // Move to new line before logging opportunity
                     info!("📊 Best opportunity: {} | {} | gap={:+}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
                           desc, leg_breakdown, gap, p_yes, k_no, k_yes, p_no);
+                    // Log URLs for easy access
+                    if let Some(p) = pair.as_ref() {
+                        let kalshi_series = p.kalshi_event_ticker
+                            .split('-')
+                            .next()
+                            .unwrap_or(&p.kalshi_event_ticker)
+                            .to_lowercase();
+                        let kalshi_event_ticker_lower = p.kalshi_event_ticker.to_lowercase();
+                        info!("   🔗 Kalshi: {}/{}/{}/{} | Polymarket: {}/{}",
+                              config::KALSHI_WEB_BASE,
+                              kalshi_series,
+                              p.kalshi_event_slug,
+                              kalshi_event_ticker_lower,
+                              config::POLYMARKET_WEB_BASE,
+                              p.poly_slug);
+                    }
                 }
             } else if with_both == 0 {
                 println!();  // Move to new line before warning
@@ -740,7 +764,7 @@ async fn main() -> Result<()> {
             discovery_state,
             shutdown_tx,
             discovery_interval,
-            leagues_owned,
+            enabled_leagues(),
         ).await;
     });
 

@@ -12,6 +12,10 @@ use crate::circuit_breaker::CircuitBreaker;
 use crate::remote_protocol::{IncomingMessage, OrderAction, OutcomeSide, Platform as WsPlatform};
 use crate::remote_trader::RemoteTraderRouter;
 use crate::types::{ArbType, FastExecutionRequest, GlobalState, MarketPair};
+use crate::config::{KALSHI_WEB_BASE, POLYMARKET_WEB_BASE};
+use crate::remote_protocol::{ArbType as WsArbType, IncomingMessage, Platform as WsPlatform};
+use crate::remote_trader::RemoteTraderHandle;
+use crate::types::{ArbType, FastExecutionRequest, GlobalState};
 
 use trading::execution::{
     execute_leg, ExecutionClients, LegRequest, OrderAction as TradingOrderAction,
@@ -124,6 +128,23 @@ impl HybridExecutor {
         info!(
             "[HYBRID] arb detected: {} | {:?} y={}c n={}c | profit={}c | {}x",
             pair.description, req.arb_type, req.yes_price, req.no_price, profit_cents, max_contracts
+        );
+
+        // Build Kalshi URL: https://kalshi.com/markets/{series}/{slug}/{event_ticker}
+        let kalshi_series = pair.kalshi_event_ticker
+            .split('-')
+            .next()
+            .unwrap_or(&pair.kalshi_event_ticker)
+            .to_lowercase();
+        let kalshi_event_ticker_lower = pair.kalshi_event_ticker.to_lowercase();
+        info!(
+            "[REMOTE_EXEC] 🔗 Kalshi: {}/{}/{}/{} | Polymarket: {}/{}",
+            KALSHI_WEB_BASE,
+            kalshi_series,
+            pair.kalshi_event_slug,
+            kalshi_event_ticker_lower,
+            POLYMARKET_WEB_BASE,
+            pair.poly_slug
         );
 
         if self.dry_run {

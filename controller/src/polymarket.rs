@@ -173,6 +173,9 @@ pub struct PolyEventMarket {
     pub slug: Option<String>,
     #[serde(rename = "clobTokenIds")]
     pub clob_token_ids: Option<String>,
+    /// JSON array of outcome names, e.g. '["Team A", "Team B"]'
+    /// Order corresponds to clob_token_ids array
+    pub outcomes: Option<String>,
 }
 
 /// Increment the date in a Polymarket slug by 1 day
