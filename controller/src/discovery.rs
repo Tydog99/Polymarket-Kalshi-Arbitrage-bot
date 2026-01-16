@@ -792,6 +792,9 @@ impl DiscoveryClient {
                                                     (ids[0].clone(), ids[1].clone(), outcome0_norm)
                                                 };
 
+                                            info!("  🔍 {} | outcomes={:?} | team1_token_owner={} | title_teams={}/{}",
+                                                  slug, outcomes, poly_team1_norm, norm1, norm2);
+
                                             // Store with both key orderings
                                             let key1 = format!("{}:{}:{}", date, norm1, norm2);
                                             let key2 = format!("{}:{}:{}", date, norm2, norm1);
@@ -799,6 +802,9 @@ impl DiscoveryClient {
                                             poly_lookup.insert(key2, (slug.clone(), team1_token, team2_token, poly_team1_norm));
                                         }
                                     }
+                                } else {
+                                    warn!("  ⚠️ {} missing outcomes field (tokens={:?}, outcomes={:?})",
+                                          slug, market.clob_token_ids.is_some(), market.outcomes.is_some());
                                 }
                                 break;
                             }
@@ -859,7 +865,11 @@ impl DiscoveryClient {
                                 .map(|s| normalize_esports_team(s))
                                 .unwrap_or_default();
 
-                            let (poly_yes, poly_no) = if kalshi_team_norm == *poly_team1 {
+                            // Check if kalshi_team matches poly_team1, handling abbreviations
+                            // "lev" should match "leviatan", "gz" should match "ground-zero"
+                            let is_match = teams_match(&kalshi_team_norm, poly_team1);
+                            let swapped = !is_match;
+                            let (poly_yes, poly_no) = if !swapped {
                                 // Kalshi "Will Team1 win?" → Poly YES = Team1 wins, Poly NO = Team1 loses
                                 (yes_token.clone(), no_token.clone())
                             } else {
@@ -868,6 +878,9 @@ impl DiscoveryClient {
                                 // Poly YES = Team1 wins = Team2 loses (this is our Kalshi NO equivalent)
                                 (no_token.clone(), yes_token.clone())
                             };
+
+                            info!("  🎯 {} | kalshi_team={} | poly_team1={} | match={} | swapped={}",
+                                  market.ticker, kalshi_team_norm, poly_team1, is_match, swapped);
 
                             pairs.push(MarketPair {
                                 pair_id: format!("{}-{}", slug, market.ticker).into(),
@@ -1086,6 +1099,41 @@ fn normalize_esports_team(name: &str) -> String {
 
     // Join words with hyphens
     cleaned.split_whitespace().collect::<Vec<_>>().join("-")
+}
+
+/// Extract initials from a normalized team name
+/// "ground-zero" -> "gz", "secret-whales" -> "sw"
+fn extract_initials(normalized: &str) -> String {
+    normalized
+        .split('-')
+        .filter_map(|word| word.chars().next())
+        .collect()
+}
+
+/// Check if two team names match, handling abbreviations
+/// "gz" matches "ground-zero", "lev" matches "leviatan", "drxc" matches "drx-challengers"
+fn teams_match(kalshi_team: &str, poly_team: &str) -> bool {
+    // Exact match
+    if kalshi_team == poly_team {
+        return true;
+    }
+    // Prefix match (either direction)
+    if poly_team.starts_with(kalshi_team) || kalshi_team.starts_with(poly_team) {
+        return true;
+    }
+    // Initial match: "gz" matches "ground-zero"
+    let poly_initials = extract_initials(poly_team);
+    if kalshi_team == poly_initials {
+        return true;
+    }
+    // Abbreviated compound match: "drxc" matches "drx-challengers"
+    // Check if kalshi_team starts with the first component of poly_team
+    if let Some(first_component) = poly_team.split('-').next() {
+        if kalshi_team.starts_with(first_component) && kalshi_team.len() > first_component.len() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Parse Polymarket event title to extract team names
@@ -1433,5 +1481,98 @@ mod tests {
         assert_eq!(normalize_esports_team("Leviatan Esports"), "leviatan");
         assert_eq!(normalize_esports_team("LOUD"), "loud");
         assert_eq!(normalize_esports_team("paiN Gaming"), "pain");
+    }
+
+    #[test]
+    fn test_extract_initials() {
+        assert_eq!(extract_initials("ground-zero"), "gz");
+        assert_eq!(extract_initials("secret-whales"), "sw");
+        assert_eq!(extract_initials("leviatan"), "l");
+        assert_eq!(extract_initials("red-canids"), "rc");
+        assert_eq!(extract_initials("furia"), "f");
+    }
+
+    #[test]
+    fn test_teams_match_exact() {
+        assert!(teams_match("furia", "furia"));
+        assert!(teams_match("leviatan", "leviatan"));
+    }
+
+    #[test]
+    fn test_teams_match_prefix() {
+        // "lev" is prefix of "leviatan"
+        assert!(teams_match("lev", "leviatan"));
+        // "red" is prefix of "red-canids"
+        assert!(teams_match("red", "red-canids"));
+    }
+
+    #[test]
+    fn test_teams_match_initials() {
+        // "gz" matches "ground-zero" via initials
+        assert!(teams_match("gz", "ground-zero"));
+        // "sw" matches "secret-whales" via initials
+        assert!(teams_match("sw", "secret-whales"));
+        // "rc" matches "red-canids" via initials
+        assert!(teams_match("rc", "red-canids"));
+    }
+
+    #[test]
+    fn test_teams_match_no_match() {
+        // Different teams should not match
+        assert!(!teams_match("furia", "leviatan"));
+        assert!(!teams_match("gz", "secret-whales"));
+        assert!(!teams_match("lev", "red-canids"));
+    }
+
+    #[test]
+    fn test_teams_match_ground_zero_bug() {
+        // This was the actual bug: "gz" should match "ground-zero"
+        let kalshi_team = normalize_esports_team("GZ");
+        let poly_team = normalize_esports_team("Ground Zero Gaming");
+        assert_eq!(kalshi_team, "gz");
+        assert_eq!(poly_team, "ground-zero");
+        assert!(teams_match(&kalshi_team, &poly_team), "GZ should match Ground Zero Gaming");
+    }
+
+    #[test]
+    fn test_teams_match_drx_challengers() {
+        // DRX should match "drx-challengers" via prefix
+        let kalshi_team = normalize_esports_team("DRX");
+        let poly_team = normalize_esports_team("DRX Challengers");
+        assert_eq!(kalshi_team, "drx");
+        assert_eq!(poly_team, "drx-challengers");
+        assert!(teams_match(&kalshi_team, &poly_team), "DRX should match DRX Challengers");
+    }
+
+    #[test]
+    fn test_teams_match_kt_rolster_challengers() {
+        // KT or KTC should match "kt-rolster-challengers"
+        let kalshi_team = normalize_esports_team("KT");
+        let poly_team = normalize_esports_team("KT Rolster Challengers");
+        assert_eq!(kalshi_team, "kt");
+        assert_eq!(poly_team, "kt-rolster-challengers");
+        assert!(teams_match(&kalshi_team, &poly_team), "KT should match KT Rolster Challengers");
+    }
+
+    #[test]
+    fn test_teams_match_drxc_compound_abbreviation() {
+        // DRXC should match "drx-challengers" via compound abbreviation
+        // "drxc" starts with "drx" (first component) and is longer
+        let kalshi_team = normalize_esports_team("DRXC");
+        let poly_team = normalize_esports_team("DRX Challengers");
+        assert_eq!(kalshi_team, "drxc");
+        assert_eq!(poly_team, "drx-challengers");
+        assert!(teams_match(&kalshi_team, &poly_team), "DRXC should match DRX Challengers");
+    }
+
+    #[test]
+    fn test_teams_match_ktc_compound_abbreviation() {
+        // KTC should match "kt-rolster-challengers" via compound abbreviation
+        // "ktc" starts with "kt" (first component) and is longer
+        let kalshi_team = normalize_esports_team("KTC");
+        let poly_team = normalize_esports_team("KT Rolster Challengers");
+        assert_eq!(kalshi_team, "ktc");
+        assert_eq!(poly_team, "kt-rolster-challengers");
+        assert!(teams_match(&kalshi_team, &poly_team), "KTC should match KT Rolster Challengers");
     }
 }
