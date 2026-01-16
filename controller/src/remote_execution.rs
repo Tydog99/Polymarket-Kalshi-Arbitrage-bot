@@ -203,7 +203,7 @@ impl HybridExecutor {
             kalshi_market_ticker,
             poly_token,
             pair_id: _,
-            description,
+            description: _,
         } = msg
         else {
             return Ok(());
@@ -235,11 +235,16 @@ impl HybridExecutor {
 
         if result.success {
             info!(
-                "[LOCAL] executed {:?} leg_id={} desc={:?} latency={}us",
-                trading_platform, leg_id, description, result.latency_ns / 1000
+                "[LOCAL] ✅ {:?} {:?} {:?} {}x @ {}¢ leg_id={} latency={}µs",
+                trading_platform, action, side, contracts, price, leg_id, result.latency_ns / 1000
             );
             Ok(())
         } else {
+            warn!(
+                "[LOCAL] ❌ {:?} {:?} {:?} {}x @ {}¢ leg_id={} err={}",
+                trading_platform, action, side, contracts, price, leg_id,
+                result.error.as_deref().unwrap_or("unknown")
+            );
             Err(anyhow!(result.error.unwrap_or_else(|| "unknown".into())))
         }
     }
