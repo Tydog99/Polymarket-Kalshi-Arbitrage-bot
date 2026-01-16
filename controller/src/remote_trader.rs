@@ -55,10 +55,9 @@ impl RemoteTraderRouter {
     }
 }
 
-#[cfg(test)]
 impl RemoteTraderRouter {
-    /// Test helper: register a fake connected trader for a platform and get a receiver
-    /// for messages sent by the controller.
+    /// Test/debug helper: register a fake connected trader for a platform and get a receiver
+    /// for messages sent by the controller. Useful for testing and debugging.
     pub async fn test_register(&self, platform: Platform) -> mpsc::UnboundedReceiver<IncomingMessage> {
         let (tx, rx) = mpsc::unbounded_channel::<IncomingMessage>();
         let mut map = self.outgoing.write().await;
