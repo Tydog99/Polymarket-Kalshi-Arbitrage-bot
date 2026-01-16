@@ -18,8 +18,47 @@ pub const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 /// Kalshi web market URL base (for user-facing links)
 pub const KALSHI_WEB_BASE: &str = "https://kalshi.com/markets";
 
-/// Polymarket web event URL base (for user-facing links)
-pub const POLYMARKET_WEB_BASE: &str = "https://polymarket.com/event";
+/// Polymarket web base URL (for user-facing links)
+pub const POLYMARKET_WEB_BASE: &str = "https://polymarket.com";
+
+/// Build a user-facing Polymarket URL from a market slug and league
+/// Uses /event/{base_slug} format (strips market-type suffixes like -total-3pt5, -ata, etc.)
+pub fn build_polymarket_url(_league: &str, poly_slug: &str) -> String {
+    // Extract base game slug (strip market-type suffixes)
+    let base_slug = extract_base_game_slug(poly_slug);
+    format!("{}/event/{}", POLYMARKET_WEB_BASE, base_slug)
+}
+
+/// Extract base game slug by removing market-type suffixes
+/// "sea-pis-ata-2026-01-16-ata" → "sea-pis-ata-2026-01-16"
+/// "sea-pis-ata-2026-01-16-total-3pt5" → "sea-pis-ata-2026-01-16"
+fn extract_base_game_slug(slug: &str) -> &str {
+    // Look for YYYY-MM-DD pattern and truncate after it
+    // Slug format: {league}-{team1}-{team2}-YYYY-MM-DD[-suffix]
+    let bytes = slug.as_bytes();
+    let len = bytes.len();
+
+    // Need at least 11 chars for the date part (-YYYY-MM-DD)
+    if len < 11 {
+        return slug;
+    }
+
+    // Scan for date pattern: -YYYY-MM-DD
+    for i in 0..len.saturating_sub(10) {
+        if bytes[i] == b'-'
+            && i + 11 <= len
+            && bytes[i+1..i+5].iter().all(|&b| b.is_ascii_digit())
+            && bytes[i+5] == b'-'
+            && bytes[i+6..i+8].iter().all(|&b| b.is_ascii_digit())
+            && bytes[i+8] == b'-'
+            && bytes[i+9..i+11].iter().all(|&b| b.is_ascii_digit())
+        {
+            // Found date ending at i+11
+            return &slug[..i + 11];
+        }
+    }
+    slug
+}
 
 /// Arb threshold: alert when total cost < this (e.g., 0.995 = 0.5% profit)
 pub const ARB_THRESHOLD: f64 = 0.995;
@@ -338,5 +377,97 @@ mod tests {
         assert!(platforms.contains(&Platform::Kalshi));
         assert!(platforms.contains(&Platform::Polymarket));
         std::env::remove_var("CONTROLLER_PLATFORMS");
+    }
+
+    #[test]
+    fn test_extract_base_game_slug_moneyline() {
+        // Moneyline slugs have team suffix
+        assert_eq!(
+            extract_base_game_slug("sea-pis-ata-2026-01-16-ata"),
+            "sea-pis-ata-2026-01-16"
+        );
+        assert_eq!(
+            extract_base_game_slug("epl-cfc-avl-2025-12-27-cfc"),
+            "epl-cfc-avl-2025-12-27"
+        );
+    }
+
+    #[test]
+    fn test_extract_base_game_slug_total() {
+        // Total slugs have -total-{line} suffix
+        assert_eq!(
+            extract_base_game_slug("sea-pis-ata-2026-01-16-total-3pt5"),
+            "sea-pis-ata-2026-01-16"
+        );
+        assert_eq!(
+            extract_base_game_slug("nba-lal-bos-2026-01-20-total-220pt5"),
+            "nba-lal-bos-2026-01-20"
+        );
+    }
+
+    #[test]
+    fn test_extract_base_game_slug_spread() {
+        // Spread slugs have -spread-{line} suffix
+        assert_eq!(
+            extract_base_game_slug("nfl-kc-buf-2026-01-19-spread-3pt5"),
+            "nfl-kc-buf-2026-01-19"
+        );
+    }
+
+    #[test]
+    fn test_extract_base_game_slug_btts() {
+        // BTTS slugs have -btts suffix
+        assert_eq!(
+            extract_base_game_slug("epl-cfc-avl-2025-12-27-btts"),
+            "epl-cfc-avl-2025-12-27"
+        );
+    }
+
+    #[test]
+    fn test_extract_base_game_slug_draw() {
+        // Draw slugs have -draw suffix
+        assert_eq!(
+            extract_base_game_slug("sea-pis-ata-2026-01-16-draw"),
+            "sea-pis-ata-2026-01-16"
+        );
+    }
+
+    #[test]
+    fn test_extract_base_game_slug_no_suffix() {
+        // Already a base slug - should return unchanged
+        assert_eq!(
+            extract_base_game_slug("sea-pis-ata-2026-01-16"),
+            "sea-pis-ata-2026-01-16"
+        );
+    }
+
+    #[test]
+    fn test_build_polymarket_url_sports() {
+        // Sports markets use /event/{base_slug} (suffixes stripped)
+        let url = build_polymarket_url("seriea", "sea-pis-ata-2026-01-16-ata");
+        assert_eq!(
+            url,
+            "https://polymarket.com/event/sea-pis-ata-2026-01-16"
+        );
+    }
+
+    #[test]
+    fn test_build_polymarket_url_esports() {
+        // Esports markets use /event/{slug}
+        let url = build_polymarket_url("cs2", "cs2-furia-9ine-2026-01-16");
+        assert_eq!(
+            url,
+            "https://polymarket.com/event/cs2-furia-9ine-2026-01-16"
+        );
+    }
+
+    #[test]
+    fn test_build_polymarket_url_ligue1() {
+        // Ligue 1 example
+        let url = build_polymarket_url("ligue1", "fl1-psg-lil-2026-01-16-psg");
+        assert_eq!(
+            url,
+            "https://polymarket.com/event/fl1-psg-lil-2026-01-16"
+        );
     }
 }
