@@ -1,5 +1,16 @@
 //! Shared types for order execution.
 
+use std::sync::Arc;
+
+use crate::kalshi::KalshiApiClient;
+use crate::polymarket::SharedAsyncClient;
+
+/// Clients available for execution.
+pub struct ExecutionClients {
+    pub kalshi: Option<Arc<KalshiApiClient>>,
+    pub polymarket: Option<Arc<SharedAsyncClient>>,
+}
+
 /// Trading platform identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Platform {
