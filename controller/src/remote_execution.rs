@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::circuit_breaker::CircuitBreaker;
+use crate::config::{KALSHI_WEB_BASE, POLYMARKET_WEB_BASE};
 use crate::remote_protocol::{ArbType as WsArbType, IncomingMessage, Platform as WsPlatform};
 use crate::remote_trader::RemoteTraderHandle;
 use crate::types::{ArbType, FastExecutionRequest, GlobalState};
@@ -95,6 +96,23 @@ impl RemoteExecutor {
         info!(
             "[REMOTE_EXEC] 🎯 {} | {:?} y={}¢ n={}¢ | profit={}¢ | {}x",
             pair.description, req.arb_type, req.yes_price, req.no_price, profit_cents, max_contracts
+        );
+
+        // Build Kalshi URL: https://kalshi.com/markets/{series}/{slug}/{event_ticker}
+        let kalshi_series = pair.kalshi_event_ticker
+            .split('-')
+            .next()
+            .unwrap_or(&pair.kalshi_event_ticker)
+            .to_lowercase();
+        let kalshi_event_ticker_lower = pair.kalshi_event_ticker.to_lowercase();
+        info!(
+            "[REMOTE_EXEC] 🔗 Kalshi: {}/{}/{}/{} | Polymarket: {}/{}",
+            KALSHI_WEB_BASE,
+            kalshi_series,
+            pair.kalshi_event_slug,
+            kalshi_event_ticker_lower,
+            POLYMARKET_WEB_BASE,
+            pair.poly_slug
         );
 
         if self.dry_run {

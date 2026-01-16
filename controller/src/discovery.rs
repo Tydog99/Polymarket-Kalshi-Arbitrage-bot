@@ -765,15 +765,38 @@ impl DiscoveryClient {
                                 && !market_slug.contains("-handicap");
 
                             if is_moneyline {
-                                if let Some(tokens) = &market.clob_token_ids {
-                                    if let Ok(ids) = serde_json::from_str::<Vec<String>>(tokens) {
-                                        if ids.len() >= 2 {
-                                            // Store with both key orderings, but always include poly_team1
-                                            // so we know which team the YES token is for
+                                if let (Some(tokens), Some(outcomes_str)) = (&market.clob_token_ids, &market.outcomes) {
+                                    if let (Ok(ids), Ok(outcomes)) = (
+                                        serde_json::from_str::<Vec<String>>(tokens),
+                                        serde_json::from_str::<Vec<String>>(outcomes_str)
+                                    ) {
+                                        if ids.len() >= 2 && outcomes.len() >= 2 {
+                                            // Use outcomes to determine which token belongs to which team
+                                            // outcomes[i] corresponds to ids[i]
+                                            let outcome0_norm = normalize_esports_team(&outcomes[0]);
+                                            let outcome1_norm = normalize_esports_team(&outcomes[1]);
+
+                                            // Find which outcome matches team1 (norm1)
+                                            // This determines which token is the "YES" for team1
+                                            let (team1_token, team2_token, poly_team1_norm) =
+                                                if outcome0_norm == norm1 || outcome1_norm == norm2 {
+                                                    // outcomes[0] is team1, outcomes[1] is team2
+                                                    (ids[0].clone(), ids[1].clone(), outcome0_norm)
+                                                } else if outcome1_norm == norm1 || outcome0_norm == norm2 {
+                                                    // outcomes[1] is team1, outcomes[0] is team2
+                                                    (ids[1].clone(), ids[0].clone(), outcome1_norm)
+                                                } else {
+                                                    // Fallback: use title order (norm1 first)
+                                                    warn!("  ⚠️ Could not match outcomes {:?} to teams {}/{}",
+                                                          outcomes, norm1, norm2);
+                                                    (ids[0].clone(), ids[1].clone(), outcome0_norm)
+                                                };
+
+                                            // Store with both key orderings
                                             let key1 = format!("{}:{}:{}", date, norm1, norm2);
                                             let key2 = format!("{}:{}:{}", date, norm2, norm1);
-                                            poly_lookup.insert(key1, (slug.clone(), ids[0].clone(), ids[1].clone(), norm1.clone()));
-                                            poly_lookup.insert(key2, (slug.clone(), ids[0].clone(), ids[1].clone(), norm1.clone()));
+                                            poly_lookup.insert(key1, (slug.clone(), team1_token.clone(), team2_token.clone(), poly_team1_norm.clone()));
+                                            poly_lookup.insert(key2, (slug.clone(), team1_token, team2_token, poly_team1_norm));
                                         }
                                     }
                                 }
@@ -1201,5 +1224,214 @@ mod tests {
         let (t1, t2) = parse_esports_kalshi_title("BLAST Bounty 2026: FURIA vs. 9INE").unwrap();
         assert_eq!(t1, "FURIA");
         assert_eq!(t2, "9INE");
+    }
+
+    /// Helper to simulate the token mapping logic from discovery
+    /// Returns (team1_token, team2_token, poly_team1_norm)
+    fn map_tokens_to_teams(
+        title_team1: &str,
+        title_team2: &str,
+        outcomes: &[&str],
+        token_ids: &[&str],
+    ) -> (String, String, String) {
+        let norm1 = normalize_esports_team(title_team1);
+        let norm2 = normalize_esports_team(title_team2);
+        let outcome0_norm = normalize_esports_team(outcomes[0]);
+        let outcome1_norm = normalize_esports_team(outcomes[1]);
+
+        if outcome0_norm == norm1 || outcome1_norm == norm2 {
+            // outcomes[0] is team1, outcomes[1] is team2
+            (token_ids[0].to_string(), token_ids[1].to_string(), outcome0_norm)
+        } else if outcome1_norm == norm1 || outcome0_norm == norm2 {
+            // outcomes[1] is team1, outcomes[0] is team2
+            (token_ids[1].to_string(), token_ids[0].to_string(), outcome1_norm)
+        } else {
+            // Fallback: use token order as-is
+            (token_ids[0].to_string(), token_ids[1].to_string(), outcome0_norm)
+        }
+    }
+
+    /// Helper to simulate the token swap logic when matching Kalshi to Poly
+    /// Returns (poly_yes_token, poly_no_token)
+    fn assign_poly_tokens(
+        team1_token: &str,
+        team2_token: &str,
+        poly_team1_norm: &str,
+        kalshi_team: &str,
+    ) -> (String, String) {
+        let kalshi_team_norm = normalize_esports_team(kalshi_team);
+        if kalshi_team_norm == poly_team1_norm {
+            // Kalshi asks about team1 → use tokens as-is
+            (team1_token.to_string(), team2_token.to_string())
+        } else {
+            // Kalshi asks about team2 → swap tokens
+            (team2_token.to_string(), team1_token.to_string())
+        }
+    }
+
+    #[test]
+    fn test_token_mapping_outcomes_match_title_order() {
+        // Title: "FURIA vs 9INE", Outcomes: ["FURIA", "9INE"]
+        // Tokens should map directly: FURIA=token0, 9INE=token1
+        let (t1_token, t2_token, poly_team1) = map_tokens_to_teams(
+            "FURIA",
+            "9INE",
+            &["FURIA Esports", "9INE Gaming"],
+            &["FURIA_TOKEN", "9INE_TOKEN"],
+        );
+        assert_eq!(t1_token, "FURIA_TOKEN");
+        assert_eq!(t2_token, "9INE_TOKEN");
+        assert_eq!(poly_team1, "furia");
+    }
+
+    #[test]
+    fn test_token_mapping_outcomes_reversed_from_title() {
+        // Title: "FURIA vs 9INE", Outcomes: ["9INE", "FURIA"]
+        // Tokens should be swapped: FURIA=token1, 9INE=token0
+        let (t1_token, t2_token, poly_team1) = map_tokens_to_teams(
+            "FURIA",
+            "9INE",
+            &["9INE Gaming", "FURIA Esports"],
+            &["9INE_TOKEN", "FURIA_TOKEN"],
+        );
+        assert_eq!(t1_token, "FURIA_TOKEN", "FURIA should get token1");
+        assert_eq!(t2_token, "9INE_TOKEN", "9INE should get token0");
+        assert_eq!(poly_team1, "furia");
+    }
+
+    #[test]
+    fn test_token_mapping_red_canids_vs_leviatan_bug() {
+        // This is the actual bug case from production:
+        // Poly title: "Leviatan Esports vs RED Canids"
+        // Poly outcomes: ["Leviatan Esports", "RED Canids"]
+        // Poly tokens: [LEV_TOKEN, RED_TOKEN]
+        // Expected: Leviatan=LEV_TOKEN, RED=RED_TOKEN
+        let (t1_token, t2_token, poly_team1) = map_tokens_to_teams(
+            "Leviatan Esports",
+            "RED Canids",
+            &["Leviatan Esports", "RED Canids"],
+            &["LEV_TOKEN", "RED_TOKEN"],
+        );
+        assert_eq!(t1_token, "LEV_TOKEN", "Leviatan should get LEV_TOKEN");
+        assert_eq!(t2_token, "RED_TOKEN", "RED should get RED_TOKEN");
+        assert_eq!(poly_team1, "leviatan");
+    }
+
+    #[test]
+    fn test_token_mapping_red_canids_vs_leviatan_reversed_outcomes() {
+        // Same match but outcomes array is reversed
+        // Poly title: "Leviatan Esports vs RED Canids"
+        // Poly outcomes: ["RED Canids", "Leviatan Esports"]
+        // Poly tokens: [RED_TOKEN, LEV_TOKEN]
+        // Expected: Leviatan=LEV_TOKEN (token1), RED=RED_TOKEN (token0)
+        let (t1_token, t2_token, poly_team1) = map_tokens_to_teams(
+            "Leviatan Esports",
+            "RED Canids",
+            &["RED Canids", "Leviatan Esports"],
+            &["RED_TOKEN", "LEV_TOKEN"],
+        );
+        assert_eq!(t1_token, "LEV_TOKEN", "Leviatan should get LEV_TOKEN");
+        assert_eq!(t2_token, "RED_TOKEN", "RED should get RED_TOKEN");
+        assert_eq!(poly_team1, "leviatan");
+    }
+
+    #[test]
+    fn test_kalshi_poly_token_assignment_kalshi_asks_team1() {
+        // Kalshi market: "Will Leviatan win?"
+        // poly_team1 = "leviatan" (Leviatan is team1 in poly_lookup)
+        // team1_token = LEV_TOKEN, team2_token = RED_TOKEN
+        // Since Kalshi asks about Leviatan (team1), use tokens as-is
+        let (poly_yes, poly_no) = assign_poly_tokens(
+            "LEV_TOKEN",
+            "RED_TOKEN",
+            "leviatan",
+            "Leviatan Esports",
+        );
+        assert_eq!(poly_yes, "LEV_TOKEN", "Kalshi YES (Leviatan wins) = Poly LEV");
+        assert_eq!(poly_no, "RED_TOKEN", "Kalshi NO (Leviatan loses) = Poly RED");
+    }
+
+    #[test]
+    fn test_kalshi_poly_token_assignment_kalshi_asks_team2() {
+        // Kalshi market: "Will RED Canids win?"
+        // poly_team1 = "leviatan" (Leviatan is team1 in poly_lookup)
+        // team1_token = LEV_TOKEN, team2_token = RED_TOKEN
+        // Since Kalshi asks about RED (team2), swap tokens
+        let (poly_yes, poly_no) = assign_poly_tokens(
+            "LEV_TOKEN",
+            "RED_TOKEN",
+            "leviatan",
+            "RED Canids",
+        );
+        assert_eq!(poly_yes, "RED_TOKEN", "Kalshi YES (RED wins) = Poly RED");
+        assert_eq!(poly_no, "LEV_TOKEN", "Kalshi NO (RED loses) = Poly LEV");
+    }
+
+    #[test]
+    fn test_full_token_flow_leviatan_market() {
+        // Full flow test for the bug case:
+        // Poly: "Leviatan Esports vs RED Canids", outcomes=["Leviatan Esports", "RED Canids"]
+        // Kalshi: "Will Leviatan Esports win?" (asking about Leviatan)
+        // Prices: Kalshi Leviatan YES=16¢, Poly LEV=22¢, Poly RED=91¢
+
+        // Step 1: Map tokens from Poly data
+        let (team1_token, team2_token, poly_team1) = map_tokens_to_teams(
+            "Leviatan Esports",
+            "RED Canids",
+            &["Leviatan Esports", "RED Canids"],
+            &["LEV_22", "RED_91"],  // Using prices as token names for clarity
+        );
+
+        // Step 2: Assign poly_yes/poly_no based on Kalshi market
+        let (poly_yes, poly_no) = assign_poly_tokens(
+            &team1_token,
+            &team2_token,
+            &poly_team1,
+            "Leviatan Esports",  // Kalshi asks about Leviatan
+        );
+
+        // Verify correct assignment:
+        // Kalshi YES = Leviatan wins → should pair with LEV token (22¢)
+        // Kalshi NO = Leviatan loses = RED wins → should pair with RED token (91¢)
+        assert_eq!(poly_yes, "LEV_22", "Kalshi YES should pair with Poly LEV (22¢)");
+        assert_eq!(poly_no, "RED_91", "Kalshi NO should pair with Poly RED (91¢)");
+
+        // The bug was: poly_no was incorrectly set to LEV (22¢) instead of RED (91¢)
+        // This caused false arbitrage detection: 16¢ + 22¢ = 38¢ (fake arb!)
+        // Correct: 16¢ + 91¢ = 107¢ (no arb)
+    }
+
+    #[test]
+    fn test_full_token_flow_red_canids_market() {
+        // Same match, but Kalshi asks about RED Canids instead
+        // Kalshi: "Will RED Canids win?"
+
+        let (team1_token, team2_token, poly_team1) = map_tokens_to_teams(
+            "Leviatan Esports",
+            "RED Canids",
+            &["Leviatan Esports", "RED Canids"],
+            &["LEV_22", "RED_91"],
+        );
+
+        let (poly_yes, poly_no) = assign_poly_tokens(
+            &team1_token,
+            &team2_token,
+            &poly_team1,
+            "RED Canids",  // Kalshi asks about RED
+        );
+
+        // Kalshi YES = RED wins → should pair with RED token (91¢)
+        // Kalshi NO = RED loses = Leviatan wins → should pair with LEV token (22¢)
+        assert_eq!(poly_yes, "RED_91", "Kalshi YES (RED wins) = Poly RED");
+        assert_eq!(poly_no, "LEV_22", "Kalshi NO (RED loses) = Poly LEV");
+    }
+
+    #[test]
+    fn test_normalize_handles_esports_suffixes() {
+        // Verify normalization handles common esports team name variations
+        assert_eq!(normalize_esports_team("RED Canids"), "red-canids");
+        assert_eq!(normalize_esports_team("Leviatan Esports"), "leviatan");
+        assert_eq!(normalize_esports_team("LOUD"), "loud");
+        assert_eq!(normalize_esports_team("paiN Gaming"), "pain");
     }
 }

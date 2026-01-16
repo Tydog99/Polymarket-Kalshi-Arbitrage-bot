@@ -48,7 +48,8 @@ use tracing::{error, info, warn};
 
 use cache::TeamCache;
 use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use config::{ARB_THRESHOLD, ENABLED_LEAGUES, WS_RECONNECT_DELAY_SECS};
+use config::{ARB_THRESHOLD, enabled_leagues, WS_RECONNECT_DELAY_SECS};
+use execution::NanoClock;
 use discovery::DiscoveryClient;
 use execution::{ExecutionEngine, create_execution_channel, run_execution_loop};
 use kalshi::{KalshiConfig, KalshiApiClient};
@@ -70,7 +71,7 @@ async fn discovery_refresh_task(
     state: Arc<GlobalState>,
     shutdown_tx: watch::Sender<bool>,
     interval_mins: u64,
-    leagues: &'static [&'static str],
+    leagues: &'static [String],
 ) {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -90,6 +91,9 @@ async fn discovery_refresh_task(
         .unwrap_or_default()
         .as_secs();
 
+    // Convert leagues to &[&str] for API compatibility
+    let leagues_ref: Vec<&str> = leagues.iter().map(|s| s.as_str()).collect();
+
     loop {
         interval.tick().await;
 
@@ -103,7 +107,7 @@ async fn discovery_refresh_task(
             .collect();
 
         // Discover new markets since last check
-        let result = discovery.discover_since(last_discovery_ts, &known_tickers, leagues).await;
+        let result = discovery.discover_since(last_discovery_ts, &known_tickers, &leagues_ref).await;
 
         // Update timestamp for next iteration
         last_discovery_ts = SystemTime::now()
@@ -178,10 +182,11 @@ fn parse_ws_platforms() -> Vec<WsPlatform> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
+    // Initialize logging with compact local time format [HH:MM:SS]
     // Note: the binary crate is `controller`, while the shared library crate is `arb_bot`.
     // If the user doesn't set `RUST_LOG`, we still want `info` logs from both crates.
     tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new("[%H:%M:%S]".to_string()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 tracing_subscriber::EnvFilter::new("info")
@@ -250,7 +255,7 @@ async fn main() -> Result<()> {
     info!("🚀 Prediction Market Arbitrage System v2.0");
     info!("   Profit threshold: <{:.1}¢ ({:.1}% minimum profit)",
           ARB_THRESHOLD * 100.0, (1.0 - ARB_THRESHOLD) * 100.0);
-    info!("   Monitored leagues: {:?}", ENABLED_LEAGUES);
+    info!("   Monitored leagues: {:?}", enabled_leagues());
 
     // Check for dry run mode
     let dry_run = std::env::var("DRY_RUN").map(|v| v == "1" || v == "true").unwrap_or(true);
@@ -287,10 +292,11 @@ async fn main() -> Result<()> {
         team_cache
     );
 
+    let leagues_ref: Vec<&str> = enabled_leagues().iter().map(|s| s.as_str()).collect();
     let result = if force_discovery {
-        discovery.discover_all_force(ENABLED_LEAGUES).await
+        discovery.discover_all_force(&leagues_ref).await
     } else {
-        discovery.discover_all(ENABLED_LEAGUES).await
+        discovery.discover_all(&leagues_ref).await
     };
 
     info!("📊 Market discovery complete:");
@@ -376,6 +382,9 @@ async fn main() -> Result<()> {
     let threshold_cents: PriceCents = ((ARB_THRESHOLD * 100.0).round() as u16).max(1);
     info!("   Execution threshold: {} cents", threshold_cents);
 
+    // Shared clock for latency measurement across all components
+    let clock = Arc::new(NanoClock::new());
+
     // Remote trader mode: controller hosts a WS server and forwards executions.
     // Set REMOTE_TRADER_BIND (e.g. "0.0.0.0:9001") to enable.
     let remote_bind = std::env::var("REMOTE_TRADER_BIND").ok();
@@ -447,6 +456,7 @@ async fn main() -> Result<()> {
             circuit_breaker.clone(),
             position_channel,
             dry_run,
+            clock.clone(),
         ));
         tokio::spawn(run_execution_loop(exec_rx, engine))
     };
@@ -527,10 +537,11 @@ async fn main() -> Result<()> {
     let kalshi_threshold = threshold_cents;
     let kalshi_ws_config = KalshiConfig::from_env()?;
     let kalshi_shutdown_rx = shutdown_rx.clone();
+    let kalshi_clock = clock.clone();
     let kalshi_handle = tokio::spawn(async move {
         loop {
             let shutdown_rx = kalshi_shutdown_rx.clone();
-            if let Err(e) = kalshi::run_ws(&kalshi_ws_config, kalshi_state.clone(), kalshi_exec_tx.clone(), kalshi_threshold, shutdown_rx).await {
+            if let Err(e) = kalshi::run_ws(&kalshi_ws_config, kalshi_state.clone(), kalshi_exec_tx.clone(), kalshi_threshold, shutdown_rx, kalshi_clock.clone()).await {
                 error!("[KALSHI] WebSocket disconnected: {} - reconnecting...", e);
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
@@ -542,10 +553,11 @@ async fn main() -> Result<()> {
     let poly_exec_tx = exec_tx.clone();
     let poly_threshold = threshold_cents;
     let poly_shutdown_rx = shutdown_rx.clone();
+    let poly_clock = clock.clone();
     let poly_handle = tokio::spawn(async move {
         loop {
             let shutdown_rx = poly_shutdown_rx.clone();
-            if let Err(e) = polymarket::run_ws(poly_state.clone(), poly_exec_tx.clone(), poly_threshold, shutdown_rx).await {
+            if let Err(e) = polymarket::run_ws(poly_state.clone(), poly_exec_tx.clone(), poly_threshold, shutdown_rx, poly_clock.clone()).await {
                 error!("[POLYMARKET] WebSocket disconnected: {} - reconnecting...", e);
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
@@ -596,7 +608,7 @@ async fn main() -> Result<()> {
             }
 
             let now = chrono::Local::now().format("%H:%M:%S");
-            print!("\r[{}] 💓 {} markets | K:{} P:{} Both:{} | threshold={}¢    ",
+            print!("\r[{}]  INFO 💓 {} markets | K:{} P:{} Both:{} | threshold={}¢    ",
                    now, market_count, with_kalshi, with_poly, with_both, heartbeat_threshold);
             let _ = std::io::stdout().flush();
 
@@ -641,7 +653,7 @@ async fn main() -> Result<()> {
             discovery_state,
             shutdown_tx,
             discovery_interval,
-            ENABLED_LEAGUES,
+            enabled_leagues(),
         ).await;
     });
 
