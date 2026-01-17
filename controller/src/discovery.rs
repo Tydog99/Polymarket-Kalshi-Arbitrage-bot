@@ -1273,6 +1273,22 @@ impl DiscoveryClient {
                             // "tes" should match "top-esports", "wb" should match "weibo-gaming"
                             let is_match = teams_match_canonical(&kalshi_team_norm, poly_team1);
                             let swapped = !is_match;
+
+                            // Validation: if swapped, verify kalshi_team matches poly_team2
+                            // If neither matches, we have an alias gap that needs fixing
+                            if swapped && std::env::var("ALIAS_VALIDATION").is_ok() {
+                                let poly_team2 = if norm1 == *poly_team1 { &norm2 } else { &norm1 };
+                                let matches_team2 = teams_match_canonical(&kalshi_team_norm, poly_team2);
+                                if !matches_team2 {
+                                    warn!(
+                                        "⚠️ [ALIAS GAP] kalshi_suffix={} doesn't match poly_team1={} OR poly_team2={} | Add alias: (\"{}\", &[\"{}\"]) or (\"{}\", &[\"{}\"])",
+                                        kalshi_team_norm, poly_team1, poly_team2,
+                                        poly_team1, kalshi_team_norm,
+                                        poly_team2, kalshi_team_norm
+                                    );
+                                }
+                            }
+
                             let (poly_yes, poly_no) = if !swapped {
                                 // Kalshi "Will Team1 win?" → Poly YES = Team1 wins, Poly NO = Team1 loses
                                 (yes_token.clone(), no_token.clone())
@@ -1506,7 +1522,7 @@ static ESPORTS_TEAM_ALIASES: &[(&str, &[&str])] = &[
     ("bilibili-gaming", &["blg", "bilibili", "bilibili gaming"]),
     ("lng-esports", &["lng", "lng esports"]),
     ("rare-atom", &["ra", "ra1", "rare atom"]),
-    ("anyone-legends", &["al", "anyone", "anyone legends"]),
+    ("anyone-legends", &["al", "anyone", "anyone legends", "anyones-legend"]),
     ("oh-my-god", &["omg", "oh my god"]),
     ("funplus-phoenix", &["fpx", "funplus", "funplus phoenix"]),
     ("edward-gaming", &["edg", "edward", "edward gaming"]),
@@ -1520,14 +1536,14 @@ static ESPORTS_TEAM_ALIASES: &[(&str, &[&str])] = &[
     // LCK (Korea LoL)
     ("t1", &["t1", "skt", "sk telecom"]),
     ("gen-g", &["gen", "geng", "gen g", "gen.g"]),
-    ("hanwha-life", &["hle", "hle1", "hanwha", "hanwha life"]),
+    ("hanwha-life", &["hle", "hle1", "hanwha", "hanwha life", "hanwha-life-esports-challengers"]),
     ("dplus-kia", &["dk", "dwg", "dplus", "dplus kia", "damwon"]),
     ("kt-rolster", &["kt", "ktr", "kt rolster"]),
     ("drx", &["drx"]),
     ("kwangdong-freecs", &["kdf", "kwangdong", "freecs"]),
     ("nongshim-redforce", &["ns", "nongshim", "redforce"]),
     ("ok-brion", &["bro", "bro2", "brion", "ok brion"]),
-    ("fearx", &["fox", "fox1", "fearx"]),
+    ("fearx", &["fox", "fox1", "fearx", "foxy", "bnk-fearx-youth"]),
     ("dn-soopers", &["dnf", "dn soopers"]),
     ("hanjin-brion", &["bro2", "hanjin", "hanjin brion"]),
 
@@ -1781,9 +1797,17 @@ fn teams_match_canonical(team_a: &str, team_b: &str) -> bool {
 
     match (canonical_a, canonical_b) {
         (Some(a), Some(b)) => a == b,
-        // If one is found and matches the other's input
-        (Some(a), None) => a == team_b || a.replace('-', " ") == team_b,
-        (None, Some(b)) => team_a == b || team_a == b.replace('-', " "),
+        // If one is found and matches the other's input (or is contained in it)
+        (Some(a), None) => {
+            a == team_b
+                || a.replace('-', " ") == team_b
+                || team_b.contains(a)  // e.g., "bnk-fearx-youth" contains "fearx"
+        }
+        (None, Some(b)) => {
+            team_a == b
+                || team_a == b.replace('-', " ")
+                || team_a.contains(b)  // e.g., "anyones-legend" contains "anyone-legends" (partial)
+        }
         // Neither found - fall back to fuzzy matching
         (None, None) => teams_match(team_a, team_b),
     }

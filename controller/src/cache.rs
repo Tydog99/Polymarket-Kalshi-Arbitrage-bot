@@ -315,6 +315,9 @@ pub fn team_search_terms(league: &str, team_code: &str) -> Option<&'static [&'st
         ("nfl", "lac") => Some(&["chargers", "los angeles"]),
         ("nfl", "cin") => Some(&["bengals", "cincinnati"]),
         ("nfl", "lar") | ("nfl", "ram") => Some(&["rams", "los angeles"]),
+        // "la" is ambiguous - could be Rams or Chargers. Include both team names
+        // so the outcome matching logic can pick the correct one.
+        ("nfl", "la") => Some(&["rams", "chargers"]),
         ("nfl", "tb") | ("nfl", "tam") => Some(&["buccaneers", "bucs", "tampa bay"]),
         ("nfl", "pit") => Some(&["steelers", "pittsburgh"]),
         ("nfl", "sea") => Some(&["seahawks", "seattle"]),
