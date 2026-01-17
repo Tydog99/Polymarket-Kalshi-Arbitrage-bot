@@ -157,12 +157,15 @@ pub struct LeagueConfig {
     pub poly_series_id: Option<&'static str>,
     /// Kalshi web URL slug for this league (e.g., "counterstrike-2-game")
     pub kalshi_web_slug: &'static str,
+    /// Team order in Kalshi tickers: true = HOME-AWAY (soccer), false = AWAY-HOME (US sports)
+    /// This affects spread slug generation (spread-home vs spread-away).
+    pub home_team_first: bool,
 }
 
 /// Get all supported leagues with their configurations
 pub fn get_league_configs() -> Vec<LeagueConfig> {
     vec![
-        // Major European leagues (full market types)
+        // Major European leagues (full market types) - HOME-AWAY ticker order
         LeagueConfig {
             league_code: "epl",
             poly_prefix: "epl",
@@ -172,6 +175,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: Some("KXEPLBTTS"),
             poly_series_id: None,
             kalshi_web_slug: "premier-league-game",
+            home_team_first: true,
         },
         LeagueConfig {
             league_code: "bundesliga",
@@ -182,6 +186,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: Some("KXBUNDESLIGABTTS"),
             poly_series_id: None,
             kalshi_web_slug: "bundesliga-game",
+            home_team_first: true,
         },
         LeagueConfig {
             league_code: "laliga",
@@ -192,6 +197,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: Some("KXLALIGABTTS"),
             poly_series_id: None,
             kalshi_web_slug: "la-liga-game",
+            home_team_first: true,
         },
         LeagueConfig {
             league_code: "seriea",
@@ -202,6 +208,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: Some("KXSERIEABTTS"),
             poly_series_id: None,
             kalshi_web_slug: "serie-a-game",
+            home_team_first: true,
         },
         LeagueConfig {
             league_code: "ligue1",
@@ -212,6 +219,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: Some("KXLIGUE1BTTS"),
             poly_series_id: None,
             kalshi_web_slug: "ligue-1-game",
+            home_team_first: true,
         },
         LeagueConfig {
             league_code: "ucl",
@@ -222,8 +230,9 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: Some("KXUCLBTTS"),
             poly_series_id: None,
             kalshi_web_slug: "champions-league-game",
+            home_team_first: true,
         },
-        // Secondary European leagues (moneyline only)
+        // Secondary European leagues (moneyline only) - HOME-AWAY ticker order
         LeagueConfig {
             league_code: "uel",
             poly_prefix: "uel",
@@ -233,6 +242,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: None,
             kalshi_web_slug: "europa-league-game",
+            home_team_first: true,
         },
         LeagueConfig {
             league_code: "eflc",
@@ -243,8 +253,21 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: None,
             kalshi_web_slug: "efl-championship-game",
+            home_team_first: true,
         },
-        // US Sports
+        // MLS (soccer) - HOME-AWAY ticker order
+        LeagueConfig {
+            league_code: "mls",
+            poly_prefix: "mls",
+            kalshi_series_game: "KXMLSGAME",
+            kalshi_series_spread: None,
+            kalshi_series_total: None,
+            kalshi_series_btts: None,
+            poly_series_id: None,
+            kalshi_web_slug: "mls-game",
+            home_team_first: true,
+        },
+        // US Sports - AWAY-HOME ticker order
         LeagueConfig {
             league_code: "nba",
             poly_prefix: "nba",
@@ -254,6 +277,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: None,
             kalshi_web_slug: "nba-game",
+            home_team_first: false,
         },
         LeagueConfig {
             league_code: "nfl",
@@ -264,6 +288,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: None,
             kalshi_web_slug: "nfl-game",
+            home_team_first: false,
         },
         LeagueConfig {
             league_code: "nhl",
@@ -274,6 +299,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: None,
             kalshi_web_slug: "nhl-game",
+            home_team_first: false,
         },
         LeagueConfig {
             league_code: "mlb",
@@ -284,16 +310,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: None,
             kalshi_web_slug: "mlb-game",
-        },
-        LeagueConfig {
-            league_code: "mls",
-            poly_prefix: "mls",
-            kalshi_series_game: "KXMLSGAME",
-            kalshi_series_spread: None,
-            kalshi_series_total: None,
-            kalshi_series_btts: None,
-            poly_series_id: None,
-            kalshi_web_slug: "mls-game",
+            home_team_first: false,
         },
         LeagueConfig {
             league_code: "ncaaf",
@@ -304,8 +321,9 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: None,
             kalshi_web_slug: "ncaaf-game",
+            home_team_first: false,
         },
-        // Esports
+        // Esports - no home/away concept, default to false
         LeagueConfig {
             league_code: "cs2",
             poly_prefix: "cs2",
@@ -315,6 +333,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: Some("10310"),
             kalshi_web_slug: "counterstrike-2-game",
+            home_team_first: false,
         },
         LeagueConfig {
             league_code: "lol",
@@ -325,6 +344,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: Some("10311"),
             kalshi_web_slug: "league-of-legends-game",
+            home_team_first: false,
         },
         LeagueConfig {
             league_code: "cod",
@@ -335,6 +355,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: Some("10427"),
             kalshi_web_slug: "call-of-duty-game",
+            home_team_first: false,
         },
     ]
 }

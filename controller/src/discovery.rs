@@ -474,7 +474,7 @@ impl DiscoveryClient {
             .into_iter()
             .enumerate()
             .map(|(idx, (parsed, event, market))| {
-                let poly_slug = self.build_poly_slug(config.poly_prefix, &parsed, market_type, &market, config.has_draws());
+                let poly_slug = self.build_poly_slug(config.poly_prefix, &parsed, market_type, &market, config.has_draws(), config.home_team_first);
 
                 if pairing_debug && idx < pairing_debug_limit {
                     info!(
@@ -738,6 +738,10 @@ impl DiscoveryClient {
     /// `has_draws` indicates whether the league has draw outcomes (soccer).
     /// - For leagues with draws: Moneyline uses team-specific slugs (e.g., `epl-cfc-avl-2025-12-27-cfc`)
     /// - For leagues without draws (NBA, NFL, etc.): Moneyline uses base slug (e.g., `nba-was-sac-2026-01-16`)
+    ///
+    /// `home_team_first` indicates the team order in Kalshi tickers:
+    /// - true (soccer): HOME-AWAY order (team1=home, team2=away)
+    /// - false (US sports): AWAY-HOME order (team1=away, team2=home)
     fn build_poly_slug(
         &self,
         poly_prefix: &str,
@@ -745,6 +749,7 @@ impl DiscoveryClient {
         market_type: MarketType,
         market: &KalshiMarket,
         has_draws: bool,
+        home_team_first: bool,
     ) -> String {
         // Convert Kalshi team codes to Polymarket codes using cache
         let poly_team1 = self.team_cache
@@ -784,14 +789,29 @@ impl DiscoveryClient {
             MarketType::Spread => {
                 // Polymarket uses "spread-home-{value}" when home team is favored,
                 // "spread-away-{value}" when away team is favored.
-                // Determine which by checking if the market suffix matches team1 (away) or team2 (home).
+                //
+                // Team order in Kalshi tickers varies by league:
+                // - Soccer (home_team_first=true): team1=HOME, team2=AWAY
+                // - US Sports (home_team_first=false): team1=AWAY, team2=HOME
                 let spread_type = if let Some(suffix) = extract_team_suffix(&market.ticker) {
-                    // Extract team code from suffix (e.g., "DEN12" -> "DEN")
+                    // Extract team code from suffix (e.g., "DEN12" -> "DEN", "CRY1" -> "CRY")
                     let team_code: String = suffix.chars().take_while(|c| c.is_alphabetic()).collect();
-                    if team_code.eq_ignore_ascii_case(&parsed.team1) {
-                        "spread-away" // suffix matches away team
+                    let suffix_matches_team1 = team_code.eq_ignore_ascii_case(&parsed.team1);
+
+                    if home_team_first {
+                        // Soccer: team1=home, team2=away
+                        if suffix_matches_team1 {
+                            "spread-home" // suffix matches home team (team1)
+                        } else {
+                            "spread-away" // suffix matches away team (team2)
+                        }
                     } else {
-                        "spread-home" // suffix matches home team (default)
+                        // US Sports: team1=away, team2=home
+                        if suffix_matches_team1 {
+                            "spread-away" // suffix matches away team (team1)
+                        } else {
+                            "spread-home" // suffix matches home team (team2)
+                        }
                     }
                 } else {
                     "spread-home"
@@ -958,7 +978,7 @@ impl DiscoveryClient {
         };
 
         // Build poly slug
-        let poly_slug = self.build_poly_slug(config.poly_prefix, &parsed, market_type, market, config.has_draws());
+        let poly_slug = self.build_poly_slug(config.poly_prefix, &parsed, market_type, market, config.has_draws(), config.home_team_first);
         if pairing_debug {
             info!(
                 "🧩 [PAIR] league={} type={:?} event={} market={} parsed=({},{},{}) slug={}",
