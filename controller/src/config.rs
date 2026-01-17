@@ -336,6 +336,15 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
     ]
 }
 
+impl LeagueConfig {
+    /// Returns true if this league has draw outcomes (soccer leagues).
+    /// Draw markets indicate the league uses team-specific slugs for Moneyline.
+    /// American sports (NBA, NFL, etc.) don't have draws and use a single base slug.
+    pub fn has_draws(&self) -> bool {
+        self.kalshi_series_btts.is_some()
+    }
+}
+
 /// Get config for a specific league
 pub fn get_league_config(league: &str) -> Option<LeagueConfig> {
     get_league_configs()

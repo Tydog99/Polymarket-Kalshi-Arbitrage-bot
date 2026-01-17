@@ -462,7 +462,7 @@ impl DiscoveryClient {
             .into_iter()
             .enumerate()
             .map(|(idx, (parsed, event, market))| {
-                let poly_slug = self.build_poly_slug(config.poly_prefix, &parsed, market_type, &market);
+                let poly_slug = self.build_poly_slug(config.poly_prefix, &parsed, market_type, &market, config.has_draws());
 
                 if pairing_debug && idx < pairing_debug_limit {
                     info!(
@@ -611,12 +611,17 @@ impl DiscoveryClient {
     }
     
     /// Build Polymarket slug from Kalshi event data
+    ///
+    /// `has_draws` indicates whether the league has draw outcomes (soccer).
+    /// - For leagues with draws: Moneyline uses team-specific slugs (e.g., `epl-cfc-avl-2025-12-27-cfc`)
+    /// - For leagues without draws (NBA, NFL, etc.): Moneyline uses base slug (e.g., `nba-was-sac-2026-01-16`)
     fn build_poly_slug(
         &self,
         poly_prefix: &str,
         parsed: &ParsedKalshiTicker,
         market_type: MarketType,
         market: &KalshiMarket,
+        has_draws: bool,
     ) -> String {
         // Convert Kalshi team codes to Polymarket codes using cache
         let poly_team1 = self.team_cache
@@ -636,12 +641,18 @@ impl DiscoveryClient {
             MarketType::Moneyline => {
                 if let Some(suffix) = extract_team_suffix(&market.ticker) {
                     if suffix.to_lowercase() == "tie" {
+                        // Draw market - append -draw suffix
                         format!("{}-draw", base)
-                    } else {
+                    } else if has_draws {
+                        // Soccer: uses team-specific slugs for each outcome
                         let poly_suffix = self.team_cache
                             .kalshi_to_poly(poly_prefix, &suffix)
                             .unwrap_or_else(|| suffix.to_lowercase());
                         format!("{}-{}", base, poly_suffix)
+                    } else {
+                        // American sports: single market with base slug
+                        // Polymarket uses one market with YES/NO tokens for each team
+                        base.clone()
                     }
                 } else {
                     base
@@ -809,7 +820,7 @@ impl DiscoveryClient {
         };
 
         // Build poly slug
-        let poly_slug = self.build_poly_slug(config.poly_prefix, &parsed, market_type, market);
+        let poly_slug = self.build_poly_slug(config.poly_prefix, &parsed, market_type, market, config.has_draws());
         if pairing_debug {
             info!(
                 "🧩 [PAIR] league={} type={:?} event={} market={} parsed=({},{},{}) slug={}",
