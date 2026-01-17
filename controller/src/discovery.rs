@@ -166,6 +166,7 @@ impl DiscoveryClient {
                     poly_matches: 0,
                     poly_misses: 0,
                     errors: vec![],
+                    stats: Default::default(),  // No stats for cached results
                 };
             }
             Some(cache) if market_type_filter.is_none() => {
@@ -240,6 +241,7 @@ impl DiscoveryClient {
             result.pairs.extend(league_result.pairs);
             result.poly_matches += league_result.poly_matches;
             result.errors.extend(league_result.errors);
+            result.stats.merge(league_result.stats);
         }
         result.kalshi_events_found = result.pairs.len();
 
@@ -266,6 +268,7 @@ impl DiscoveryClient {
         // Merge cached pairs with newly discovered ones
         let mut all_pairs = cache.pairs;
         let mut new_count = 0;
+        let mut stats = crate::types::DiscoveryStats::default();
 
         for league_result in league_results {
             for pair in league_result.pairs {
@@ -274,6 +277,7 @@ impl DiscoveryClient {
                     new_count += 1;
                 }
             }
+            stats.merge(league_result.stats);
         }
 
         if new_count > 0 {
@@ -300,6 +304,7 @@ impl DiscoveryClient {
             poly_matches: new_count,
             poly_misses: 0,
             errors: vec![],
+            stats,
         }
     }
 
@@ -335,12 +340,14 @@ impl DiscoveryClient {
         let mut result = DiscoveryResult::default();
         for (pairs_result, market_type) in type_results.into_iter().zip(market_types.iter()) {
             match pairs_result {
-                Ok(pairs) => {
-                    let count = pairs.len();
-                    if count > 0 {
-                        info!("  ✅ {} {}: {} pairs", config.league_code, market_type, count);
+                Ok((pairs, kalshi_count)) => {
+                    let matched_count = pairs.len();
+                    if matched_count > 0 {
+                        info!("  ✅ {} {}: {} pairs", config.league_code, market_type, matched_count);
                     }
-                    result.poly_matches += count;
+                    // Record stats for this league + market type
+                    result.stats.record(config.league_code, *market_type, kalshi_count, matched_count);
+                    result.poly_matches += matched_count;
                     result.pairs.extend(pairs);
                 }
                 Err(e) => {
@@ -363,13 +370,14 @@ impl DiscoveryClient {
     
     /// Discover markets for a specific series (PARALLEL Kalshi + Gamma lookups)
     /// If cache is provided, skips markets already in cache
+    /// Returns (matched_pairs, kalshi_market_count)
     async fn discover_series(
         &self,
         config: &LeagueConfig,
         series: &str,
         market_type: MarketType,
         cache: Option<&DiscoveryCache>,
-    ) -> Result<Vec<MarketPair>> {
+    ) -> Result<(Vec<MarketPair>, usize)> {
         let pairing_debug = config::pairing_debug_enabled();
         let pairing_debug_limit = config::pairing_debug_limit();
 
@@ -381,7 +389,7 @@ impl DiscoveryClient {
         let events = self.kalshi.get_events(series, 50).await?;
 
         if events.is_empty() {
-            return Ok(vec![]);
+            return Ok((vec![], 0));
         }
         info!("  📡 {} {}: {} events from Kalshi", config.league_code, market_type, events.len());
 
@@ -447,11 +455,14 @@ impl DiscoveryClient {
             }
         }
 
+        // Capture kalshi count before event_markets is consumed
+        let kalshi_count = event_markets.len() + cached_count;
+
         if event_markets.is_empty() {
             if cached_count > 0 {
                 info!("  ✅ {} {}: {} markets (all cached)", config.league_code, market_type, cached_count);
             }
-            return Ok(vec![]);
+            return Ok((vec![], kalshi_count));
         }
         info!("  🔎 {} {}: looking up {} new markets on Polymarket{}",
               config.league_code, market_type, event_markets.len(),
@@ -730,7 +741,7 @@ impl DiscoveryClient {
             info!("  ✅ {} {}: matched {} pairs", config.league_code, market_type, pairs.len());
         }
 
-        Ok(pairs)
+        Ok((pairs, kalshi_count))
     }
     
     /// Build Polymarket slug from Kalshi event data
@@ -1296,12 +1307,17 @@ impl DiscoveryClient {
             info!("  ✅ {} {}: matched {} pairs", config.league_code, "esports", pairs.len());
         }
 
+        // Record stats for esports (moneyline only)
+        let mut stats = crate::types::DiscoveryStats::default();
+        stats.record(config.league_code, MarketType::Moneyline, kalshi_events.len(), pairs.len());
+
         DiscoveryResult {
             pairs,
             kalshi_events_found: kalshi_events.len(),
             poly_matches: poly_lookup.len() / 2,
             poly_misses: 0,
             errors: vec![],
+            stats,
         }
     }
 }

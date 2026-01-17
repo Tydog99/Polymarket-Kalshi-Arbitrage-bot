@@ -4,6 +4,7 @@
 //! orderbook representation, and arbitrage opportunity detection.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use rustc_hash::FxHashMap;
@@ -1284,6 +1285,26 @@ pub struct GammaMarket {
 
 // === Discovery Result ===
 
+/// Stats for discovery summary table
+/// Tracks per-league, per-market-type breakdown of Kalshi vs matched counts
+#[derive(Debug, Default, Clone)]
+pub struct DiscoveryStats {
+    /// Map of (league, market_type) -> (kalshi_count, matched_count)
+    pub by_league_type: HashMap<(String, MarketType), (usize, usize)>,
+}
+
+impl DiscoveryStats {
+    /// Record stats for a league + market type combination
+    pub fn record(&mut self, league: &str, market_type: MarketType, kalshi: usize, matched: usize) {
+        self.by_league_type.insert((league.to_string(), market_type), (kalshi, matched));
+    }
+
+    /// Merge another DiscoveryStats into this one
+    pub fn merge(&mut self, other: DiscoveryStats) {
+        self.by_league_type.extend(other.by_league_type);
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct DiscoveryResult {
     pub pairs: Vec<MarketPair>,
@@ -1292,4 +1313,6 @@ pub struct DiscoveryResult {
     #[allow(dead_code)]
     pub poly_misses: usize,
     pub errors: Vec<String>,
+    /// Per-league, per-market-type breakdown stats
+    pub stats: DiscoveryStats,
 }
