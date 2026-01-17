@@ -1336,6 +1336,8 @@ fn is_likely_two_letter_code(code: &str) -> bool {
         "OH" |
         // NHL 2-letter codes (can appear as first team, e.g., SJFLA = SJ+FLA)
         "SJ" | "TB" | "NJ" | "LA" |
+        // NFL 2-letter codes (e.g., SFSEA = SF+SEA)
+        "SF" |
         // Generic short codes
         "BC" | "SC" | "AC" | "AS" | "US"
     )
