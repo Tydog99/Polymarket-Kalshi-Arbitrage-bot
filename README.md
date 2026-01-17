@@ -245,6 +245,97 @@ Example: `ENABLED_LEAGUES=cs2,lol,cod` to monitor only esports.
 
 ---
 
+## Token Assignment (Kalshi ↔ Polymarket Mapping)
+
+When pairing Kalshi markets with Polymarket, the bot must correctly assign which Polymarket token corresponds to "YES" for the Kalshi market. This is critical - incorrect assignment means betting on the **same team** instead of opposite outcomes.
+
+### The Problem
+
+Kalshi tickers contain a team suffix (e.g., `MUN` in `KXEPLSPREAD-26JAN18MUNEVE-MUN1`), but Polymarket outcomes may be:
+- **Team names**: `["Manchester United FC", "Everton FC"]`
+- **Yes/No**: `["Yes", "No"]` (team-specific markets like "Will MUN win?")
+
+The suffix `MUN` is **not** a substring of `"Manchester United FC"`, so naive matching fails.
+
+### Token Assignment Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Polymarket API returns: token1, token2, outcomes                │
+└─────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ CHECK FIRST: Are outcomes ["Yes", "No"] or ["Over", "Under"]?   │
+│                                                                 │
+│ Examples:                                                       │
+│ - epl-ars-mun-2026-01-25-mun → outcomes=["Yes", "No"]          │
+│ - nba-lal-bos-spread-lal-5pt5 → outcomes=["Yes", "No"]         │
+│ - nba-lal-bos-total-220pt5 → outcomes=["Over", "Under"]        │
+└─────────────────────────────────────────────────────────────────┘
+                                   │
+                    ┌──────────────┴──────────────┐
+                    │                             │
+              YES (is Yes/No)               NO (team names)
+                    │                             │
+                    ▼                             ▼
+┌─────────────────────────┐   ┌───────────────────────────────────┐
+│ Use API order:          │   │ Match Kalshi suffix to outcomes:  │
+│ token1 = YES            │   │ 1. Direct substring match         │
+│ token2 = NO             │   │ 2. team_search_terms() lookup     │
+│                         │   │ 3. Fallback to API order (warn)   │
+└─────────────────────────┘   └───────────────────────────────────┘
+```
+
+### Concrete Example: Manchester United Spread
+
+**Phase 1: Kalshi Market Discovery**
+```
+Ticker: KXEPLSPREAD-26JAN18MUNEVE-MUN1
+        └─────────────┬──────────────┘
+                      │
+Extracted: team1=MUN (away), team2=EVE (home), suffix=MUN1
+```
+
+**Phase 2: Polymarket Gamma API Lookup**
+```
+Slug: epl-mun-eve-2026-01-18-spread-away-1pt5
+
+Response:
+  token1: "0x1234abcd..."
+  token2: "0x5678efgh..."
+  outcomes: ["Manchester United FC", "Everton FC"]
+```
+
+**Phase 3: Token Assignment**
+```
+suffix = "MUN1" → team_code = "mun" (strip numeric)
+
+Direct match: "manchester united fc".contains("mun") = FALSE
+
+Lookup: team_search_terms("epl", "mun") = ["manchester", "man utd", "united"]
+
+Search term match: "manchester united fc".contains("manchester") = TRUE
+
+Result: token1 = YES (Man United), token2 = NO (Everton)
+```
+
+### Team Search Terms
+
+For team codes that aren't substrings of full names, `cache::team_search_terms()` provides searchable fragments:
+
+| Code | Team | Search Terms |
+|------|------|--------------|
+| `MUN` | Manchester United | `["manchester", "man utd", "united"]` |
+| `NFO` | Nottingham Forest | `["nottingham", "forest"]` |
+| `AVL` | Aston Villa | `["aston", "villa"]` |
+| `LAL` | Los Angeles Lakers | `["lakers", "los angeles"]` |
+| `KC` | Kansas City Chiefs | `["chiefs", "kansas city"]` |
+
+See `controller/src/cache.rs` for the complete mapping across all supported leagues.
+
+---
+
 ## Known Issues & Technical Notes
 
 ### Startup Race Condition (Cached Discovery)

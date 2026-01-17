@@ -547,7 +547,9 @@ pub async fn run_ws(
                         }
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        let _ = write.send(Message::Pong(data)).await;
+                        if let Err(e) = write.send(Message::Pong(data)).await {
+                            tracing::warn!("[KALSHI] Failed to send pong: {} (connection may be degraded)", e);
+                        }
                     }
                     Some(Err(e)) => {
                         error!("[KALSHI] WebSocket error: {}", e);
@@ -701,5 +703,11 @@ async fn send_kalshi_arb_request(
         detected_ns: clock.now_ns(),
     };
 
-    let _ = exec_tx.try_send(req);
+    // Send to execution engine; log if channel is full (backpressure)
+    if let Err(e) = exec_tx.try_send(req) {
+        tracing::warn!(
+            "[KALSHI] Arb request dropped for market {}: {} (channel backpressure)",
+            market_id, e
+        );
+    }
 }
