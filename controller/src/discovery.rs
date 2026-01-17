@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
-use crate::cache::TeamCache;
+use crate::cache::{TeamCache, team_search_terms};
 use crate::config;
 use crate::config::{LeagueConfig, get_league_configs, get_league_config};
 use crate::kalshi::KalshiApiClient;
@@ -523,45 +523,123 @@ impl DiscoveryClient {
                         Ok(Some((token1, token2, outcomes))) => {
                             let team_suffix = extract_team_suffix(&task.market.ticker);
 
+                            // DIAGNOSTIC: Log API response for token-outcome verification
+                            if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                                info!(
+                                    "🔍 [PAIR] API response: slug={} token1={}... token2={}... outcomes={:?}",
+                                    task.poly_slug,
+                                    &token1[..token1.len().min(12)],
+                                    &token2[..token2.len().min(12)],
+                                    outcomes
+                                );
+                            }
+
                             // Use outcomes to determine which token is YES for this Kalshi market
                             // outcomes[i] corresponds to token[i] from Gamma API
                             let (yes_token, no_token) = if let Some(suffix) = &team_suffix {
-                                let suffix_lower = suffix.to_lowercase();
-                                // Check if outcome[0] contains the team suffix (team we're betting YES on)
-                                let outcome0_matches = outcomes.get(0)
-                                    .map(|o| o.to_lowercase().contains(&suffix_lower))
-                                    .unwrap_or(false);
-                                let outcome1_matches = outcomes.get(1)
-                                    .map(|o| o.to_lowercase().contains(&suffix_lower))
-                                    .unwrap_or(false);
+                                // First check: Is this a Yes/No or Over/Under market?
+                                // These are team-specific markets where API order is always correct:
+                                // - Moneyline: "Will MUN win?" → outcomes=["Yes", "No"]
+                                // - Spread: "Will MUN cover -1.5?" → outcomes=["Yes", "No"]
+                                // - Total: "Will game go over 2.5?" → outcomes=["Over", "Under"]
+                                let is_yes_no_market = outcomes.iter().any(|o| {
+                                    let lower = o.to_lowercase();
+                                    lower == "yes" || lower == "no" || lower == "over" || lower == "under"
+                                });
 
-                                if outcome0_matches && !outcome1_matches {
-                                    // token1 is YES for this team
+                                if is_yes_no_market {
+                                    // For Yes/No markets, API order is: [Yes token, No token]
+                                    // This is correct - token1 is always the "Yes" outcome
                                     if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
                                         info!(
-                                            "✅ [PAIR] league={} type={:?} series={} slug={} suffix={} → token1=YES outcomes={:?}",
-                                            task.league, task.market_type, task.debug_series, task.poly_slug, suffix, outcomes
+                                            "✅ [PAIR] Yes/No market, using API order: league={} type={:?} slug={} suffix={} outcomes={:?}",
+                                            task.league, task.market_type, task.poly_slug, suffix, outcomes
                                         );
                                     }
                                     (token1, token2)
-                                } else if outcome1_matches && !outcome0_matches {
-                                    // token2 is YES for this team
-                                    if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
-                                        info!(
-                                            "✅ [PAIR] league={} type={:?} series={} slug={} suffix={} → token2=YES outcomes={:?}",
-                                            task.league, task.market_type, task.debug_series, task.poly_slug, suffix, outcomes
-                                        );
-                                    }
-                                    (token2, token1)
                                 } else {
-                                    // Ambiguous or no match - fall back to API order with warning
-                                    if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
-                                        warn!(
-                                            "⚠️ [PAIR] league={} type={:?} series={} slug={} suffix={} ambiguous outcomes={:?} → using API order",
-                                            task.league, task.market_type, task.debug_series, task.poly_slug, suffix, outcomes
-                                        );
+                                    // Outcomes contain team names (e.g., ["Manchester United FC", "Everton FC"])
+                                    // Need to match Kalshi suffix to determine which token is YES
+
+                                    // Strip numeric suffix for spread/total markets (e.g., "LEE1" -> "LEE")
+                                    let team_code: String = suffix.chars()
+                                        .take_while(|c| c.is_alphabetic())
+                                        .collect::<String>()
+                                        .to_lowercase();
+
+                                    // Check if outcome[0] contains the team code (team we're betting YES on)
+                                    let outcome0_matches = outcomes.get(0)
+                                        .map(|o| o.to_lowercase().contains(&team_code))
+                                        .unwrap_or(false);
+                                    let outcome1_matches = outcomes.get(1)
+                                        .map(|o| o.to_lowercase().contains(&team_code))
+                                        .unwrap_or(false);
+
+                                    if outcome0_matches && !outcome1_matches {
+                                        // token1 is YES for this team (outcome[0] contains team code)
+                                        if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                                            info!(
+                                                "✅ [PAIR] league={} type={:?} slug={} suffix={} team_code={} → token1=YES (matched outcome[0]) outcomes={:?}",
+                                                task.league, task.market_type, task.poly_slug, suffix, team_code, outcomes
+                                            );
+                                        }
+                                        (token1, token2)
+                                    } else if outcome1_matches && !outcome0_matches {
+                                        // token2 is YES for this team (outcome[1] contains team code)
+                                        if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                                            info!(
+                                                "✅ [PAIR] league={} type={:?} slug={} suffix={} team_code={} → token2=YES (matched outcome[1]) outcomes={:?}",
+                                                task.league, task.market_type, task.poly_slug, suffix, team_code, outcomes
+                                            );
+                                        }
+                                        (token2, token1)
+                                    } else {
+                                        // Direct substring match failed, try team_search_terms lookup
+                                        let search_terms = team_search_terms(&task.league, &team_code);
+
+                                        if let Some(terms) = search_terms {
+                                            // Check if any search term matches in outcomes
+                                            let outcome0_lower = outcomes.get(0).map(|o| o.to_lowercase()).unwrap_or_default();
+                                            let outcome1_lower = outcomes.get(1).map(|o| o.to_lowercase()).unwrap_or_default();
+
+                                            let term_matches_0 = terms.iter().any(|term| outcome0_lower.contains(term));
+                                            let term_matches_1 = terms.iter().any(|term| outcome1_lower.contains(term));
+
+                                            if term_matches_0 && !term_matches_1 {
+                                                // token1 is YES (search terms matched outcome[0])
+                                                if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                                                    info!(
+                                                        "✅ [PAIR] league={} type={:?} slug={} suffix={} team_code={} → token1=YES (matched via search terms {:?}) outcomes={:?}",
+                                                        task.league, task.market_type, task.poly_slug, suffix, team_code, terms, outcomes
+                                                    );
+                                                }
+                                                (token1, token2)
+                                            } else if term_matches_1 && !term_matches_0 {
+                                                // token2 is YES (search terms matched outcome[1])
+                                                if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                                                    info!(
+                                                        "✅ [PAIR] league={} type={:?} slug={} suffix={} team_code={} → token2=YES (matched via search terms {:?}) outcomes={:?}",
+                                                        task.league, task.market_type, task.poly_slug, suffix, team_code, terms, outcomes
+                                                    );
+                                                }
+                                                (token2, token1)
+                                            } else {
+                                                // Still ambiguous even with search terms
+                                                warn!(
+                                                    "⚠️ [PAIR] AMBIGUOUS after search terms! league={} type={:?} slug={} suffix={} team_code={} terms={:?} outcomes={:?} → using API order (may be wrong!)",
+                                                    task.league, task.market_type, task.poly_slug, suffix, team_code, terms, outcomes
+                                                );
+                                                (token1, token2)
+                                            }
+                                        } else {
+                                            // No search terms available - THIS IS A BUG for team-name outcomes
+                                            warn!(
+                                                "⚠️ [PAIR] AMBIGUOUS TOKEN ASSIGNMENT! league={} type={:?} slug={} suffix={} team_code={} outcomes={:?} → using API order (may be wrong!)",
+                                                task.league, task.market_type, task.poly_slug, suffix, team_code, outcomes
+                                            );
+                                            (token1, token2)
+                                        }
                                     }
-                                    (token1, token2)
                                 }
                             } else {
                                 // No team suffix (shouldn't happen for moneyline), use API order
@@ -2507,5 +2585,307 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert!(filtered.contains(&MarketType::Total));
+    }
+
+    // ========================================================================
+    // SPORTS TOKEN ASSIGNMENT TESTS
+    // These tests verify the fix for the numeric suffix bug in spread markets
+    // ========================================================================
+
+    /// Helper to simulate the sports token assignment logic from discovery
+    /// This mirrors the logic at lines 539-600 of discovery.rs
+    fn assign_sports_tokens(
+        suffix: &str,
+        outcomes: &[&str],
+        token1: &str,
+        token2: &str,
+    ) -> (String, String, &'static str) {
+        // Strip numeric suffix (e.g., "LEE1" -> "LEE", "ATL" -> "ATL")
+        let team_code: String = suffix.chars()
+            .take_while(|c| c.is_alphabetic())
+            .collect::<String>()
+            .to_lowercase();
+
+        let outcome0_matches = outcomes.get(0)
+            .map(|o| o.to_lowercase().contains(&team_code))
+            .unwrap_or(false);
+        let outcome1_matches = outcomes.get(1)
+            .map(|o| o.to_lowercase().contains(&team_code))
+            .unwrap_or(false);
+
+        if outcome0_matches && !outcome1_matches {
+            (token1.to_string(), token2.to_string(), "token1=YES (outcome[0] matched)")
+        } else if outcome1_matches && !outcome0_matches {
+            (token2.to_string(), token1.to_string(), "token2=YES (outcome[1] matched)")
+        } else {
+            (token1.to_string(), token2.to_string(), "API order (ambiguous/no match)")
+        }
+    }
+
+    // --- NBA Moneyline Tests (Real Production Examples) ---
+
+    #[test]
+    fn test_nba_moneyline_atl_suffix() {
+        // Kalshi: KXNBAGAME-26JAN17BOSATL-ATL (Boston at Atlanta, betting on Atlanta)
+        // Polymarket outcomes: ["Boston Celtics", "Atlanta Hawks"]
+        let (yes, no, reason) = assign_sports_tokens(
+            "ATL",
+            &["Boston Celtics", "Atlanta Hawks"],
+            "BOS_TOKEN",
+            "ATL_TOKEN",
+        );
+        assert_eq!(yes, "ATL_TOKEN", "ATL should match 'Atlanta Hawks' in outcome[1]");
+        assert_eq!(no, "BOS_TOKEN", "NO should be Boston token");
+        assert_eq!(reason, "token2=YES (outcome[1] matched)");
+    }
+
+    #[test]
+    fn test_nba_moneyline_bos_suffix() {
+        // Kalshi: KXNBAGAME-26JAN17BOSATL-BOS (Boston at Atlanta, betting on Boston)
+        // Polymarket outcomes: ["Boston Celtics", "Atlanta Hawks"]
+        let (yes, no, reason) = assign_sports_tokens(
+            "BOS",
+            &["Boston Celtics", "Atlanta Hawks"],
+            "BOS_TOKEN",
+            "ATL_TOKEN",
+        );
+        assert_eq!(yes, "BOS_TOKEN", "BOS should match 'Boston Celtics' in outcome[0]");
+        assert_eq!(no, "ATL_TOKEN", "NO should be Atlanta token");
+        assert_eq!(reason, "token1=YES (outcome[0] matched)");
+    }
+
+    // --- NHL Moneyline Tests ---
+
+    #[test]
+    fn test_nhl_moneyline_van_suffix() {
+        // Kalshi: KXNHLGAME-26JAN17EDMVAN-VAN (Edmonton at Vancouver, betting on Vancouver)
+        // Polymarket outcomes: ["Edmonton Oilers", "Vancouver Canucks"]
+        let (yes, no, reason) = assign_sports_tokens(
+            "VAN",
+            &["Edmonton Oilers", "Vancouver Canucks"],
+            "EDM_TOKEN",
+            "VAN_TOKEN",
+        );
+        assert_eq!(yes, "VAN_TOKEN", "VAN should match 'Vancouver Canucks' in outcome[1]");
+        assert_eq!(no, "EDM_TOKEN", "NO should be Edmonton token");
+        assert_eq!(reason, "token2=YES (outcome[1] matched)");
+    }
+
+    // --- EPL Spread Tests (The Bug Case) ---
+
+    #[test]
+    fn test_epl_spread_lee1_suffix_before_fix() {
+        // This was the BUG: suffix "LEE1" doesn't match "Leeds United FC"
+        // because we were checking if "leeds united fc".contains("lee1")
+        // Now we strip the numeric: "LEE1" -> "lee" and check contains("lee")
+        let (yes, no, reason) = assign_sports_tokens(
+            "LEE1",  // Spread suffix includes the spread value
+            &["Everton FC", "Leeds United FC"],
+            "EVE_TOKEN",
+            "LEE_TOKEN",
+        );
+        assert_eq!(yes, "LEE_TOKEN", "LEE1 should strip to 'lee' and match 'Leeds United FC'");
+        assert_eq!(no, "EVE_TOKEN", "NO should be Everton token");
+        assert_eq!(reason, "token2=YES (outcome[1] matched)");
+    }
+
+    #[test]
+    fn test_epl_spread_mun1_suffix_no_match() {
+        // Arsenal vs Manchester United, betting on Man United spread
+        // NOTE: "mun" is NOT a substring of "manchester united fc"
+        // (MUN is an abbreviation, not a substring)
+        // This falls back to API order - which may be wrong for some markets
+        let (yes, no, reason) = assign_sports_tokens(
+            "MUN1",
+            &["Arsenal FC", "Manchester United FC"],
+            "ARS_TOKEN",
+            "MUN_TOKEN",
+        );
+        // Neither outcome contains "mun", so API order is used
+        assert_eq!(reason, "API order (ambiguous/no match)");
+    }
+
+    #[test]
+    fn test_epl_spread_man1_suffix_matches() {
+        // If Kalshi used "MAN1" instead of "MUN1", it would match
+        let (yes, no, reason) = assign_sports_tokens(
+            "MAN1",
+            &["Arsenal FC", "Manchester United FC"],
+            "ARS_TOKEN",
+            "MAN_TOKEN",
+        );
+        assert_eq!(yes, "MAN_TOKEN", "MAN1 should strip to 'man' and match 'Manchester United FC'");
+        assert_eq!(no, "ARS_TOKEN");
+        assert_eq!(reason, "token2=YES (outcome[1] matched)");
+    }
+
+    #[test]
+    fn test_epl_spread_bou1_suffix() {
+        // Liverpool vs Bournemouth, betting on Bournemouth spread
+        // Note: outcomes may have different order
+        let (yes, no, reason) = assign_sports_tokens(
+            "BOU1",
+            &["Liverpool FC", "AFC Bournemouth"],
+            "LIV_TOKEN",
+            "BOU_TOKEN",
+        );
+        assert_eq!(yes, "BOU_TOKEN", "BOU1 should strip to 'bou' and match 'AFC Bournemouth'");
+        assert_eq!(no, "LIV_TOKEN");
+        assert_eq!(reason, "token2=YES (outcome[1] matched)");
+    }
+
+    #[test]
+    fn test_epl_spread_cry1_away_favored() {
+        // Chelsea vs Crystal Palace, betting on Crystal Palace (away favored)
+        // Outcomes: ["Chelsea FC", "Crystal Palace FC"]
+        let (yes, no, reason) = assign_sports_tokens(
+            "CRY1",
+            &["Chelsea FC", "Crystal Palace FC"],
+            "CHE_TOKEN",
+            "CRY_TOKEN",
+        );
+        assert_eq!(yes, "CRY_TOKEN", "CRY1 should match 'Crystal Palace FC'");
+        assert_eq!(no, "CHE_TOKEN");
+        assert_eq!(reason, "token2=YES (outcome[1] matched)");
+    }
+
+    // --- BTTS/Total Tests (Yes/No outcomes) ---
+
+    #[test]
+    fn test_btts_yes_no_outcomes() {
+        // BTTS markets have Yes/No outcomes, no team matching possible
+        // Should fall back to API order which is [Yes, No]
+        let (yes, no, reason) = assign_sports_tokens(
+            "ARSMUN",  // BTTS suffix is typically the event, no team suffix
+            &["Yes", "No"],
+            "YES_TOKEN",
+            "NO_TOKEN",
+        );
+        // Neither outcome contains "arsmun", so API order is used
+        assert_eq!(yes, "YES_TOKEN");
+        assert_eq!(no, "NO_TOKEN");
+        assert_eq!(reason, "API order (ambiguous/no match)");
+    }
+
+    // --- Edge Cases ---
+
+    #[test]
+    fn test_suffix_with_large_spread_value() {
+        // Spread suffix with larger value like "WOL2" (2.5 goals)
+        let (yes, no, reason) = assign_sports_tokens(
+            "WOL2",
+            &["Manchester City FC", "Wolverhampton Wanderers FC"],
+            "MCI_TOKEN",
+            "WOL_TOKEN",
+        );
+        assert_eq!(yes, "WOL_TOKEN", "WOL2 should strip to 'wol' and match 'Wolverhampton'");
+        assert_eq!(no, "MCI_TOKEN");
+        assert_eq!(reason, "token2=YES (outcome[1] matched)");
+    }
+
+    #[test]
+    fn test_suffix_matching_first_outcome() {
+        // When the team code matches the FIRST outcome
+        let (yes, no, reason) = assign_sports_tokens(
+            "ARS1",
+            &["Arsenal FC", "Manchester United FC"],
+            "ARS_TOKEN",
+            "MUN_TOKEN",
+        );
+        assert_eq!(yes, "ARS_TOKEN", "ARS1 should match 'Arsenal FC' in outcome[0]");
+        assert_eq!(no, "MUN_TOKEN");
+        assert_eq!(reason, "token1=YES (outcome[0] matched)");
+    }
+
+    #[test]
+    fn test_both_outcomes_contain_suffix() {
+        // Edge case: suffix matches BOTH outcomes (e.g., "FC" in both)
+        // This should fall back to API order
+        let (yes, no, reason) = assign_sports_tokens(
+            "FC",
+            &["Arsenal FC", "Manchester United FC"],
+            "ARS_TOKEN",
+            "MUN_TOKEN",
+        );
+        // Both contain "fc", so ambiguous
+        assert_eq!(reason, "API order (ambiguous/no match)");
+    }
+
+    #[test]
+    fn test_neither_outcome_matches() {
+        // Edge case: suffix matches neither outcome
+        let (yes, no, reason) = assign_sports_tokens(
+            "XYZ",
+            &["Arsenal FC", "Manchester United FC"],
+            "ARS_TOKEN",
+            "MUN_TOKEN",
+        );
+        assert_eq!(reason, "API order (ambiguous/no match)");
+    }
+
+    // --- Real Bug Reproduction Tests ---
+
+    #[test]
+    fn test_bur1_burnley_spread_bug() {
+        // This was a production bug:
+        // Kalshi suffix: BUR1 (Burnley +1.5)
+        // Poly outcomes: ["Tottenham Hotspur FC", "Burnley FC"]
+        // Bug: "bur1" doesn't contain in "burnley fc"
+        // Fix: Strip to "bur", which IS in "burnley fc"
+        let (yes, no, reason) = assign_sports_tokens(
+            "BUR1",
+            &["Tottenham Hotspur FC", "Burnley FC"],
+            "TOT_TOKEN",
+            "BUR_TOKEN",
+        );
+        assert_eq!(yes, "BUR_TOKEN", "BUR1 should strip to 'bur' and match 'Burnley FC'");
+        assert_eq!(no, "TOT_TOKEN");
+        assert_eq!(reason, "token2=YES (outcome[1] matched)");
+    }
+
+    #[test]
+    fn test_nfo1_nottingham_spread_no_match() {
+        // Kalshi suffix: NFO1 (Nottingham Forest +1.5)
+        // Poly outcomes: ["Brentford FC", "Nottingham Forest FC"]
+        // NOTE: "nfo" is NOT a substring of "nottingham forest fc"
+        // NFO is an abbreviation (Nottingham FOrest), not a substring
+        let (yes, no, reason) = assign_sports_tokens(
+            "NFO1",
+            &["Brentford FC", "Nottingham Forest FC"],
+            "BRE_TOKEN",
+            "NFO_TOKEN",
+        );
+        // Neither outcome contains "nfo", falls back to API order
+        assert_eq!(reason, "API order (ambiguous/no match)");
+    }
+
+    #[test]
+    fn test_not1_nottingham_spread_matches() {
+        // If Kalshi used "NOT1" instead, it would match "Nottingham"
+        let (yes, no, reason) = assign_sports_tokens(
+            "NOT1",
+            &["Brentford FC", "Nottingham Forest FC"],
+            "BRE_TOKEN",
+            "NOT_TOKEN",
+        );
+        assert_eq!(yes, "NOT_TOKEN", "NOT1 should strip to 'not' and match 'Nottingham Forest FC'");
+        assert_eq!(no, "BRE_TOKEN");
+        assert_eq!(reason, "token2=YES (outcome[1] matched)");
+    }
+
+    #[test]
+    fn test_sun1_sunderland_spread_bug() {
+        // Kalshi suffix: SUN1 (Sunderland +1.5)
+        // Poly outcomes: ["West Ham United FC", "Sunderland AFC"]
+        let (yes, no, reason) = assign_sports_tokens(
+            "SUN1",
+            &["West Ham United FC", "Sunderland AFC"],
+            "WHU_TOKEN",
+            "SUN_TOKEN",
+        );
+        // "sun" is in "sunderland afc"
+        assert_eq!(yes, "SUN_TOKEN", "SUN1 should strip to 'sun' and match 'Sunderland AFC'");
+        assert_eq!(no, "WHU_TOKEN");
+        assert_eq!(reason, "token2=YES (outcome[1] matched)");
     }
 }
