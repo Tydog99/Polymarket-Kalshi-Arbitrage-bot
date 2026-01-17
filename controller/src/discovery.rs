@@ -704,12 +704,26 @@ impl DiscoveryClient {
                 }
             }
             MarketType::Spread => {
-                // Polymarket uses "spread-home-{value}" format for American sports
+                // Polymarket uses "spread-home-{value}" when home team is favored,
+                // "spread-away-{value}" when away team is favored.
+                // Determine which by checking if the market suffix matches team1 (away) or team2 (home).
+                let spread_type = if let Some(suffix) = extract_team_suffix(&market.ticker) {
+                    // Extract team code from suffix (e.g., "DEN12" -> "DEN")
+                    let team_code: String = suffix.chars().take_while(|c| c.is_alphabetic()).collect();
+                    if team_code.eq_ignore_ascii_case(&parsed.team1) {
+                        "spread-away" // suffix matches away team
+                    } else {
+                        "spread-home" // suffix matches home team (default)
+                    }
+                } else {
+                    "spread-home"
+                };
+
                 if let Some(floor) = market.floor_strike {
                     let floor_str = format!("{:.1}", floor).replace(".", "pt");
-                    format!("{}-spread-home-{}", base, floor_str)
+                    format!("{}-{}-{}", base, spread_type, floor_str)
                 } else {
-                    format!("{}-spread-home", base)
+                    format!("{}-{}", base, spread_type)
                 }
             }
             MarketType::Total => {
