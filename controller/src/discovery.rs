@@ -1006,6 +1006,7 @@ impl DiscoveryClient {
             Some(id) => id,
             None => return DiscoveryResult::default(),
         };
+        let pairing_debug = config::pairing_debug_enabled();
 
         info!("🎮 Discovering {} esports markets (series_id={})...", config.league_code, series_id);
 
@@ -1083,9 +1084,11 @@ impl DiscoveryClient {
                                                     (ids[0].clone(), ids[1].clone(), outcome0_norm.clone())
                                                 };
 
-                                            info!("  🔍 {} | outcomes={:?} | o0_t1={} o1_t1={} o0_t2={} o1_t2={} | team1_tok_owner={} | title={}/{}",
-                                                  slug, outcomes, outcome0_matches_team1, outcome1_matches_team1,
-                                                  outcome0_matches_team2, outcome1_matches_team2, poly_team1_norm, team1, team2);
+                                            if pairing_debug {
+                                                info!("  🔍 {} | outcomes={:?} | o0_t1={} o1_t1={} o0_t2={} o1_t2={} | team1_tok_owner={} | title={}/{}",
+                                                      slug, outcomes, outcome0_matches_team1, outcome1_matches_team1,
+                                                      outcome0_matches_team2, outcome1_matches_team2, poly_team1_norm, team1, team2);
+                                            }
 
                                             // Store with both key orderings
                                             let key1 = format!("{}:{}:{}", date, norm1, norm2);
@@ -1170,9 +1173,6 @@ impl DiscoveryClient {
                                 // Poly YES = Team1 wins = Team2 loses (this is our Kalshi NO equivalent)
                                 (no_token.clone(), yes_token.clone())
                             };
-
-                            info!("  🎯 {} | kalshi_team={} | poly_team1={} | match={} | swapped={}",
-                                  market.ticker, kalshi_team_norm, poly_team1, is_match, swapped);
 
                             pairs.push(MarketPair {
                                 pair_id: format!("{}-{}", slug, market.ticker).into(),
