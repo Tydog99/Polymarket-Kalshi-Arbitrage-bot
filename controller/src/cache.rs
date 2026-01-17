@@ -235,10 +235,13 @@ pub fn team_search_terms(league: &str, team_code: &str) -> Option<&'static [&'st
 
         // Ligue 1
         ("ligue1", "psg") => Some(&["paris", "saint-germain"]),
-        ("ligue1", "oml") | ("ligue1", "mar") => Some(&["marseille", "olympique"]),
+        ("ligue1", "oml") | ("ligue1", "mar") | ("ligue1", "om") => Some(&["marseille", "olympique"]),
         ("ligue1", "oly") | ("ligue1", "lyo") => Some(&["lyon", "olympique"]),
         ("ligue1", "mon") | ("ligue1", "asm") => Some(&["monaco"]),
         ("ligue1", "lil") | ("ligue1", "los") => Some(&["lille"]),
+        ("ligue1", "rcs") | ("ligue1", "str") => Some(&["strasbourg"]),
+        ("ligue1", "tfc") | ("ligue1", "tou") => Some(&["toulouse"]),
+        ("ligue1", "rcl") | ("ligue1", "len") => Some(&["lens", "racing"]),
 
         // EFL Championship
         ("efl_championship", "lee") => Some(&["leeds"]),
@@ -371,6 +374,7 @@ pub fn team_search_terms(league: &str, team_code: &str) -> Option<&'static [&'st
         ("nhl", "sea") => Some(&["kraken", "seattle"]),
         ("nhl", "van") => Some(&["canucks", "vancouver"]),
         ("nhl", "vgk") | ("nhl", "vgs") => Some(&["golden knights", "vegas"]),
+        ("nhl", "ana") | ("nhl", "anh") => Some(&["ducks", "anaheim"]),
 
         // MLB
         ("mlb", "lad") => Some(&["dodgers", "los angeles"]),
