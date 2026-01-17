@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "generate-aliases"
 path = "src/bin/generate_aliases.rs"
 
+[[bin]]
+name = "generate-team-cache"
+path = "src/bin/generate_team_cache.rs"
+
 [dependencies]
 anyhow = "1.0"
 arrayvec = "0.7"
