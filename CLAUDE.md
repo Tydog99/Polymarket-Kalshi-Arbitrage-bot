@@ -160,3 +160,109 @@ ws_port = 9001       # WebSocket port
 ## Supported Markets
 
 Soccer (EPL, Bundesliga, La Liga, Serie A, Ligue 1, UCL, UEL, EFL Championship), NBA, NFL, NHL, MLB, MLS, NCAAF, Esports (CS2, LoL, CoD)
+
+## Market Pairing: Kalshi ↔ Polymarket Slug Mapping
+
+This section documents how market tickers are constructed on each platform and how to map between them.
+
+### Kalshi Ticker Format
+
+Kalshi uses a structured ticker format:
+
+```
+{SERIES}-{DATE}{TEAM1}{TEAM2}-{SUFFIX}
+```
+
+**Team order varies by sport:**
+- **US Sports (NBA, NFL, NHL, MLB, etc.):** AWAY-HOME order (team1=away, team2=home)
+- **Soccer (EPL, Bundesliga, La Liga, etc.):** HOME-AWAY order (team1=home, team2=away)
+
+**Example (NBA):** `KXNBASPREAD-26JAN17WASDEN-DEN12`
+
+| Component | Value | Meaning |
+|-----------|-------|---------|
+| Series | `KXNBASPREAD` | NBA spread markets |
+| Date | `26JAN17` | January 17, 2026 |
+| Team1 (Away) | `WAS` | Washington Wizards (away) |
+| Team2 (Home) | `DEN` | Denver Nuggets (home) |
+| Suffix | `DEN12` | Denver wins by 12+ points |
+
+**Example (EPL):** `KXEPLML-25DEC25AVLCFC-CFC` (Aston Villa home vs Chelsea away)
+
+**Key insight:** The code uses `home_team_first` config flag to handle this difference - see `config.rs`.
+
+### Polymarket Slug Format
+
+Polymarket uses URL-friendly slugs with the same team order as Kalshi:
+
+```
+{league}-{team1}-{team2}-{date}-{market_type}-{qualifier}
+```
+
+**Team order matches Kalshi:** US sports = away-home, Soccer = home-away
+
+**Examples (NBA - away first):**
+- Moneyline: `nba-was-den-2026-01-17`
+- Spread (home favored): `nba-was-den-2026-01-17-spread-home-12pt5`
+- Spread (away favored): `nba-okc-mia-2026-01-17-spread-away-8pt5`
+- Total: `nba-was-den-2026-01-17-total-230pt5`
+
+**Examples (EPL - home first):**
+- Moneyline: `epl-avl-cfc-2025-12-25-avl` (Aston Villa to win)
+- Spread: `epl-avl-cfc-2025-12-25-spread-home-1pt5`
+
+### Spread Market Logic (Critical)
+
+Polymarket uses **different slug prefixes** depending on which team is favored:
+
+| Scenario | Slug Format | Example |
+|----------|-------------|---------|
+| Home team favored | `spread-home-{value}` | Denver (home) -12.5 → `spread-home-12pt5` |
+| Away team favored | `spread-away-{value}` | OKC (away) -8.5 → `spread-away-8pt5` |
+
+**How to determine which to use:**
+
+1. Parse Kalshi event ticker to get `team1` (away) and `team2` (home)
+2. Extract team code from market suffix (e.g., `DEN12` → `DEN`)
+3. If suffix team == `team1` (away) → use `spread-away-{value}`
+4. If suffix team == `team2` (home) → use `spread-home-{value}`
+
+**Code location:** `discovery.rs` → `build_poly_slug()` function
+
+### Why Matches Fail
+
+Even with correct slug format, matches can fail because:
+
+1. **Spread value mismatch:** Kalshi offers many spreads (3, 6, 9, 12, 15, 18, 21, 24, 27), Polymarket offers 2-4 values around the actual line
+2. **No underdog spreads:** Polymarket only creates spread markets for the FAVORED team
+3. **Date timezone issues:** Polymarket may use different timezone, code tries next-day slug as fallback
+
+### Gamma API for Verification
+
+Query Polymarket's Gamma API to verify market existence:
+
+```bash
+# Single market lookup
+curl "https://gamma-api.polymarket.com/markets?slug=nba-was-den-2026-01-17-spread-home-12pt5"
+
+# Batch lookup (multiple slugs)
+curl "https://gamma-api.polymarket.com/markets?slug=slug1&slug=slug2&slug=slug3"
+
+# All markets for an event
+curl "https://gamma-api.polymarket.com/events?slug=nba-was-den-2026-01-17" | jq '.[].markets[].slug'
+```
+
+### Debugging Market Pairing
+
+```bash
+# Run with pairing debug output
+DISCOVERY_ONLY=1 FORCE_DISCOVERY=1 DRY_RUN=1 cargo run -p controller --release -- \
+  --leagues nba --pairing-debug --pairing-debug-limit 50 --market-type spread
+```
+
+This shows:
+- Generated Polymarket slugs for each Kalshi market
+- Which lookups succeeded/failed
+- Match statistics (total, matched, misses by reason)
+
+For detailed debugging of league-specific pairing issues, see `controller/docs/PAIRING_DEBUG_PLAYBOOK.md`.

@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "generate-aliases"
 path = "src/bin/generate_aliases.rs"
 
+[[bin]]
+name = "generate-team-cache"
+path = "src/bin/generate_team_cache.rs"
+
 [dependencies]
 anyhow = "1.0"
 arrayvec = "0.7"
@@ -42,6 +46,7 @@ tokio = { version = "1.0", features = ["full"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 tokio-util = "0.7"
 tracing = "0.1"
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 wide = "0.7"
 

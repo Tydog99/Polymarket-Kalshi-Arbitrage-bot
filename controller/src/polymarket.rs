@@ -13,7 +13,7 @@ use tokio::time::{interval, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
-use crate::config::{POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS, GAMMA_API_BASE};
+use crate::config::{POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS, GAMMA_API_BASE, POLY_MAX_TOKENS_PER_WS};
 use crate::execution::NanoClock;
 use crate::types::{
     GlobalState, FastExecutionRequest, ArbType, PriceCents, SizeCents,
@@ -102,14 +102,48 @@ impl GammaClient {
     async fn try_lookup_slug(&self, slug: &str) -> Result<Option<(String, String, Vec<String>)>> {
         let url = format!("{}/markets?slug={}", GAMMA_API_BASE, slug);
 
-        let resp = self.http.get(&url).send().await?;
+        // Retry logic for transient failures (Cloudflare throttling, network issues)
+        let mut last_error = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                // Exponential backoff: 100ms, 200ms
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * (1 << (attempt - 1)))).await;
+            }
 
-        if !resp.status().is_success() {
-            return Ok(None);
+            match self.http.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<Vec<GammaMarket>>().await {
+                        Ok(markets) => {
+                            // Success - continue with normal logic below
+                            return self.parse_gamma_market_response(markets);
+                        }
+                        Err(e) => {
+                            last_error = Some(format!("JSON parse error: {}", e));
+                            continue;
+                        }
+                    }
+                }
+                Ok(_resp) => {
+                    // Non-success status, don't retry (likely 404)
+                    return Ok(None);
+                }
+                Err(e) => {
+                    last_error = Some(format!("Request error: {}", e));
+                    continue;
+                }
+            }
         }
 
-        let markets: Vec<GammaMarket> = resp.json().await?;
+        // All retries exhausted - return error so callers can distinguish from "not found"
+        if let Some(err) = last_error {
+            tracing::warn!("Gamma lookup failed after 3 attempts for {}: {}", slug, err);
+            anyhow::bail!("Gamma API failed after 3 retries for {}: {}", slug, err);
+        }
+        // Should never reach here (last_error is always Some if we get here), but be safe
+        Ok(None)
+    }
 
+    fn parse_gamma_market_response(&self, markets: Vec<GammaMarket>) -> Result<Option<(String, String, Vec<String>)>> {
         if markets.is_empty() {
             return Ok(None);
         }
@@ -234,14 +268,22 @@ fn parse_size(s: &str) -> SizeCents {
         .unwrap_or(0)
 }
 
-/// WebSocket runner
+/// WebSocket coordinator - spawns multiple connections for large token sets.
+///
+/// Polymarket's WebSocket API silently fails when subscribing to >500 tokens on a single
+/// connection (see [`POLY_MAX_TOKENS_PER_WS`]). This function splits the token list across
+/// multiple parallel connections to work around this limitation.
+///
+/// Each connection manages its own reconnection logic. If any connection exits (error or
+/// shutdown signal), all connections are aborted to trigger a coordinated reconnect.
 pub async fn run_ws(
     state: Arc<GlobalState>,
     exec_tx: mpsc::Sender<FastExecutionRequest>,
     threshold_cents: PriceCents,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
     clock: Arc<NanoClock>,
 ) -> Result<()> {
+    // Collect all tokens from markets
     let tokens: Vec<String> = state.markets.iter()
         .take(state.market_count())
         .filter_map(|m| m.pair())
@@ -254,11 +296,100 @@ pub async fn run_ws(
         return Ok(());
     }
 
+    // Split tokens into chunks for multiple connections
+    let num_connections = (tokens.len() + POLY_MAX_TOKENS_PER_WS - 1) / POLY_MAX_TOKENS_PER_WS;
+
+    if num_connections == 1 {
+        // Single connection - run directly
+        return run_single_ws(
+            0,
+            tokens,
+            state,
+            exec_tx,
+            threshold_cents,
+            shutdown_rx,
+            clock,
+        ).await;
+    }
+
+    info!(
+        "[POLY] Splitting {} tokens across {} connections (max {} per connection)",
+        tokens.len(),
+        num_connections,
+        POLY_MAX_TOKENS_PER_WS
+    );
+
+    // Spawn tasks for each chunk
+    let mut handles = Vec::with_capacity(num_connections);
+
+    for (conn_id, chunk) in tokens.chunks(POLY_MAX_TOKENS_PER_WS).enumerate() {
+        let token_start = conn_id * POLY_MAX_TOKENS_PER_WS;
+        let token_end = token_start + chunk.len().saturating_sub(1);
+        info!(
+            "[POLY:{}] Assigned tokens {}-{} ({} tokens)",
+            conn_id,
+            token_start,
+            token_end,
+            chunk.len()
+        );
+
+        let chunk_tokens = chunk.to_vec();
+        let state = Arc::clone(&state);
+        let exec_tx = exec_tx.clone();
+        let shutdown_rx = shutdown_rx.clone();
+        let clock = Arc::clone(&clock);
+
+        let handle = tokio::spawn(async move {
+            run_single_ws(
+                conn_id,
+                chunk_tokens,
+                state,
+                exec_tx,
+                threshold_cents,
+                shutdown_rx,
+                clock,
+            ).await
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for any connection to exit
+    let (result, _index, remaining) = futures_util::future::select_all(handles).await;
+
+    // Abort remaining connections
+    for handle in remaining {
+        handle.abort();
+    }
+
+    // Propagate the result (or error if task panicked)
+    match result {
+        Ok(inner_result) => inner_result,
+        Err(join_error) => Err(anyhow::anyhow!("Connection task panicked: {}", join_error)),
+    }
+}
+
+/// Single WebSocket connection handler
+async fn run_single_ws(
+    conn_id: usize,
+    tokens: Vec<String>,
+    state: Arc<GlobalState>,
+    exec_tx: mpsc::Sender<FastExecutionRequest>,
+    threshold_cents: PriceCents,
+    mut shutdown_rx: watch::Receiver<bool>,
+    clock: Arc<NanoClock>,
+) -> Result<()> {
+    let log_prefix = if conn_id == 0 && tokens.len() <= POLY_MAX_TOKENS_PER_WS {
+        "[POLY]".to_string()
+    } else {
+        format!("[POLY:{}]", conn_id)
+    };
+
     let (ws_stream, _) = connect_async(POLYMARKET_WS_URL)
         .await
         .context("Failed to connect to Polymarket")?;
 
-    info!("[POLY] Connected");
+    info!("{} Connected", log_prefix);
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -269,7 +400,7 @@ pub async fn run_ws(
     };
 
     write.send(Message::Text(serde_json::to_string(&subscribe_msg)?)).await?;
-    info!("[POLY] Subscribed to {} tokens", tokens.len());
+    info!("{} Subscribed to {} tokens", log_prefix, tokens.len());
 
     let mut ping_interval = interval(Duration::from_secs(POLY_PING_INTERVAL_SECS));
     let mut last_message = Instant::now();
@@ -281,14 +412,14 @@ pub async fn run_ws(
             // Check shutdown signal first
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
-                    info!("[POLY] Shutdown signal received, disconnecting...");
+                    info!("{} Shutdown signal received, disconnecting...", log_prefix);
                     break;
                 }
             }
 
             _ = ping_interval.tick() => {
                 if let Err(e) = write.send(Message::Ping(vec![])).await {
-                    error!("[POLY] Failed to send ping: {}", e);
+                    error!("{} Failed to send ping: {}", log_prefix, e);
                     break;
                 }
             }
@@ -316,26 +447,28 @@ pub async fn run_ws(
                         }
                         // Log unknown message types at trace level for debugging
                         else {
-                            tracing::trace!("[POLY] Unknown WS message: {}...", &text[..text.len().min(100)]);
+                            tracing::trace!("{} Unknown WS message: {}...", log_prefix, &text[..text.len().min(100)]);
                         }
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        let _ = write.send(Message::Pong(data)).await;
+                        if let Err(e) = write.send(Message::Pong(data)).await {
+                            warn!("{} Failed to send pong: {} (connection may be degraded)", log_prefix, e);
+                        }
                         last_message = Instant::now();
                     }
                     Some(Ok(Message::Pong(_))) => {
                         last_message = Instant::now();
                     }
                     Some(Ok(Message::Close(frame))) => {
-                        warn!("[POLY] Server closed: {:?}", frame);
+                        warn!("{} Server closed: {:?}", log_prefix, frame);
                         break;
                     }
                     Some(Err(e)) => {
-                        error!("[POLY] WebSocket error: {}", e);
+                        error!("{} WebSocket error: {}", log_prefix, e);
                         break;
                     }
                     None => {
-                        warn!("[POLY] Stream ended");
+                        warn!("{} Stream ended", log_prefix);
                         break;
                     }
                     _ => {}
@@ -344,7 +477,7 @@ pub async fn run_ws(
         }
 
         if last_message.elapsed() > Duration::from_secs(120) {
-            warn!("[POLY] Stale connection, reconnecting...");
+            warn!("{} Stale connection, reconnecting...", log_prefix);
             break;
         }
     }
@@ -502,6 +635,11 @@ async fn send_arb_request(
         detected_ns: clock.now_ns(),
     };
 
-    // send! ~~ 
-    let _ = exec_tx.try_send(req);
+    // Send to execution engine; log if channel is full (backpressure)
+    if let Err(e) = exec_tx.try_send(req) {
+        tracing::warn!(
+            "[POLY] Arb request dropped for market {}: {} (channel backpressure)",
+            market_id, e
+        );
+    }
 }

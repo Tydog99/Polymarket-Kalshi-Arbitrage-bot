@@ -39,12 +39,17 @@ mod types;
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tailscale::beacon::BeaconSender;
 use tokio::sync::{RwLock, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// Global counter for lines printed since last table clear.
 static LINES_SINCE_TABLE: AtomicUsize = AtomicUsize::new(0);
@@ -98,23 +103,92 @@ use crate::remote_trader::RemoteTraderServer;
 use trading::execution::Platform as TradingPlatform;
 use types::{GlobalState, MarketType, PriceCents};
 
-fn cli_has_flag(args: &[String], flag: &str) -> bool {
-    args.iter().any(|a| a == flag)
-}
-
-fn cli_get_value(args: &[String], flag: &str) -> Option<String> {
-    for arg in args {
-        if let Some(val) = arg.strip_prefix(&format!("{}=", flag)) {
-            return Some(val.to_string());
-        }
-    }
-    None
-}
-
 /// Polymarket CLOB API host
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
 /// Polygon chain ID
 const POLYGON_CHAIN_ID: u64 = 137;
+
+fn cli_arg_value(args: &[String], key: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == key)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+fn cli_has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|a| a == flag)
+}
+
+/// Print a summary table of discovery results
+fn print_discovery_summary(result: &types::DiscoveryResult) {
+    use std::collections::BTreeSet;
+
+    // Collect all unique leagues from stats
+    let leagues: BTreeSet<_> = result.stats.by_league_type
+        .keys()
+        .map(|(league, _)| league.clone())
+        .collect();
+
+    if leagues.is_empty() {
+        return;
+    }
+
+    let market_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+    let type_headers = ["Moneyline", "Spread", "Total", "BTTS"];
+
+    // Calculate column widths
+    let league_width = leagues.iter().map(|l| l.len()).max().unwrap_or(6).max(6);
+
+    // Print header
+    info!("┌{:─<width$}┬{:─<48}┬{:─<8}┬{:─<8}┐",
+          "", "", "", "", width = league_width + 2);
+    info!("│{:^width$}│{:^48}│{:^8}│{:^8}│",
+          "DISCOVERY SUMMARY", "", "", "", width = league_width + 2);
+    info!("├{:─<width$}┼{:─<11}─{:─<11}─{:─<11}─{:─<11}┼{:─<8}┼{:─<8}┤",
+          "", "", "", "", "", "", "", width = league_width + 2);
+    info!("│ {:width$} │ {:^9} {:^9} {:^9} {:^9}   │ {:^6} │ {:^6} │",
+          "League", type_headers[0], type_headers[1], type_headers[2], type_headers[3], "Kalshi", "Match",
+          width = league_width);
+    info!("├{:─<width$}┼{:─<11}─{:─<11}─{:─<11}─{:─<11}┼{:─<8}┼{:─<8}┤",
+          "", "", "", "", "", "", "", width = league_width + 2);
+
+    // Print each league row
+    let mut total_kalshi = 0usize;
+    let mut total_matched = 0usize;
+
+    for league in &leagues {
+        let mut row_kalshi = 0usize;
+        let mut row_matched = 0usize;
+        let mut type_strs: Vec<String> = Vec::new();
+
+        for mt in &market_types {
+            if let Some(&(kalshi, matched)) = result.stats.by_league_type.get(&(league.clone(), *mt)) {
+                type_strs.push(format!("{}/{}", matched, kalshi));
+                row_kalshi += kalshi;
+                row_matched += matched;
+            } else {
+                type_strs.push("-".to_string());
+            }
+        }
+
+        info!("│ {:width$} │ {:^9} {:^9} {:^9} {:^9}   │ {:^6} │ {:^6} │",
+              league,
+              type_strs[0], type_strs[1], type_strs[2], type_strs[3],
+              row_kalshi, row_matched,
+              width = league_width);
+
+        total_kalshi += row_kalshi;
+        total_matched += row_matched;
+    }
+
+    // Print footer with totals
+    info!("├{:─<width$}┼{:─<11}─{:─<11}─{:─<11}─{:─<11}┼{:─<8}┼{:─<8}┤",
+          "", "", "", "", "", "", "", width = league_width + 2);
+    info!("│ {:width$} │ {:^9} {:^9} {:^9} {:^9}   │ {:^6} │ {:^6} │",
+          "TOTAL", "", "", "", "", total_kalshi, total_matched, width = league_width);
+    info!("└{:─<width$}┴{:─<48}┴{:─<8}┴{:─<8}┘",
+          "", "", "", "", width = league_width + 2);
+}
 
 /// Background task that periodically discovers new markets
 async fn discovery_refresh_task(
@@ -231,28 +305,114 @@ fn parse_ws_platforms() -> Vec<WsPlatform> {
         .collect()
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Initialize logging with compact local time format [HH:MM:SS]
-    // Note: the binary crate is `controller`, while the shared library crate is `arb_bot`.
-    // If the user doesn't set `RUST_LOG`, we still want `info` logs from both crates.
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
+/// Maximum number of log files to retain in the logs directory
+const MAX_LOG_FILES: usize = 10;
 
+/// Initialize logging with both console and file output.
+///
+/// Returns the log file path and a [`WorkerGuard`] that **must be kept alive** for the
+/// entire duration of the program. The guard ensures buffered logs are flushed on shutdown.
+/// Dropping the guard early will cause log loss.
+///
+/// # Usage
+/// ```ignore
+/// let (log_path, _log_guard) = init_logging();
+/// // _log_guard lives until main() exits, ensuring all logs are flushed
+/// ```
+fn init_logging() -> (PathBuf, WorkerGuard) {
+    use chrono::Local;
+
+    // Create logs directory in project root (same level as Cargo.toml)
+    let logs_dir = PathBuf::from(".logs");
+    std::fs::create_dir_all(&logs_dir).expect("Failed to create logs directory");
+
+    // Generate timestamped filename: controller-2026-01-17-143052.log
+    let timestamp = Local::now().format("%Y-%m-%d-%H%M%S");
+    let log_filename = format!("controller-{}.log", timestamp);
+    let log_path = logs_dir.join(&log_filename);
+
+    // Get absolute path for logging (canonicalize requires file to exist, so we build it manually)
+    let absolute_log_path = std::env::current_dir()
+        .map(|cwd| cwd.join(&log_path))
+        .unwrap_or_else(|_| log_path.clone());
+
+    // Clean up old log files, keeping only the most recent MAX_LOG_FILES
+    cleanup_old_logs(&logs_dir, MAX_LOG_FILES);
+
+    // Create non-blocking file appender
+    let file_appender = tracing_appender::rolling::never(&logs_dir, &log_filename);
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    // Build env filter
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info")
+            .add_directive("controller=info".parse().unwrap())
+            .add_directive("arb_bot=info".parse().unwrap())
+    });
+
+    // Create timer for consistent formatting
+    let timer = tracing_subscriber::fmt::time::ChronoLocal::new("[%H:%M:%S]".to_string());
+
+    // Console layer with color support
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_timer(timer.clone())
+        .with_ansi(true);
+
+    // File layer without ANSI codes
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_timer(timer)
+        .with_ansi(false)
+        .with_writer(non_blocking);
+
+    // Combine layers (including LineCountingLayer for table replacement)
     tracing_subscriber::registry()
         .with(LineCountingLayer)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new("[%H:%M:%S]".to_string()))
-        )
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("info")
-                    .add_directive("controller=info".parse().unwrap())
-                    .add_directive("arb_bot=info".parse().unwrap())
-            }),
-        )
+        .with(env_filter)
+        .with(console_layer)
+        .with(file_layer)
         .init();
+
+    (absolute_log_path, guard)
+}
+
+/// Remove old log files, keeping only the most recent `keep_count` files.
+fn cleanup_old_logs(logs_dir: &PathBuf, keep_count: usize) {
+    let Ok(entries) = std::fs::read_dir(logs_dir) else {
+        return;
+    };
+
+    // Collect log files with their modification times
+    let mut log_files: Vec<(PathBuf, std::time::SystemTime)> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "log")
+                .unwrap_or(false)
+        })
+        .filter_map(|e| {
+            e.metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|t| (e.path(), t))
+        })
+        .collect();
+
+    // Sort by modification time (newest first)
+    log_files.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Remove files beyond keep_count
+    for (path, _) in log_files.into_iter().skip(keep_count) {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize logging with both console and file output
+    // The guard must be kept alive for the duration of the program to ensure logs are flushed
+    let (log_file_path, _log_guard) = init_logging();
+    info!("📝 Logging to: {}", log_file_path.display());
 
     // Load environment variables from `.env` (supports workspace-root `.env`)
     paths::load_dotenv();
@@ -327,27 +487,64 @@ async fn main() -> Result<()> {
     info!("   Profit threshold: <{:.1}¢ ({:.1}% minimum profit)",
           ARB_THRESHOLD * 100.0, (1.0 - ARB_THRESHOLD) * 100.0);
 
-    // --- CLI overrides ---
+    // --- CLI overrides (faster iteration) ---
+    // Examples:
+    //   cargo run -p controller -- --leagues nba
+    //   cargo run -p controller -- --leagues nba,nfl --pairing-debug --pairing-debug-limit 50
+    //   cargo run -p controller -- --verbose-heartbeat --heartbeat-interval 5
     let args: Vec<String> = std::env::args().skip(1).collect();
     if cli_has_flag(&args, "--verbose-heartbeat") {
         std::env::set_var("VERBOSE_HEARTBEAT", "1");
     }
-    if let Some(val) = cli_get_value(&args, "--heartbeat-interval") {
-        std::env::set_var("HEARTBEAT_INTERVAL_SECS", val);
+    if let Some(v) = cli_arg_value(&args, "--heartbeat-interval") {
+        std::env::set_var("HEARTBEAT_INTERVAL_SECS", v);
+    }
+    if cli_has_flag(&args, "--pairing-debug") {
+        std::env::set_var("PAIRING_DEBUG", "1");
+    }
+    if let Some(v) = cli_arg_value(&args, "--pairing-debug-limit") {
+        std::env::set_var("PAIRING_DEBUG_LIMIT", v);
     }
 
-    // Build league list for discovery from config env.
-    // - If ENABLED_LEAGUES is empty, we monitor all supported leagues.
-    // - Otherwise, we monitor only the explicit set.
-    let leagues: Vec<&str> = {
-        let enabled = enabled_leagues();
-        if enabled.is_empty() {
-            get_league_configs().into_iter().map(|c| c.league_code).collect()
-        } else {
-            enabled.iter().map(|s| s.as_str()).collect()
-        }
+    // Build league list for discovery from CLI/env.
+    // - `--leagues nba,nfl` overrides env.
+    // - If nothing is specified, we monitor all supported leagues.
+    let cli_leagues: Option<Vec<String>> = cli_arg_value(&args, "--leagues").map(|v| {
+        v.split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+
+    let env_leagues: Vec<String> = enabled_leagues().to_vec();
+
+    let leagues_owned: Vec<String> = match cli_leagues {
+        Some(v) if !v.is_empty() => v,
+        _ if !env_leagues.is_empty() => env_leagues,
+        _ => get_league_configs()
+            .into_iter()
+            .map(|c| c.league_code.to_string())
+            .collect(),
     };
+
+    let leagues: Vec<&str> = leagues_owned.iter().map(|s| s.as_str()).collect();
     info!("   Monitored leagues: {:?}", leagues);
+
+    // Parse --market-type filter (e.g., --market-type moneyline)
+    let market_type_filter: Option<MarketType> = cli_arg_value(&args, "--market-type")
+        .and_then(|s| match s.to_lowercase().as_str() {
+            "moneyline" => Some(MarketType::Moneyline),
+            "spread" => Some(MarketType::Spread),
+            "total" => Some(MarketType::Total),
+            "btts" => Some(MarketType::Btts),
+            _ => {
+                warn!("Unknown market type '{}', ignoring filter", s);
+                None
+            }
+        });
+    if let Some(mt) = &market_type_filter {
+        info!("   Market type filter: {:?}", mt);
+    }
 
     // Check for dry run mode
     let dry_run = std::env::var("DRY_RUN").map(|v| v == "1" || v == "true").unwrap_or(true);
@@ -393,12 +590,13 @@ async fn main() -> Result<()> {
     );
 
     let result = if force_discovery {
-        discovery.discover_all_force(&leagues).await
+        discovery.discover_all_force(&leagues, market_type_filter).await
     } else {
-        discovery.discover_all(&leagues).await
+        discovery.discover_all(&leagues, market_type_filter).await
     };
 
     info!("📊 Market discovery complete:");
+    print_discovery_summary(&result);
     info!("   - Matched market pairs: {}", result.pairs.len());
 
     if !result.errors.is_empty() {
@@ -837,13 +1035,14 @@ async fn main() -> Result<()> {
             let mut total_poly_updates: u64 = 0;
             let mut with_both = 0usize;
 
-            // Track best arbitrage opportunity
+            // Track best arbitrage opportunity:
+            // (total_cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no, max_contracts)
             #[allow(clippy::type_complexity)]
-            let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, bool)> = None;
+            let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, bool, i64)> = None;
 
             for market in heartbeat_state.markets.iter().take(market_count) {
-                let (k_yes, k_no, _k_yes_size, _k_no_size) = market.kalshi.load();
-                let (p_yes, p_no, _p_yes_size, _p_no_size) = market.poly.load();
+                let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
+                let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.load();
                 let (k_upd, p_upd) = market.load_update_counts();
 
                 total_kalshi_updates += k_upd as u64;
@@ -890,18 +1089,30 @@ async fn main() -> Result<()> {
 
                     let fee1 = kalshi_fee_cents(k_no);
                     let cost1 = p_yes + k_no + fee1;
+                    let max1 = (p_yes_size.min(k_no_size) / 100) as i64;
 
                     let fee2 = kalshi_fee_cents(k_yes);
                     let cost2 = k_yes + fee2 + p_no;
+                    let max2 = (k_yes_size.min(p_no_size) / 100) as i64;
 
-                    let (best_cost, best_fee, is_poly_yes) = if cost1 <= cost2 {
-                        (cost1, fee1, true)
+                    let (best_cost, best_fee, is_poly_yes, best_max) = if cost1 <= cost2 {
+                        (cost1, fee1, true, max1)
                     } else {
-                        (cost2, fee2, false)
+                        (cost2, fee2, false, max2)
                     };
 
                     if best_arb.is_none() || best_cost < best_arb.as_ref().unwrap().0 {
-                        best_arb = Some((best_cost, market.market_id, p_yes, k_no, k_yes, p_no, best_fee, is_poly_yes));
+                        best_arb = Some((
+                            best_cost,
+                            market.market_id,
+                            p_yes,
+                            k_no,
+                            k_yes,
+                            p_no,
+                            best_fee,
+                            is_poly_yes,
+                            best_max,
+                        ));
                     }
                 }
             }
@@ -991,7 +1202,7 @@ async fn main() -> Result<()> {
             }
 
             // Log best opportunity
-            if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes)) = best_arb {
+            if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes, max_contracts)) = best_arb {
                 let gap = cost as i16 - heartbeat_threshold as i16;
                 let pair = heartbeat_state.get_by_id(market_id)
                     .and_then(|m| m.pair());
@@ -1011,11 +1222,13 @@ async fn main() -> Result<()> {
                     format!("K_yes({}¢) + P_no({}¢) + K_fee({}¢) = {}¢", k_yes, p_no, fee, cost)
                 };
                 if gap < 0 {
+                    println!();  // Move to new line before logging opportunity
                     info!(
-                        "📊 Best opportunity: {} | {} | gap={:+}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
+                        "📊 Best opportunity: {} | {} | gap={:+}¢ | max={}x | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
                         desc,
                         leg_breakdown,
                         gap,
+                        max_contracts,
                         p_yes,
                         k_no,
                         k_yes,
@@ -1108,13 +1321,14 @@ async fn main() -> Result<()> {
     let discovery_interval = config::discovery_interval_mins();
     let discovery_client = Arc::new(discovery);
     let discovery_state = state.clone();
+    let refresh_leagues = leagues_owned.clone();
     let discovery_handle = tokio::spawn(async move {
         discovery_refresh_task(
             discovery_client,
             discovery_state,
             shutdown_tx,
             discovery_interval,
-            enabled_leagues().to_vec(),
+            refresh_leagues,
         ).await;
     });
 

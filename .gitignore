@@ -8,3 +8,4 @@ positions.json
 .discovery_cache.json
 *.pem
 .worktrees/
+.logs/
