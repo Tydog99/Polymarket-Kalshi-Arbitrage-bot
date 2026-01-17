@@ -123,7 +123,7 @@ impl GammaClient {
                         }
                     }
                 }
-                Ok(resp) => {
+                Ok(_resp) => {
                     // Non-success status, don't retry (likely 404)
                     return Ok(None);
                 }

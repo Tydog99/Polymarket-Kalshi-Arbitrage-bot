@@ -22,7 +22,7 @@ use crate::config;
 use crate::config::{LeagueConfig, get_league_configs, get_league_config};
 use crate::kalshi::KalshiApiClient;
 use crate::polymarket::GammaClient;
-use crate::types::{MarketPair, MarketType, DiscoveryResult, PairingStats, KalshiMarket, KalshiEvent};
+use crate::types::{MarketPair, MarketType, DiscoveryResult, KalshiMarket, KalshiEvent};
 
 /// Max concurrent Gamma API requests
 const GAMMA_CONCURRENCY: usize = 5;
@@ -166,7 +166,6 @@ impl DiscoveryClient {
                     poly_matches: 0,
                     poly_misses: 0,
                     errors: vec![],
-                    pairing_stats: HashMap::new(),
                 };
             }
             Some(cache) if market_type_filter.is_none() => {
@@ -301,7 +300,6 @@ impl DiscoveryClient {
             poly_matches: new_count,
             poly_misses: 0,
             errors: vec![],
-            pairing_stats: HashMap::new(),
         }
     }
 
@@ -1192,7 +1190,6 @@ impl DiscoveryClient {
             poly_matches: poly_lookup.len() / 2,
             poly_misses: 0,
             errors: vec![],
-            pairing_stats: HashMap::new(),
         }
     }
 }

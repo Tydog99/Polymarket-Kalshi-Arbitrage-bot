@@ -30,6 +30,7 @@ struct PolyEvent {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 struct PolyMarket {
     slug: Option<String>,
     #[serde(rename = "clobTokenIds")]
@@ -286,6 +287,7 @@ fn normalize_team(name: &str) -> String {
 
 /// Match outcome codes to team names
 /// Returns vec of (code, team_name) pairs
+#[allow(dead_code)]
 fn match_outcomes_to_teams(outcomes: &[String], teams: &(String, String)) -> Vec<(String, String)> {
     let (team1, team2) = teams;
     let mut mappings = Vec::new();
