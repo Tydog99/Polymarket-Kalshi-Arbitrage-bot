@@ -76,6 +76,77 @@ fn cli_has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
+/// Print a summary table of discovery results
+fn print_discovery_summary(result: &types::DiscoveryResult) {
+    use std::collections::BTreeSet;
+
+    // Collect all unique leagues from stats
+    let leagues: BTreeSet<_> = result.stats.by_league_type
+        .keys()
+        .map(|(league, _)| league.clone())
+        .collect();
+
+    if leagues.is_empty() {
+        return;
+    }
+
+    let market_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+    let type_headers = ["Moneyline", "Spread", "Total", "BTTS"];
+
+    // Calculate column widths
+    let league_width = leagues.iter().map(|l| l.len()).max().unwrap_or(6).max(6);
+
+    // Print header
+    info!("┌{:─<width$}┬{:─<48}┬{:─<8}┬{:─<8}┐",
+          "", "", "", "", width = league_width + 2);
+    info!("│{:^width$}│{:^48}│{:^8}│{:^8}│",
+          "DISCOVERY SUMMARY", "", "", "", width = league_width + 2);
+    info!("├{:─<width$}┼{:─<11}─{:─<11}─{:─<11}─{:─<11}┼{:─<8}┼{:─<8}┤",
+          "", "", "", "", "", "", "", width = league_width + 2);
+    info!("│ {:width$} │ {:^9} {:^9} {:^9} {:^9}   │ {:^6} │ {:^6} │",
+          "League", type_headers[0], type_headers[1], type_headers[2], type_headers[3], "Kalshi", "Match",
+          width = league_width);
+    info!("├{:─<width$}┼{:─<11}─{:─<11}─{:─<11}─{:─<11}┼{:─<8}┼{:─<8}┤",
+          "", "", "", "", "", "", "", width = league_width + 2);
+
+    // Print each league row
+    let mut total_kalshi = 0usize;
+    let mut total_matched = 0usize;
+
+    for league in &leagues {
+        let mut row_kalshi = 0usize;
+        let mut row_matched = 0usize;
+        let mut type_strs: Vec<String> = Vec::new();
+
+        for mt in &market_types {
+            if let Some(&(kalshi, matched)) = result.stats.by_league_type.get(&(league.clone(), *mt)) {
+                type_strs.push(format!("{}/{}", matched, kalshi));
+                row_kalshi += kalshi;
+                row_matched += matched;
+            } else {
+                type_strs.push("-".to_string());
+            }
+        }
+
+        info!("│ {:width$} │ {:^9} {:^9} {:^9} {:^9}   │ {:^6} │ {:^6} │",
+              league,
+              type_strs[0], type_strs[1], type_strs[2], type_strs[3],
+              row_kalshi, row_matched,
+              width = league_width);
+
+        total_kalshi += row_kalshi;
+        total_matched += row_matched;
+    }
+
+    // Print footer with totals
+    info!("├{:─<width$}┼{:─<11}─{:─<11}─{:─<11}─{:─<11}┼{:─<8}┼{:─<8}┤",
+          "", "", "", "", "", "", "", width = league_width + 2);
+    info!("│ {:width$} │ {:^9} {:^9} {:^9} {:^9}   │ {:^6} │ {:^6} │",
+          "TOTAL", "", "", "", "", total_kalshi, total_matched, width = league_width);
+    info!("└{:─<width$}┴{:─<48}┴{:─<8}┴{:─<8}┘",
+          "", "", "", "", width = league_width + 2);
+}
+
 /// Background task that periodically discovers new markets
 async fn discovery_refresh_task(
     discovery: Arc<DiscoveryClient>,
@@ -382,6 +453,7 @@ async fn main() -> Result<()> {
     };
 
     info!("📊 Market discovery complete:");
+    print_discovery_summary(&result);
     info!("   - Matched market pairs: {}", result.pairs.len());
 
     if !result.errors.is_empty() {
