@@ -39,12 +39,50 @@ mod types;
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
-use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tailscale::beacon::BeaconSender;
 use tokio::sync::{RwLock, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+/// Global counter for lines printed since last table clear.
+static LINES_SINCE_TABLE: AtomicUsize = AtomicUsize::new(0);
+
+/// Custom tracing layer that counts output lines for table replacement.
+/// Estimates visual lines based on message length and terminal width.
+struct LineCountingLayer;
+
+impl<S> tracing_subscriber::Layer<S> for LineCountingLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        // Get actual terminal width, fallback to 80
+        let term_width = terminal_size::terminal_size()
+            .map(|(w, _)| w.0 as usize)
+            .unwrap_or(80);
+
+        // Extract message length from event
+        struct MsgLen(usize);
+        impl tracing::field::Visit for MsgLen {
+            fn record_debug(&mut self, _field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0 += format!("{:?}", value).len();
+            }
+            fn record_str(&mut self, _field: &tracing::field::Field, value: &str) {
+                self.0 += value.len();
+            }
+        }
+
+        let mut visitor = MsgLen(60); // Base overhead for timestamp, level, target, emojis
+        event.record(&mut visitor);
+
+        // Calculate visual lines - be conservative (emojis take 2 chars, add buffer)
+        // Use 1.5x message length estimate and always at least 1 line
+        let visual_lines = ((visitor.0 * 3 / 2) / term_width).max(1) + 1;
+        LINES_SINCE_TABLE.fetch_add(visual_lines, Ordering::Relaxed);
+    }
+}
 
 use cache::TeamCache;
 use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
@@ -58,7 +96,20 @@ use crate::remote_execution::{HybridExecutor, run_hybrid_execution_loop};
 use crate::remote_protocol::Platform as WsPlatform;
 use crate::remote_trader::RemoteTraderServer;
 use trading::execution::Platform as TradingPlatform;
-use types::{GlobalState, PriceCents};
+use types::{GlobalState, MarketType, PriceCents};
+
+fn cli_has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|a| a == flag)
+}
+
+fn cli_get_value(args: &[String], flag: &str) -> Option<String> {
+    for arg in args {
+        if let Some(val) = arg.strip_prefix(&format!("{}=", flag)) {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
 
 /// Polymarket CLOB API host
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
@@ -185,9 +236,16 @@ async fn main() -> Result<()> {
     // Initialize logging with compact local time format [HH:MM:SS]
     // Note: the binary crate is `controller`, while the shared library crate is `arb_bot`.
     // If the user doesn't set `RUST_LOG`, we still want `info` logs from both crates.
-    tracing_subscriber::fmt()
-        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new("[%H:%M:%S]".to_string()))
-        .with_env_filter(
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    tracing_subscriber::registry()
+        .with(LineCountingLayer)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new("[%H:%M:%S]".to_string()))
+        )
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 tracing_subscriber::EnvFilter::new("info")
                     .add_directive("controller=info".parse().unwrap())
@@ -268,6 +326,15 @@ async fn main() -> Result<()> {
     info!("🚀 Prediction Market Arbitrage System v2.0");
     info!("   Profit threshold: <{:.1}¢ ({:.1}% minimum profit)",
           ARB_THRESHOLD * 100.0, (1.0 - ARB_THRESHOLD) * 100.0);
+
+    // --- CLI overrides ---
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if cli_has_flag(&args, "--verbose-heartbeat") {
+        std::env::set_var("VERBOSE_HEARTBEAT", "1");
+    }
+    if let Some(val) = cli_get_value(&args, "--heartbeat-interval") {
+        std::env::set_var("HEARTBEAT_INTERVAL_SECS", val);
+    }
 
     // Build league list for discovery from config env.
     // - If ENABLED_LEAGUES is empty, we monitor all supported leagues.
@@ -725,24 +792,99 @@ async fn main() -> Result<()> {
     let heartbeat_threshold = threshold_cents;
     let heartbeat_handle = tokio::spawn(async move {
         use crate::types::kalshi_fee_cents;
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        use std::collections::HashMap;
+
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+            config::heartbeat_interval_secs(),
+        ));
+
+        // Track previous update totals for delta calculation
+        let mut prev_kalshi_updates: u64 = 0;
+        let mut prev_poly_updates: u64 = 0;
+
+        // Clear line counter from startup logs before first heartbeat
+        LINES_SINCE_TABLE.store(0, Ordering::SeqCst);
+
+        // Track previous stats for delta calculation
+        let mut prev_league_type_stats: HashMap<(String, MarketType), (u32, u32)> = HashMap::new();
+
         loop {
             interval.tick().await;
             let market_count = heartbeat_state.market_count();
-            let mut with_kalshi = 0;
-            let mut with_poly = 0;
-            let mut with_both = 0;
-            // Track best arbitrage opportunity: (total_cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no)
+            let verbose = config::verbose_heartbeat_enabled();
+
+            // Aggregate stats by (league, market_type)
+            // Value: (market_count, kalshi_updates, poly_updates)
+            let mut league_type_stats: HashMap<(String, MarketType), (usize, u32, u32)> = HashMap::new();
+
+            // For verbose mode: collect market details
+            struct MarketDetail {
+                description: String,
+                league: String,
+                market_type: MarketType,
+                k_yes: u16,
+                k_no: u16,
+                p_yes: u16,
+                p_no: u16,
+                gap: i16,
+                k_updates: u32,
+                p_updates: u32,
+            }
+            let mut market_details: Vec<MarketDetail> = Vec::new();
+
+            // Totals for header
+            let mut total_kalshi_updates: u64 = 0;
+            let mut total_poly_updates: u64 = 0;
+            let mut with_both = 0usize;
+
+            // Track best arbitrage opportunity
             #[allow(clippy::type_complexity)]
             let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, bool)> = None;
 
             for market in heartbeat_state.markets.iter().take(market_count) {
-                let (k_yes, k_no, _, _) = market.kalshi.load();
-                let (p_yes, p_no, _, _) = market.poly.load();
+                let (k_yes, k_no, _k_yes_size, _k_no_size) = market.kalshi.load();
+                let (p_yes, p_no, _p_yes_size, _p_no_size) = market.poly.load();
+                let (k_upd, p_upd) = market.load_update_counts();
+
+                total_kalshi_updates += k_upd as u64;
+                total_poly_updates += p_upd as u64;
+
                 let has_k = k_yes > 0 && k_no > 0;
                 let has_p = p_yes > 0 && p_no > 0;
-                if k_yes > 0 || k_no > 0 { with_kalshi += 1; }
-                if p_yes > 0 || p_no > 0 { with_poly += 1; }
+
+                // Aggregate by league/type
+                if let Some(pair) = market.pair() {
+                    let key = (pair.league.to_string(), pair.market_type);
+                    let entry = league_type_stats.entry(key).or_insert((0, 0, 0));
+                    entry.0 += 1;
+                    entry.1 += k_upd;
+                    entry.2 += p_upd;
+
+                    // For verbose mode, collect market details
+                    if verbose && has_k && has_p {
+                        // Calculate gap (best cross-platform cost - threshold)
+                        let fee1 = kalshi_fee_cents(k_no);
+                        let cost1 = p_yes + k_no + fee1;
+                        let fee2 = kalshi_fee_cents(k_yes);
+                        let cost2 = k_yes + fee2 + p_no;
+                        let best_cost = cost1.min(cost2);
+                        let gap = best_cost as i16 - heartbeat_threshold as i16;
+
+                        market_details.push(MarketDetail {
+                            description: pair.description.to_string(),
+                            league: pair.league.to_string(),
+                            market_type: pair.market_type,
+                            k_yes,
+                            k_no,
+                            p_yes,
+                            p_no,
+                            gap,
+                            k_updates: k_upd,
+                            p_updates: p_upd,
+                        });
+                    }
+                }
+
                 if has_k && has_p {
                     with_both += 1;
 
@@ -764,11 +906,91 @@ async fn main() -> Result<()> {
                 }
             }
 
-            let now = chrono::Local::now().format("%H:%M:%S");
-            print!("\r[{}]  INFO 💓 {} markets | K:{} P:{} Both:{} | threshold={}¢    ",
-                   now, market_count, with_kalshi, with_poly, with_both, heartbeat_threshold);
-            let _ = std::io::stdout().flush();
+            // Calculate update deltas since last heartbeat
+            let kalshi_delta = total_kalshi_updates.saturating_sub(prev_kalshi_updates);
+            let poly_delta = total_poly_updates.saturating_sub(prev_poly_updates);
+            prev_kalshi_updates = total_kalshi_updates;
+            prev_poly_updates = total_poly_updates;
 
+            if verbose {
+                // Verbose mode: hierarchical tree view
+                println!();
+                info!("💓 VERBOSE - {} markets", market_count);
+                println!();
+
+                // Group by league, then by market type
+                let mut by_league: HashMap<String, Vec<&MarketDetail>> = HashMap::new();
+                for detail in &market_details {
+                    by_league.entry(detail.league.clone()).or_default().push(detail);
+                }
+
+                let mut sorted_leagues: Vec<_> = by_league.keys().cloned().collect();
+                sorted_leagues.sort();
+
+                for league in sorted_leagues {
+                    let markets = by_league.get(&league).unwrap();
+                    let league_updates: u64 = markets.iter().map(|m| m.k_updates as u64 + m.p_updates as u64).sum();
+
+                    println!("📊 {} ({} markets, {} updates)",
+                             league.to_uppercase(), markets.len(), league_updates);
+
+                    // Group by market type
+                    let mut by_type: HashMap<MarketType, Vec<&&MarketDetail>> = HashMap::new();
+                    for m in markets {
+                        by_type.entry(m.market_type).or_default().push(m);
+                    }
+
+                    let type_order = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+                    let type_count = by_type.len();
+                    let mut type_idx = 0;
+
+                    for mt in type_order.iter() {
+                        if let Some(type_markets) = by_type.get(mt) {
+                            type_idx += 1;
+                            let is_last_type = type_idx == type_count;
+                            let branch = if is_last_type { "└" } else { "├" };
+
+                            println!("{}─ {:?} ({})", branch, mt, type_markets.len());
+
+                            // Show all markets
+                            for (i, m) in type_markets.iter().enumerate() {
+                                let is_last = i == type_markets.len() - 1;
+                                let prefix = if is_last_type { " " } else { "│" };
+                                let item_branch = if is_last { "└" } else { "├" };
+
+                                // Truncate description to 30 chars
+                                let desc: String = if m.description.len() > 30 {
+                                    format!("{}...", &m.description[..27])
+                                } else {
+                                    m.description.clone()
+                                };
+
+                                let gap_str = if m.gap < 0 {
+                                    format!("\x1b[32m{:+}¢\x1b[0m", m.gap) // Green for arb
+                                } else {
+                                    format!("{:+}¢", m.gap)
+                                };
+
+                                println!("{}  {}── {:30} K:{:02}/{:02} P:{:02}/{:02} gap:{} upd:K{}/P{}",
+                                         prefix, item_branch, desc,
+                                         m.k_yes, m.k_no, m.p_yes, m.p_no,
+                                         gap_str, m.k_updates, m.p_updates);
+                            }
+                        }
+                    }
+                    println!();
+                }
+
+                println!("Legend: gap = cost - {}¢ | negative = arb opportunity", heartbeat_threshold);
+                println!();
+            } else {
+                // Default mode: compact summary
+                println!();
+                info!("💓 {} markets | K:{} P:{} updates/min",
+                      market_count, kalshi_delta, poly_delta);
+            }
+
+            // Log best opportunity
             if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes)) = best_arb {
                 let gap = cost as i16 - heartbeat_threshold as i16;
                 let pair = heartbeat_state.get_by_id(market_id)
@@ -789,9 +1011,16 @@ async fn main() -> Result<()> {
                     format!("K_yes({}¢) + P_no({}¢) + K_fee({}¢) = {}¢", k_yes, p_no, fee, cost)
                 };
                 if gap < 0 {
-                    println!();  // Move to new line before logging opportunity
-                    info!("📊 Best opportunity: {} | {} | gap={:+}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
-                          desc, leg_breakdown, gap, p_yes, k_no, k_yes, p_no);
+                    info!(
+                        "📊 Best opportunity: {} | {} | gap={:+}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
+                        desc,
+                        leg_breakdown,
+                        gap,
+                        p_yes,
+                        k_no,
+                        k_yes,
+                        p_no
+                    );
                     // Log URLs for easy access
                     if let Some(p) = pair.as_ref() {
                         let kalshi_series = p.kalshi_event_ticker
@@ -810,8 +1039,67 @@ async fn main() -> Result<()> {
                     }
                 }
             } else if with_both == 0 {
-                println!();  // Move to new line before warning
                 warn!("⚠️  No markets with both Kalshi and Polymarket prices - verify WebSocket connections");
+            }
+
+            // Print league summary table (replaces previous table using ANSI escape codes)
+            let market_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+            let type_headers = ["Moneyline", "Spread", "Total", "BTTS"];
+
+            let mut leagues: Vec<String> = league_type_stats.keys()
+                .map(|(l, _)| l.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            leagues.sort();
+
+            if !leagues.is_empty() {
+                static PREV_TABLE_LINES: AtomicUsize = AtomicUsize::new(0);
+
+                // Get lines logged since last table and reset counter
+                let extra_lines = LINES_SINCE_TABLE.swap(0, Ordering::SeqCst);
+                let prev_lines = PREV_TABLE_LINES.load(Ordering::Relaxed);
+
+                // Only replace table if few/no interleaved logs (preserve important logs)
+                // If many logs appeared, just print fresh table below them
+                if prev_lines > 0 && extra_lines <= 3 {
+                    use std::io::Write;
+                    // Move up to start of previous table, clear to end of screen
+                    print!("\x1b[{}A\x1b[J", prev_lines);
+                    std::io::stdout().flush().ok();
+                }
+
+                // Print header
+                println!("┌──────────┬────────────┬────────────┬────────────┬────────────┐");
+                println!("│ {:8} │ {:^10} │ {:^10} │ {:^10} │ {:^10} │",
+                         "League", type_headers[0], type_headers[1], type_headers[2], type_headers[3]);
+                println!("├──────────┼────────────┼────────────┼────────────┼────────────┤");
+
+                for league in &leagues {
+                    let mut cells: Vec<String> = Vec::new();
+                    for mt in &market_types {
+                        if let Some(&(count, k_upd, p_upd)) = league_type_stats.get(&(league.clone(), *mt)) {
+                            let key = (league.clone(), *mt);
+                            let (prev_k, prev_p) = prev_league_type_stats.get(&key).copied().unwrap_or((0, 0));
+                            let delta = (k_upd.saturating_sub(prev_k)) + (p_upd.saturating_sub(prev_p));
+                            cells.push(format!("{} (+{})", count, delta));
+                        } else {
+                            cells.push("-".to_string());
+                        }
+                    }
+                    println!("│ {:8} │ {:^10} │ {:^10} │ {:^10} │ {:^10} │",
+                             league, cells[0], cells[1], cells[2], cells[3]);
+                }
+
+                println!("└──────────┴────────────┴────────────┴────────────┴────────────┘");
+
+                // Update previous stats for next iteration
+                for (key, &(_, k_upd, p_upd)) in &league_type_stats {
+                    prev_league_type_stats.insert(key.clone(), (k_upd, p_upd));
+                }
+
+                // Store table height: 3 header lines + league rows + 1 footer
+                PREV_TABLE_LINES.store(4 + leagues.len(), Ordering::Relaxed);
             }
         }
     });

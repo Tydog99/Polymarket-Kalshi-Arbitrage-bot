@@ -104,6 +104,29 @@ pub fn is_league_disabled(league: &str) -> bool {
     disabled_leagues().contains(&league.to_lowercase())
 }
 
+/// Enable verbose heartbeat output with hierarchical tree view.
+/// Set `VERBOSE_HEARTBEAT=1` or use `--verbose-heartbeat` CLI flag.
+pub fn verbose_heartbeat_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("VERBOSE_HEARTBEAT")
+            .map(|v| v == "1" || v.to_lowercase() == "true" || v.to_lowercase() == "yes")
+            .unwrap_or(false)
+    })
+}
+
+/// Heartbeat interval in seconds for arbitrage detection loop.
+/// Set `HEARTBEAT_INTERVAL_SECS=N` or use `--heartbeat-interval=N` CLI flag (default: 10 seconds).
+pub fn heartbeat_interval_secs() -> u64 {
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("HEARTBEAT_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10)
+    })
+}
+
 /// Price logging enabled (set PRICE_LOGGING=1 to enable)
 #[allow(dead_code)]
 pub fn price_logging_enabled() -> bool {

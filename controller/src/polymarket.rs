@@ -378,6 +378,7 @@ async fn process_book(
     if let Some(market_id) = yes_market_id {
         let market = &state.markets[market_id as usize];
         market.poly.update_yes(best_ask, ask_size);
+        market.inc_poly_updates();
 
         // Check arbs
         let arb_mask = market.check_arbs(threshold_cents);
@@ -392,6 +393,7 @@ async fn process_book(
     if let Some(market_id) = no_market_id {
         let market = &state.markets[market_id as usize];
         market.poly.update_no(best_ask, ask_size);
+        market.inc_poly_updates();
 
         // Check arbs
         let arb_mask = market.check_arbs(threshold_cents);
@@ -429,6 +431,7 @@ async fn process_price_change(
 
         // Always update cached price to reflect current market state
         market.poly.update_yes(price, current_yes_size);
+        market.inc_poly_updates();
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_yes || current_yes == 0 {
@@ -448,6 +451,7 @@ async fn process_price_change(
 
         // Always update cached price to reflect current market state
         market.poly.update_no(price, current_no_size);
+        market.inc_poly_updates();
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_no || current_no == 0 {
