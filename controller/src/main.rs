@@ -58,7 +58,7 @@ use crate::remote_execution::{HybridExecutor, run_hybrid_execution_loop};
 use crate::remote_protocol::Platform as WsPlatform;
 use crate::remote_trader::RemoteTraderServer;
 use trading::execution::Platform as TradingPlatform;
-use types::{GlobalState, PriceCents};
+use types::{GlobalState, MarketType, PriceCents};
 
 /// Polymarket CLOB API host
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
@@ -316,6 +316,22 @@ async fn main() -> Result<()> {
     let leagues: Vec<&str> = leagues_owned.iter().map(|s| s.as_str()).collect();
     info!("   Monitored leagues: {:?}", leagues);
 
+    // Parse --market-type filter (e.g., --market-type moneyline)
+    let market_type_filter: Option<MarketType> = cli_arg_value(&args, "--market-type")
+        .and_then(|s| match s.to_lowercase().as_str() {
+            "moneyline" => Some(MarketType::Moneyline),
+            "spread" => Some(MarketType::Spread),
+            "total" => Some(MarketType::Total),
+            "btts" => Some(MarketType::Btts),
+            _ => {
+                warn!("Unknown market type '{}', ignoring filter", s);
+                None
+            }
+        });
+    if let Some(mt) = &market_type_filter {
+        info!("   Market type filter: {:?}", mt);
+    }
+
     // Check for dry run mode
     let dry_run = std::env::var("DRY_RUN").map(|v| v == "1" || v == "true").unwrap_or(true);
     if dry_run {
@@ -360,9 +376,9 @@ async fn main() -> Result<()> {
     );
 
     let result = if force_discovery {
-        discovery.discover_all_force(&leagues).await
+        discovery.discover_all_force(&leagues, market_type_filter).await
     } else {
-        discovery.discover_all(&leagues).await
+        discovery.discover_all(&leagues, market_type_filter).await
     };
 
     info!("📊 Market discovery complete:");

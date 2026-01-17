@@ -148,13 +148,13 @@ impl DiscoveryClient {
     /// 2. If cache exists and is fresh (<2 hours), use it directly
     /// 3. If cache exists but is stale, load it + fetch incremental updates
     /// 4. If no cache, do full discovery
-    pub async fn discover_all(&self, leagues: &[&str]) -> DiscoveryResult {
+    pub async fn discover_all(&self, leagues: &[&str], market_type_filter: Option<MarketType>) -> DiscoveryResult {
         // Try to load existing cache
         let cached = Self::load_cache().await;
 
         match cached {
-            Some(cache) if !cache.is_expired() => {
-                // Cache is fresh - filter by enabled leagues and return
+            Some(cache) if !cache.is_expired() && market_type_filter.is_none() => {
+                // Cache is fresh and no filter - use it directly
                 let age = cache.age_secs();
                 let pairs = filter_pairs_by_leagues(cache.pairs, leagues);
                 info!("📂 Loaded {} pairs from cache (age: {}s){}",
@@ -169,19 +169,23 @@ impl DiscoveryClient {
                     pairing_stats: HashMap::new(),
                 };
             }
-            Some(cache) => {
+            Some(cache) if market_type_filter.is_none() => {
                 // Cache is stale - do incremental discovery
                 info!("📂 Cache expired (age: {}s), doing incremental refresh...", cache.age_secs());
-                return self.discover_incremental(leagues, cache).await;
+                return self.discover_incremental(leagues, cache, market_type_filter).await;
             }
-            None => {
-                // No cache - do full discovery
-                info!("📂 No cache found, doing full discovery...");
+            _ => {
+                // No cache or market type filter specified - do full discovery
+                if market_type_filter.is_some() {
+                    info!("📂 Market type filter active, doing fresh discovery...");
+                } else {
+                    info!("📂 No cache found, doing full discovery...");
+                }
             }
         }
 
         // Full discovery (no cache)
-        let result = self.discover_full(leagues).await;
+        let result = self.discover_full(leagues, market_type_filter).await;
 
         // Save to cache
         if !result.pairs.is_empty() {
@@ -197,9 +201,9 @@ impl DiscoveryClient {
     }
 
     /// Force full discovery (ignores cache)
-    pub async fn discover_all_force(&self, leagues: &[&str]) -> DiscoveryResult {
+    pub async fn discover_all_force(&self, leagues: &[&str], market_type_filter: Option<MarketType>) -> DiscoveryResult {
         info!("🔄 Forced full discovery (ignoring cache)...");
-        let result = self.discover_full(leagues).await;
+        let result = self.discover_full(leagues, market_type_filter).await;
 
         // Save to cache
         if !result.pairs.is_empty() {
@@ -215,7 +219,7 @@ impl DiscoveryClient {
     }
 
     /// Full discovery without cache
-    async fn discover_full(&self, leagues: &[&str]) -> DiscoveryResult {
+    async fn discover_full(&self, leagues: &[&str], market_type_filter: Option<MarketType>) -> DiscoveryResult {
         let configs: Vec<_> = if leagues.is_empty() {
             get_league_configs()
         } else {
@@ -226,7 +230,7 @@ impl DiscoveryClient {
 
         // Parallel discovery across all leagues
         let league_futures: Vec<_> = configs.iter()
-            .map(|config| self.discover_league(config, None))
+            .map(|config| self.discover_league(config, None, market_type_filter))
             .collect();
 
         let league_results = futures_util::future::join_all(league_futures).await;
@@ -244,7 +248,7 @@ impl DiscoveryClient {
     }
 
     /// Incremental discovery - merge cached pairs with newly discovered ones
-    async fn discover_incremental(&self, leagues: &[&str], cache: DiscoveryCache) -> DiscoveryResult {
+    async fn discover_incremental(&self, leagues: &[&str], cache: DiscoveryCache, market_type_filter: Option<MarketType>) -> DiscoveryResult {
         let configs: Vec<_> = if leagues.is_empty() {
             get_league_configs()
         } else {
@@ -255,7 +259,7 @@ impl DiscoveryClient {
 
         // Discover with filter for known tickers
         let league_futures: Vec<_> = configs.iter()
-            .map(|config| self.discover_league(config, Some(&cache)))
+            .map(|config| self.discover_league(config, Some(&cache), market_type_filter))
             .collect();
 
         let league_results = futures_util::future::join_all(league_futures).await;
@@ -303,7 +307,8 @@ impl DiscoveryClient {
 
     /// Discover all market types for a single league (PARALLEL)
     /// If cache is provided, only discovers markets not already in cache
-    async fn discover_league(&self, config: &LeagueConfig, cache: Option<&DiscoveryCache>) -> DiscoveryResult {
+    /// If market_type_filter is provided, only discovers that market type
+    async fn discover_league(&self, config: &LeagueConfig, cache: Option<&DiscoveryCache>, market_type_filter: Option<MarketType>) -> DiscoveryResult {
         // Use esports discovery for leagues with poly_series_id
         if config.poly_series_id.is_some() {
             return self.discover_esports_league(config).await;
@@ -311,7 +316,13 @@ impl DiscoveryClient {
 
         info!("🔍 Discovering {} markets...", config.league_code);
 
-        let market_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+        let all_market_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+
+        // Filter market types if filter is specified
+        let market_types: Vec<_> = all_market_types.iter()
+            .filter(|mt| market_type_filter.map_or(true, |f| f == **mt))
+            .copied()
+            .collect();
 
         // Parallel discovery across market types
         let type_futures: Vec<_> = market_types.iter()
