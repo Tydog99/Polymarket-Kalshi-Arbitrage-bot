@@ -1281,8 +1281,22 @@ fn split_team_codes(teams: &str) -> (String, String) {
     match len {
         4 => (teams[..2].to_uppercase(), teams[2..].to_uppercase()),
         5 => {
-            // Prefer 2+3 (common for OM+ASM, OL+PSG)
-            (teams[..2].to_uppercase(), teams[2..].to_uppercase())
+            // Could be 2+3 (SJ+FLA, OM+ASM) or 3+2 (CAR+NJ, ANA+LA)
+            let first_two = teams[..2].to_uppercase();
+            let last_two = teams[3..].to_uppercase();
+
+            // Check prefix first - if first 2 chars are a known code, use 2+3
+            // (handles SJFLA = SJ+FLA where both SJ and LA are valid codes)
+            if is_likely_two_letter_code(&first_two) {
+                (first_two, teams[2..].to_uppercase())
+            } else if is_known_two_letter_suffix(&last_two) {
+                // Otherwise check if last 2 chars are a known suffix (3+2 pattern)
+                // (handles CARNJ = CAR+NJ, ANALA = ANA+LA)
+                (teams[..3].to_uppercase(), last_two)
+            } else {
+                // Default to 3+2 for unknown patterns (most sports use 3-letter codes)
+                (teams[..3].to_uppercase(), teams[3..].to_uppercase())
+            }
         }
         6 => {
             // Check if it looks like 2+4 pattern (e.g., OHFRES = OH+FRES)
@@ -1320,8 +1334,20 @@ fn is_likely_two_letter_code(code: &str) -> bool {
         // and mis-splitting breaks slug construction ("LACTOR" should be "LAC"+"TOR", not "LA"+"CTOR").
         // Only include codes we've seen appear as true 2-letter prefixes in Kalshi tickers.
         "OH" |
+        // NHL 2-letter codes (can appear as first team, e.g., SJFLA = SJ+FLA)
+        "SJ" | "TB" | "NJ" | "LA" |
         // Generic short codes
         "BC" | "SC" | "AC" | "AS" | "US"
+    )
+}
+
+/// Check if a code is a known 2-letter team code that appears at END of combined strings
+/// These are codes like NJ, LA, TB, SJ that Kalshi uses for NHL teams
+fn is_known_two_letter_suffix(code: &str) -> bool {
+    matches!(
+        code,
+        // NHL 2-letter codes (appear as second team in tickers like CARNJ, ANALA)
+        "NJ" | "LA" | "TB" | "SJ"
     )
 }
 
