@@ -224,7 +224,11 @@ impl ExecutionEngine {
         }
 
         // Circuit breaker check
-        if let Err(_reason) = self.circuit_breaker.can_execute(&pair.pair_id, max_contracts).await {
+        if let Err(reason) = self.circuit_breaker.can_execute(&pair.pair_id, max_contracts).await {
+            warn!(
+                "[EXEC] ⛔ Circuit breaker blocked: {} | market={} | pair={} | contracts={}",
+                reason, pair.description, pair.pair_id, max_contracts
+            );
             self.release_in_flight(market_id);
             return Ok(ExecutionResult {
                 market_id,
