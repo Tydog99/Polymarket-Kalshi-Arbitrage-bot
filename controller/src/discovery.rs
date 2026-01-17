@@ -12,18 +12,20 @@ use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::cache::TeamCache;
+use crate::config;
 use crate::config::{LeagueConfig, get_league_configs, get_league_config};
 use crate::kalshi::KalshiApiClient;
 use crate::polymarket::GammaClient;
 use crate::types::{MarketPair, MarketType, DiscoveryResult, KalshiMarket, KalshiEvent};
 
 /// Max concurrent Gamma API requests
-const GAMMA_CONCURRENCY: usize = 20;
+const GAMMA_CONCURRENCY: usize = 5;
 
 /// Kalshi rate limit: 2 requests per second (very conservative - they rate limit aggressively)
 /// Must be conservative because discovery runs many leagues/series in parallel
@@ -47,6 +49,8 @@ struct GammaLookupTask {
     market_type: MarketType,
     league: String,
     kalshi_web_slug: String,
+    debug_idx: usize,
+    debug_series: String,
 }
 
 /// Type alias for Kalshi rate limiter
@@ -144,13 +148,13 @@ impl DiscoveryClient {
     /// 2. If cache exists and is fresh (<2 hours), use it directly
     /// 3. If cache exists but is stale, load it + fetch incremental updates
     /// 4. If no cache, do full discovery
-    pub async fn discover_all(&self, leagues: &[&str]) -> DiscoveryResult {
+    pub async fn discover_all(&self, leagues: &[&str], market_type_filter: Option<MarketType>) -> DiscoveryResult {
         // Try to load existing cache
         let cached = Self::load_cache().await;
 
         match cached {
-            Some(cache) if !cache.is_expired() => {
-                // Cache is fresh - filter by enabled leagues and return
+            Some(cache) if !cache.is_expired() && market_type_filter.is_none() => {
+                // Cache is fresh and no filter - use it directly
                 let age = cache.age_secs();
                 let pairs = filter_pairs_by_leagues(cache.pairs, leagues);
                 info!("📂 Loaded {} pairs from cache (age: {}s){}",
@@ -162,21 +166,26 @@ impl DiscoveryClient {
                     poly_matches: 0,
                     poly_misses: 0,
                     errors: vec![],
+                    stats: Default::default(),  // No stats for cached results
                 };
             }
-            Some(cache) => {
+            Some(cache) if market_type_filter.is_none() => {
                 // Cache is stale - do incremental discovery
                 info!("📂 Cache expired (age: {}s), doing incremental refresh...", cache.age_secs());
-                return self.discover_incremental(leagues, cache).await;
+                return self.discover_incremental(leagues, cache, market_type_filter).await;
             }
-            None => {
-                // No cache - do full discovery
-                info!("📂 No cache found, doing full discovery...");
+            _ => {
+                // No cache or market type filter specified - do full discovery
+                if market_type_filter.is_some() {
+                    info!("📂 Market type filter active, doing fresh discovery...");
+                } else {
+                    info!("📂 No cache found, doing full discovery...");
+                }
             }
         }
 
         // Full discovery (no cache)
-        let result = self.discover_full(leagues).await;
+        let result = self.discover_full(leagues, market_type_filter).await;
 
         // Save to cache
         if !result.pairs.is_empty() {
@@ -192,9 +201,9 @@ impl DiscoveryClient {
     }
 
     /// Force full discovery (ignores cache)
-    pub async fn discover_all_force(&self, leagues: &[&str]) -> DiscoveryResult {
+    pub async fn discover_all_force(&self, leagues: &[&str], market_type_filter: Option<MarketType>) -> DiscoveryResult {
         info!("🔄 Forced full discovery (ignoring cache)...");
-        let result = self.discover_full(leagues).await;
+        let result = self.discover_full(leagues, market_type_filter).await;
 
         // Save to cache
         if !result.pairs.is_empty() {
@@ -210,7 +219,7 @@ impl DiscoveryClient {
     }
 
     /// Full discovery without cache
-    async fn discover_full(&self, leagues: &[&str]) -> DiscoveryResult {
+    async fn discover_full(&self, leagues: &[&str], market_type_filter: Option<MarketType>) -> DiscoveryResult {
         let configs: Vec<_> = if leagues.is_empty() {
             get_league_configs()
         } else {
@@ -221,7 +230,7 @@ impl DiscoveryClient {
 
         // Parallel discovery across all leagues
         let league_futures: Vec<_> = configs.iter()
-            .map(|config| self.discover_league(config, None))
+            .map(|config| self.discover_league(config, None, market_type_filter))
             .collect();
 
         let league_results = futures_util::future::join_all(league_futures).await;
@@ -232,6 +241,7 @@ impl DiscoveryClient {
             result.pairs.extend(league_result.pairs);
             result.poly_matches += league_result.poly_matches;
             result.errors.extend(league_result.errors);
+            result.stats.merge(league_result.stats);
         }
         result.kalshi_events_found = result.pairs.len();
 
@@ -239,7 +249,7 @@ impl DiscoveryClient {
     }
 
     /// Incremental discovery - merge cached pairs with newly discovered ones
-    async fn discover_incremental(&self, leagues: &[&str], cache: DiscoveryCache) -> DiscoveryResult {
+    async fn discover_incremental(&self, leagues: &[&str], cache: DiscoveryCache, market_type_filter: Option<MarketType>) -> DiscoveryResult {
         let configs: Vec<_> = if leagues.is_empty() {
             get_league_configs()
         } else {
@@ -250,7 +260,7 @@ impl DiscoveryClient {
 
         // Discover with filter for known tickers
         let league_futures: Vec<_> = configs.iter()
-            .map(|config| self.discover_league(config, Some(&cache)))
+            .map(|config| self.discover_league(config, Some(&cache), market_type_filter))
             .collect();
 
         let league_results = futures_util::future::join_all(league_futures).await;
@@ -258,6 +268,7 @@ impl DiscoveryClient {
         // Merge cached pairs with newly discovered ones
         let mut all_pairs = cache.pairs;
         let mut new_count = 0;
+        let mut stats = crate::types::DiscoveryStats::default();
 
         for league_result in league_results {
             for pair in league_result.pairs {
@@ -266,6 +277,7 @@ impl DiscoveryClient {
                     new_count += 1;
                 }
             }
+            stats.merge(league_result.stats);
         }
 
         if new_count > 0 {
@@ -292,12 +304,14 @@ impl DiscoveryClient {
             poly_matches: new_count,
             poly_misses: 0,
             errors: vec![],
+            stats,
         }
     }
-    
+
     /// Discover all market types for a single league (PARALLEL)
     /// If cache is provided, only discovers markets not already in cache
-    async fn discover_league(&self, config: &LeagueConfig, cache: Option<&DiscoveryCache>) -> DiscoveryResult {
+    /// If market_type_filter is provided, only discovers that market type
+    async fn discover_league(&self, config: &LeagueConfig, cache: Option<&DiscoveryCache>, market_type_filter: Option<MarketType>) -> DiscoveryResult {
         // Use esports discovery for leagues with poly_series_id
         if config.poly_series_id.is_some() {
             return self.discover_esports_league(config).await;
@@ -305,7 +319,13 @@ impl DiscoveryClient {
 
         info!("🔍 Discovering {} markets...", config.league_code);
 
-        let market_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+        let all_market_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+
+        // Filter market types if filter is specified
+        let market_types: Vec<_> = all_market_types.iter()
+            .filter(|mt| market_type_filter.map_or(true, |f| f == **mt))
+            .copied()
+            .collect();
 
         // Parallel discovery across market types
         let type_futures: Vec<_> = market_types.iter()
@@ -320,12 +340,14 @@ impl DiscoveryClient {
         let mut result = DiscoveryResult::default();
         for (pairs_result, market_type) in type_results.into_iter().zip(market_types.iter()) {
             match pairs_result {
-                Ok(pairs) => {
-                    let count = pairs.len();
-                    if count > 0 {
-                        info!("  ✅ {} {}: {} pairs", config.league_code, market_type, count);
+                Ok((pairs, kalshi_count)) => {
+                    let matched_count = pairs.len();
+                    if matched_count > 0 {
+                        info!("  ✅ {} {}: {} pairs", config.league_code, market_type, matched_count);
                     }
-                    result.poly_matches += count;
+                    // Record stats for this league + market type
+                    result.stats.record(config.league_code, *market_type, kalshi_count, matched_count);
+                    result.poly_matches += matched_count;
                     result.pairs.extend(pairs);
                 }
                 Err(e) => {
@@ -348,13 +370,17 @@ impl DiscoveryClient {
     
     /// Discover markets for a specific series (PARALLEL Kalshi + Gamma lookups)
     /// If cache is provided, skips markets already in cache
+    /// Returns (matched_pairs, kalshi_market_count)
     async fn discover_series(
         &self,
         config: &LeagueConfig,
         series: &str,
         market_type: MarketType,
         cache: Option<&DiscoveryCache>,
-    ) -> Result<Vec<MarketPair>> {
+    ) -> Result<(Vec<MarketPair>, usize)> {
+        let pairing_debug = config::pairing_debug_enabled();
+        let pairing_debug_limit = config::pairing_debug_limit();
+
         // Fetch Kalshi events
         {
             let _permit = self.kalshi_semaphore.acquire().await.map_err(|e| anyhow::anyhow!("semaphore closed: {}", e))?;
@@ -363,7 +389,7 @@ impl DiscoveryClient {
         let events = self.kalshi.get_events(series, 50).await?;
 
         if events.is_empty() {
-            return Ok(vec![]);
+            return Ok((vec![], 0));
         }
         info!("  📡 {} {}: {} events from Kalshi", config.league_code, market_type, events.len());
 
@@ -385,6 +411,7 @@ impl DiscoveryClient {
                 Some((parsed, event))
             })
             .collect();
+        let parsed_events_len = parsed_events.len();
 
         // Execute market fetches with GLOBAL concurrency limit
         let market_results: Vec<_> = stream::iter(parsed_events)
@@ -428,21 +455,53 @@ impl DiscoveryClient {
             }
         }
 
+        // Capture kalshi count before event_markets is consumed
+        let kalshi_count = event_markets.len() + cached_count;
+
         if event_markets.is_empty() {
             if cached_count > 0 {
                 info!("  ✅ {} {}: {} markets (all cached)", config.league_code, market_type, cached_count);
             }
-            return Ok(vec![]);
+            return Ok((vec![], kalshi_count));
         }
         info!("  🔎 {} {}: looking up {} new markets on Polymarket{}",
               config.league_code, market_type, event_markets.len(),
               if cached_count > 0 { format!(" ({} cached)", cached_count) } else { String::new() });
 
+        if pairing_debug {
+            info!(
+                "🔎 [PAIR] league={} type={:?} series={} kalshi_events={} new_markets={} cached={}",
+                config.league_code,
+                market_type,
+                series,
+                parsed_events_len,
+                event_markets.len(),
+                cached_count
+            );
+        }
+
         // Parallel Gamma lookups with semaphore
         let lookup_futures: Vec<_> = event_markets
             .into_iter()
-            .map(|(parsed, event, market)| {
-                let poly_slug = self.build_poly_slug(config.poly_prefix, &parsed, market_type, &market);
+            .enumerate()
+            .map(|(idx, (parsed, event, market))| {
+                let poly_slug = self.build_poly_slug(config.poly_prefix, &parsed, market_type, &market, config.has_draws());
+
+                if pairing_debug && idx < pairing_debug_limit {
+                    info!(
+                        "🧩 [PAIR] #{}/{} league={} type={:?} event={} market={} parsed=({},{},{}) slug={}",
+                        idx + 1,
+                        pairing_debug_limit,
+                        config.league_code,
+                        market_type,
+                        event.event_ticker,
+                        market.ticker,
+                        parsed.date,
+                        parsed.team1,
+                        parsed.team2,
+                        poly_slug
+                    );
+                }
 
                 GammaLookupTask {
                     event,
@@ -451,15 +510,24 @@ impl DiscoveryClient {
                     market_type,
                     league: config.league_code.to_string(),
                     kalshi_web_slug: config.kalshi_web_slug.to_string(),
+                    debug_idx: idx,
+                    debug_series: series.to_string(),
                 }
             })
             .collect();
-        
+
+        // Track stats with atomic counters for the async closure
+        let total_tasks = lookup_futures.len();
+        let miss_slug_not_found = Arc::new(AtomicUsize::new(0));
+        let miss_api_error = Arc::new(AtomicUsize::new(0));
+
         // Execute lookups in parallel
         let pairs: Vec<MarketPair> = stream::iter(lookup_futures)
             .map(|task| {
                 let gamma = self.gamma.clone();
                 let semaphore = self.gamma_semaphore.clone();
+                let miss_slug_not_found = miss_slug_not_found.clone();
+                let miss_api_error = miss_api_error.clone();
                 async move {
                     let _permit = semaphore.acquire().await.ok()?;
                     match gamma.lookup_market(&task.poly_slug).await {
@@ -480,25 +548,54 @@ impl DiscoveryClient {
 
                                 if outcome0_matches && !outcome1_matches {
                                     // token1 is YES for this team
-                                    debug!("  🎯 {} | outcomes={:?} | suffix={} matches outcome[0] → token1=YES",
-                                           task.poly_slug, outcomes, suffix);
+                                    if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                                        info!(
+                                            "✅ [PAIR] league={} type={:?} series={} slug={} suffix={} → token1=YES outcomes={:?}",
+                                            task.league, task.market_type, task.debug_series, task.poly_slug, suffix, outcomes
+                                        );
+                                    }
                                     (token1, token2)
                                 } else if outcome1_matches && !outcome0_matches {
                                     // token2 is YES for this team
-                                    debug!("  🎯 {} | outcomes={:?} | suffix={} matches outcome[1] → token2=YES",
-                                           task.poly_slug, outcomes, suffix);
+                                    if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                                        info!(
+                                            "✅ [PAIR] league={} type={:?} series={} slug={} suffix={} → token2=YES outcomes={:?}",
+                                            task.league, task.market_type, task.debug_series, task.poly_slug, suffix, outcomes
+                                        );
+                                    }
                                     (token2, token1)
                                 } else {
                                     // Ambiguous or no match - fall back to API order with warning
-                                    warn!("  ⚠️ {} | outcomes={:?} | suffix={} - ambiguous match, using API order",
-                                          task.poly_slug, outcomes, suffix);
+                                    if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                                        warn!(
+                                            "⚠️ [PAIR] league={} type={:?} series={} slug={} suffix={} ambiguous outcomes={:?} → using API order",
+                                            task.league, task.market_type, task.debug_series, task.poly_slug, suffix, outcomes
+                                        );
+                                    }
                                     (token1, token2)
                                 }
                             } else {
                                 // No team suffix (shouldn't happen for moneyline), use API order
-                                warn!("  ⚠️ {} | no team_suffix extracted, using API order", task.poly_slug);
+                                if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                                    warn!(
+                                        "⚠️ [PAIR] league={} type={:?} series={} slug={} no team_suffix → using API order outcomes={:?}",
+                                        task.league, task.market_type, task.debug_series, task.poly_slug, outcomes
+                                    );
+                                }
                                 (token1, token2)
                             };
+
+                            if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                                info!(
+                                    "🎯 [PAIR] MATCH league={} type={:?} kalshi_market={} poly_slug={} yes_token={} no_token={}",
+                                    task.league,
+                                    task.market_type,
+                                    task.market.ticker,
+                                    task.poly_slug,
+                                    yes_token,
+                                    no_token
+                                );
+                            }
 
                             Some(MarketPair {
                                 pair_id: format!("{}-{}", task.poly_slug, task.market.ticker).into(),
@@ -515,8 +612,18 @@ impl DiscoveryClient {
                                 team_suffix: team_suffix.map(|s| s.into()),
                             })
                         }
-                        Ok(None) => None,
+                        Ok(None) => {
+                            miss_slug_not_found.fetch_add(1, Ordering::Relaxed);
+                            if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                                info!(
+                                    "❌ [PAIR] NO_MATCH league={} type={:?} series={} kalshi_market={} poly_slug={}",
+                                    task.league, task.market_type, task.debug_series, task.market.ticker, task.poly_slug
+                                );
+                            }
+                            None
+                        }
                         Err(e) => {
+                            miss_api_error.fetch_add(1, Ordering::Relaxed);
                             warn!("  ⚠️ Gamma lookup failed for {}: {}", task.poly_slug, e);
                             None
                         }
@@ -528,20 +635,49 @@ impl DiscoveryClient {
             .collect()
             .await;
 
-        if !pairs.is_empty() {
+        // Log summary stats when pairing_debug is enabled
+        let matched = pairs.len();
+        let slug_misses = miss_slug_not_found.load(Ordering::Relaxed);
+        let api_errors = miss_api_error.load(Ordering::Relaxed);
+
+        if pairing_debug && total_tasks > 0 {
+            let match_rate = (matched as f64 / total_tasks as f64 * 100.0).round() as u32;
+            let mut reasons = Vec::new();
+            if slug_misses > 0 {
+                reasons.push(format!("poly_no_market={}", slug_misses));
+            }
+            if api_errors > 0 {
+                reasons.push(format!("api_error={}", api_errors));
+            }
+            let reasons_str = if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", reasons.join(", "))
+            };
+            info!(
+                "📊 [PAIR] SUMMARY league={} type={:?} total={} matched={} ({}%) misses={}{}",
+                config.league_code, market_type, total_tasks, matched, match_rate,
+                total_tasks - matched, reasons_str
+            );
+        } else if !pairs.is_empty() {
             info!("  ✅ {} {}: matched {} pairs", config.league_code, market_type, pairs.len());
         }
 
-        Ok(pairs)
+        Ok((pairs, kalshi_count))
     }
     
     /// Build Polymarket slug from Kalshi event data
+    ///
+    /// `has_draws` indicates whether the league has draw outcomes (soccer).
+    /// - For leagues with draws: Moneyline uses team-specific slugs (e.g., `epl-cfc-avl-2025-12-27-cfc`)
+    /// - For leagues without draws (NBA, NFL, etc.): Moneyline uses base slug (e.g., `nba-was-sac-2026-01-16`)
     fn build_poly_slug(
         &self,
         poly_prefix: &str,
         parsed: &ParsedKalshiTicker,
         market_type: MarketType,
         market: &KalshiMarket,
+        has_draws: bool,
     ) -> String {
         // Convert Kalshi team codes to Polymarket codes using cache
         let poly_team1 = self.team_cache
@@ -561,23 +697,44 @@ impl DiscoveryClient {
             MarketType::Moneyline => {
                 if let Some(suffix) = extract_team_suffix(&market.ticker) {
                     if suffix.to_lowercase() == "tie" {
+                        // Draw market - append -draw suffix
                         format!("{}-draw", base)
-                    } else {
+                    } else if has_draws {
+                        // Soccer: uses team-specific slugs for each outcome
                         let poly_suffix = self.team_cache
                             .kalshi_to_poly(poly_prefix, &suffix)
                             .unwrap_or_else(|| suffix.to_lowercase());
                         format!("{}-{}", base, poly_suffix)
+                    } else {
+                        // American sports: single market with base slug
+                        // Polymarket uses one market with YES/NO tokens for each team
+                        base.clone()
                     }
                 } else {
                     base
                 }
             }
             MarketType::Spread => {
+                // Polymarket uses "spread-home-{value}" when home team is favored,
+                // "spread-away-{value}" when away team is favored.
+                // Determine which by checking if the market suffix matches team1 (away) or team2 (home).
+                let spread_type = if let Some(suffix) = extract_team_suffix(&market.ticker) {
+                    // Extract team code from suffix (e.g., "DEN12" -> "DEN")
+                    let team_code: String = suffix.chars().take_while(|c| c.is_alphabetic()).collect();
+                    if team_code.eq_ignore_ascii_case(&parsed.team1) {
+                        "spread-away" // suffix matches away team
+                    } else {
+                        "spread-home" // suffix matches home team (default)
+                    }
+                } else {
+                    "spread-home"
+                };
+
                 if let Some(floor) = market.floor_strike {
                     let floor_str = format!("{:.1}", floor).replace(".", "pt");
-                    format!("{}-spread-{}", base, floor_str)
+                    format!("{}-{}-{}", base, spread_type, floor_str)
                 } else {
-                    format!("{}-spread", base)
+                    format!("{}-{}", base, spread_type)
                 }
             }
             MarketType::Total => {
@@ -694,9 +851,14 @@ impl DiscoveryClient {
 
     /// Try to match a single Kalshi market to Polymarket
     async fn try_match_market(&self, config: &LeagueConfig, market: &KalshiMarket) -> Option<MarketPair> {
+        let pairing_debug = config::pairing_debug_enabled();
+
         // Extract event ticker from market ticker (format: SERIES-EVENTID-SUFFIX)
         let parts: Vec<&str> = market.ticker.split('-').collect();
         if parts.len() < 2 {
+            if pairing_debug {
+                info!("❌ [PAIR] cannot split market ticker: {}", market.ticker);
+            }
             return None;
         }
 
@@ -715,16 +877,48 @@ impl DiscoveryClient {
         };
 
         // Parse event ticker to get teams and date
-        let parsed = parse_kalshi_event_ticker(&event_ticker)?;
+        let parsed = match parse_kalshi_event_ticker(&event_ticker) {
+            Some(p) => p,
+            None => {
+                if pairing_debug {
+                    info!(
+                        "❌ [PAIR] cannot parse event_ticker={} (market={})",
+                        event_ticker, market.ticker
+                    );
+                }
+                return None;
+            }
+        };
 
         // Build poly slug
-        let poly_slug = self.build_poly_slug(config.poly_prefix, &parsed, market_type, market);
+        let poly_slug = self.build_poly_slug(config.poly_prefix, &parsed, market_type, market, config.has_draws());
+        if pairing_debug {
+            info!(
+                "🧩 [PAIR] league={} type={:?} event={} market={} parsed=({},{},{}) slug={}",
+                config.league_code,
+                market_type,
+                event_ticker,
+                market.ticker,
+                parsed.date,
+                parsed.team1,
+                parsed.team2,
+                poly_slug
+            );
+        }
 
         // Look up on Polymarket
         let _permit = self.gamma_semaphore.acquire().await.ok()?;
         let (token1, token2, outcomes) = match self.gamma.lookup_market(&poly_slug).await {
             Ok(Some(result)) => result,
-            Ok(None) => return None,
+            Ok(None) => {
+                if pairing_debug {
+                    info!(
+                        "❌ [PAIR] NO_MATCH league={} type={:?} market={} poly_slug={}",
+                        config.league_code, market_type, market.ticker, poly_slug
+                    );
+                }
+                return None;
+            }
             Err(e) => {
                 tracing::warn!("  ⚠️ Gamma lookup failed for {}: {}", poly_slug, e);
                 return None;
@@ -744,22 +938,62 @@ impl DiscoveryClient {
                 .unwrap_or(false);
 
             if outcome0_matches && !outcome1_matches {
-                debug!("  🎯 {} | outcomes={:?} | suffix={} matches outcome[0] → token1=YES",
-                       poly_slug, outcomes, suffix);
+                if pairing_debug {
+                    info!(
+                        "✅ [PAIR] slug={} suffix={} → token1=YES outcomes={:?}",
+                        poly_slug, suffix, outcomes
+                    );
+                } else {
+                    debug!("  🎯 {} | outcomes={:?} | suffix={} matches outcome[0] → token1=YES",
+                           poly_slug, outcomes, suffix);
+                }
                 (token1, token2)
             } else if outcome1_matches && !outcome0_matches {
-                debug!("  🎯 {} | outcomes={:?} | suffix={} matches outcome[1] → token2=YES",
-                       poly_slug, outcomes, suffix);
+                if pairing_debug {
+                    info!(
+                        "✅ [PAIR] slug={} suffix={} → token2=YES outcomes={:?}",
+                        poly_slug, suffix, outcomes
+                    );
+                } else {
+                    debug!("  🎯 {} | outcomes={:?} | suffix={} matches outcome[1] → token2=YES",
+                           poly_slug, outcomes, suffix);
+                }
                 (token2, token1)
             } else {
-                warn!("  ⚠️ {} | outcomes={:?} | suffix={} - ambiguous match, using API order",
-                      poly_slug, outcomes, suffix);
+                if pairing_debug {
+                    warn!(
+                        "⚠️ [PAIR] slug={} suffix={} ambiguous outcomes={:?} → using API order",
+                        poly_slug, suffix, outcomes
+                    );
+                } else {
+                    warn!("  ⚠️ {} | outcomes={:?} | suffix={} - ambiguous match, using API order",
+                          poly_slug, outcomes, suffix);
+                }
                 (token1, token2)
             }
         } else {
-            warn!("  ⚠️ {} | no team_suffix extracted, using API order", poly_slug);
+            if pairing_debug {
+                warn!(
+                    "⚠️ [PAIR] slug={} no team_suffix → using API order outcomes={:?}",
+                    poly_slug, outcomes
+                );
+            } else {
+                warn!("  ⚠️ {} | no team_suffix extracted, using API order", poly_slug);
+            }
             (token1, token2)
         };
+
+        if pairing_debug {
+            info!(
+                "🎯 [PAIR] MATCH league={} type={:?} kalshi_market={} poly_slug={} yes_token={} no_token={}",
+                config.league_code,
+                market_type,
+                market.ticker,
+                poly_slug,
+                yes_token,
+                no_token
+            );
+        }
 
         Some(MarketPair {
             pair_id: format!("{}-{}", poly_slug, market.ticker).into(),
@@ -783,6 +1017,7 @@ impl DiscoveryClient {
             Some(id) => id,
             None => return DiscoveryResult::default(),
         };
+        let pairing_debug = config::pairing_debug_enabled();
 
         info!("🎮 Discovering {} esports markets (series_id={})...", config.league_code, series_id);
 
@@ -860,9 +1095,11 @@ impl DiscoveryClient {
                                                     (ids[0].clone(), ids[1].clone(), outcome0_norm.clone())
                                                 };
 
-                                            info!("  🔍 {} | outcomes={:?} | o0_t1={} o1_t1={} o0_t2={} o1_t2={} | team1_tok_owner={} | title={}/{}",
-                                                  slug, outcomes, outcome0_matches_team1, outcome1_matches_team1,
-                                                  outcome0_matches_team2, outcome1_matches_team2, poly_team1_norm, team1, team2);
+                                            if pairing_debug {
+                                                info!("  🔍 {} | outcomes={:?} | o0_t1={} o1_t1={} o0_t2={} o1_t2={} | team1_tok_owner={} | title={}/{}",
+                                                      slug, outcomes, outcome0_matches_team1, outcome1_matches_team1,
+                                                      outcome0_matches_team2, outcome1_matches_team2, poly_team1_norm, team1, team2);
+                                            }
 
                                             // Store with both key orderings
                                             let key1 = format!("{}:{}:{}", date, norm1, norm2);
@@ -948,9 +1185,6 @@ impl DiscoveryClient {
                                 (no_token.clone(), yes_token.clone())
                             };
 
-                            info!("  🎯 {} | kalshi_team={} | poly_team1={} | match={} | swapped={}",
-                                  market.ticker, kalshi_team_norm, poly_team1, is_match, swapped);
-
                             pairs.push(MarketPair {
                                 pair_id: format!("{}-{}", slug, market.ticker).into(),
                                 league: config.league_code.into(),
@@ -975,12 +1209,17 @@ impl DiscoveryClient {
             info!("  ✅ {} {}: matched {} pairs", config.league_code, "esports", pairs.len());
         }
 
+        // Record stats for esports (moneyline only)
+        let mut stats = crate::types::DiscoveryStats::default();
+        stats.record(config.league_code, MarketType::Moneyline, kalshi_events.len(), pairs.len());
+
         DiscoveryResult {
             pairs,
             kalshi_events_found: kalshi_events.len(),
             poly_matches: poly_lookup.len() / 2,
             poly_misses: 0,
             errors: vec![],
+            stats,
         }
     }
 }
@@ -1058,8 +1297,22 @@ fn split_team_codes(teams: &str) -> (String, String) {
     match len {
         4 => (teams[..2].to_uppercase(), teams[2..].to_uppercase()),
         5 => {
-            // Prefer 2+3 (common for OM+ASM, OL+PSG)
-            (teams[..2].to_uppercase(), teams[2..].to_uppercase())
+            // Could be 2+3 (SJ+FLA, OM+ASM) or 3+2 (CAR+NJ, ANA+LA)
+            let first_two = teams[..2].to_uppercase();
+            let last_two = teams[3..].to_uppercase();
+
+            // Check prefix first - if first 2 chars are a known code, use 2+3
+            // (handles SJFLA = SJ+FLA where both SJ and LA are valid codes)
+            if is_likely_two_letter_code(&first_two) {
+                (first_two, teams[2..].to_uppercase())
+            } else if is_known_two_letter_suffix(&last_two) {
+                // Otherwise check if last 2 chars are a known suffix (3+2 pattern)
+                // (handles CARNJ = CAR+NJ, ANALA = ANA+LA)
+                (teams[..3].to_uppercase(), last_two)
+            } else {
+                // Default to 3+2 for unknown patterns (most sports use 3-letter codes)
+                (teams[..3].to_uppercase(), teams[3..].to_uppercase())
+            }
         }
         6 => {
             // Check if it looks like 2+4 pattern (e.g., OHFRES = OH+FRES)
@@ -1093,10 +1346,26 @@ fn is_likely_two_letter_code(code: &str) -> bool {
         code,
         // European football (Ligue 1, etc.)
         "OM" | "OL" | "FC" |
-        // US sports common abbreviations
-        "OH" | "SF" | "LA" | "NY" | "KC" | "TB" | "GB" | "NE" | "NO" | "LV" |
+        // Keep this list conservative: 2-letter codes are ambiguous in many leagues (e.g., NBA/NFL),
+        // and mis-splitting breaks slug construction ("LACTOR" should be "LAC"+"TOR", not "LA"+"CTOR").
+        // Only include codes we've seen appear as true 2-letter prefixes in Kalshi tickers.
+        "OH" |
+        // NHL 2-letter codes (can appear as first team, e.g., SJFLA = SJ+FLA)
+        "SJ" | "TB" | "NJ" | "LA" |
+        // NFL 2-letter codes (e.g., SFSEA = SF+SEA)
+        "SF" |
         // Generic short codes
         "BC" | "SC" | "AC" | "AS" | "US"
+    )
+}
+
+/// Check if a code is a known 2-letter team code that appears at END of combined strings
+/// These are codes like NJ, LA, TB, SJ that Kalshi uses for NHL teams
+fn is_known_two_letter_suffix(code: &str) -> bool {
+    matches!(
+        code,
+        // NHL 2-letter codes (appear as second team in tickers like CARNJ, ANALA)
+        "NJ" | "LA" | "TB" | "SJ"
     )
 }
 
@@ -1684,6 +1953,44 @@ mod tests {
         assert_eq!(t2, "9INE");
     }
 
+    #[test]
+    fn test_filter_pairs_by_leagues_nba() {
+        let pairs = vec![
+            MarketPair {
+                pair_id: "p1".into(),
+                league: "nba".into(),
+                market_type: MarketType::Moneyline,
+                description: "NBA".into(),
+                kalshi_event_ticker: "KXNBA-1".into(),
+                kalshi_market_ticker: "KXNBA-1-A".into(),
+                kalshi_event_slug: "nba-game".into(),
+                poly_slug: "nba-market".into(),
+                poly_yes_token: "yes".into(),
+                poly_no_token: "no".into(),
+                line_value: None,
+                team_suffix: None,
+            },
+            MarketPair {
+                pair_id: "p2".into(),
+                league: "epl".into(),
+                market_type: MarketType::Moneyline,
+                description: "EPL".into(),
+                kalshi_event_ticker: "KXEPL-1".into(),
+                kalshi_market_ticker: "KXEPL-1-A".into(),
+                kalshi_event_slug: "premier-league-game".into(),
+                poly_slug: "epl-market".into(),
+                poly_yes_token: "yes".into(),
+                poly_no_token: "no".into(),
+                line_value: None,
+                team_suffix: None,
+            },
+        ];
+
+        let filtered = filter_pairs_by_leagues(pairs, &["nba"]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(&*filtered[0].league, "nba");
+    }
+
     /// Helper to simulate the token mapping logic from discovery
     /// Returns (team1_token, team2_token, poly_team1_norm)
     fn map_tokens_to_teams(
@@ -2151,5 +2458,70 @@ mod tests {
                    "los-ratones should match");
         assert_eq!(lookup_team_canonical("los ratones"), Some("los-ratones"),
                    "los ratones (spaces) should match los-ratones");
+    }
+
+    #[test]
+    fn test_market_type_filter_none_includes_all() {
+        // When filter is None, all market types should be included
+        let all_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+        let filter: Option<MarketType> = None;
+
+        let filtered: Vec<_> = all_types.iter()
+            .filter(|mt| filter.map_or(true, |f| f == **mt))
+            .copied()
+            .collect();
+
+        assert_eq!(filtered.len(), 4);
+        assert!(filtered.contains(&MarketType::Moneyline));
+        assert!(filtered.contains(&MarketType::Spread));
+        assert!(filtered.contains(&MarketType::Total));
+        assert!(filtered.contains(&MarketType::Btts));
+    }
+
+    #[test]
+    fn test_market_type_filter_moneyline_only() {
+        // When filter is Moneyline, only Moneyline should be included
+        let all_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+        let filter = Some(MarketType::Moneyline);
+
+        let filtered: Vec<_> = all_types.iter()
+            .filter(|mt| filter.map_or(true, |f| f == **mt))
+            .copied()
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered.contains(&MarketType::Moneyline));
+        assert!(!filtered.contains(&MarketType::Spread));
+    }
+
+    #[test]
+    fn test_market_type_filter_spread_only() {
+        // When filter is Spread, only Spread should be included
+        let all_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+        let filter = Some(MarketType::Spread);
+
+        let filtered: Vec<_> = all_types.iter()
+            .filter(|mt| filter.map_or(true, |f| f == **mt))
+            .copied()
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered.contains(&MarketType::Spread));
+        assert!(!filtered.contains(&MarketType::Moneyline));
+    }
+
+    #[test]
+    fn test_market_type_filter_total_only() {
+        // When filter is Total, only Total should be included
+        let all_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+        let filter = Some(MarketType::Total);
+
+        let filtered: Vec<_> = all_types.iter()
+            .filter(|mt| filter.map_or(true, |f| f == **mt))
+            .copied()
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered.contains(&MarketType::Total));
     }
 }

@@ -21,6 +21,11 @@ pub struct TeamCache {
     reverse: HashMap<Box<str>, Box<str>>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyTeamCacheFile {
+    mappings: HashMap<String, String>,
+}
+
 fn serialize_boxed_map<S>(map: &HashMap<Box<str>, Box<str>>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -56,10 +61,36 @@ impl TeamCache {
     pub fn load_from<P: AsRef<Path>>(path: P) -> Self {
         let mut cache = match std::fs::read_to_string(path.as_ref()) {
             Ok(contents) => {
-                serde_json::from_str(&contents).unwrap_or_else(|e| {
-                    tracing::warn!("Failed to parse team cache: {}", e);
-                    Self::default()
-                })
+                match serde_json::from_str::<TeamCache>(&contents) {
+                    Ok(cache) => cache,
+                    Err(e_new) => {
+                        // Backwards compatibility: older cache format stored mappings under a top-level `mappings` key.
+                        match serde_json::from_str::<LegacyTeamCacheFile>(&contents) {
+                            Ok(legacy) => {
+                                tracing::info!(
+                                    "Loaded legacy team cache format ({} mappings); will re-save in new format on next write",
+                                    legacy.mappings.len()
+                                );
+                                TeamCache {
+                                    forward: legacy
+                                        .mappings
+                                        .into_iter()
+                                        .map(|(k, v)| (k.into_boxed_str(), v.into_boxed_str()))
+                                        .collect(),
+                                    reverse: HashMap::new(),
+                                }
+                            }
+                            Err(e_legacy) => {
+                                tracing::warn!(
+                                    "Failed to parse team cache (new format: {}; legacy format: {})",
+                                    e_new,
+                                    e_legacy
+                                );
+                                Self::default()
+                            }
+                        }
+                    }
+                }
             }
             Err(_) => {
                 tracing::info!("No team cache found at {:?}, starting empty", path.as_ref());
@@ -154,5 +185,31 @@ mod tests {
         assert_eq!(cache.poly_to_kalshi("epl", "che"), Some("cfc".to_string()));
         assert_eq!(cache.poly_to_kalshi("epl", "CHE"), Some("cfc".to_string()));
         assert_eq!(cache.kalshi_to_poly("epl", "cfc"), Some("che".to_string()));
+    }
+
+    #[test]
+    fn test_load_legacy_cache_format() {
+        let legacy = r#"
+        {
+          "mappings": {
+            "nba:lal": "lal",
+            "nba:nyk": "nyk"
+          }
+        }
+        "#;
+
+        let parsed: LegacyTeamCacheFile = serde_json::from_str(legacy).expect("legacy parses");
+        let mut cache = TeamCache {
+            forward: parsed
+                .mappings
+                .into_iter()
+                .map(|(k, v)| (k.into_boxed_str(), v.into_boxed_str()))
+                .collect(),
+            reverse: HashMap::new(),
+        };
+        cache.rebuild_reverse();
+
+        assert_eq!(cache.poly_to_kalshi("nba", "lal"), Some("lal".to_string()));
+        assert_eq!(cache.kalshi_to_poly("nba", "lal"), Some("lal".to_string()));
     }
 }

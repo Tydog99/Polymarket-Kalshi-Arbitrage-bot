@@ -86,6 +86,31 @@ pub fn enabled_leagues() -> &'static [String] {
     })
 }
 
+/// Enable verbose pairing/matching debug logs (emoji-tagged).
+///
+/// This is intentionally an `info!`-level debug mode so it can be enabled without changing `RUST_LOG`.
+/// - Set `PAIRING_DEBUG=1` to enable.
+pub fn pairing_debug_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("PAIRING_DEBUG")
+            .map(|v| v == "1" || v.to_lowercase() == "true" || v.to_lowercase() == "yes")
+            .unwrap_or(false)
+    })
+}
+
+/// Maximum per-league pairing debug lines emitted for individual market attempts.
+/// - Set `PAIRING_DEBUG_LIMIT=<N>` to override.
+pub fn pairing_debug_limit() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("PAIRING_DEBUG_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200)
+    })
+}
+
 /// Which leagues to discover but not trade (monitor only)
 /// Set DISABLED_LEAGUES env var to comma-separated list, e.g., "epl,seriea"
 pub fn disabled_leagues() -> &'static HashSet<String> {
@@ -311,6 +336,20 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
     ]
 }
 
+impl LeagueConfig {
+    /// Returns true if this league has draw outcomes (soccer leagues).
+    /// Draw markets indicate the league uses team-specific slugs for Moneyline.
+    /// American sports (NBA, NFL, etc.) don't have draws and use a single base slug.
+    pub fn has_draws(&self) -> bool {
+        // All soccer leagues have draws (including EFL Championship which doesn't have btts series)
+        // Only American sports (nba, nfl, nhl, mlb, ncaaf) and esports don't have draws
+        !matches!(
+            self.league_code,
+            "nba" | "nfl" | "nhl" | "mlb" | "ncaaf" | "cs2" | "lol" | "cod"
+        )
+    }
+}
+
 /// Get config for a specific league
 pub fn get_league_config(league: &str) -> Option<LeagueConfig> {
     get_league_configs()
@@ -395,6 +434,12 @@ mod tests {
         assert!(platforms.contains(&Platform::Kalshi));
         assert!(platforms.contains(&Platform::Polymarket));
         std::env::remove_var("CONTROLLER_PLATFORMS");
+    }
+
+    #[test]
+    fn test_get_league_config_nba_exists() {
+        let cfg = get_league_config("nba");
+        assert!(cfg.is_some(), "nba league config should exist");
     }
 
     #[test]

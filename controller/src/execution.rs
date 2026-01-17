@@ -159,18 +159,19 @@ impl ExecutionEngine {
 
         // Log detection early so we know what arb was found even if checks fail
         let profit_cents = req.profit_cents();
+        let est_max_contracts = (req.yes_size.min(req.no_size) / 100) as i64;
         info!(
-            "[EXEC] 📡 Detected: {} | {:?} y={}¢ n={}¢ | est_profit={}¢ | size={}¢/{}¢",
+            "[EXEC] 📡 Detected: {} | {:?} y={}¢ n={}¢ | est_profit={}¢ | size={}¢/{}¢ | est_max={}x",
             pair.description, req.arb_type, req.yes_price, req.no_price,
-            profit_cents, req.yes_size, req.no_size
+            profit_cents, req.yes_size, req.no_size, est_max_contracts
         );
 
         // Check if league is disabled (monitor only, no execution)
         if crate::config::is_league_disabled(&pair.league) {
             info!(
-                "[EXEC] 🚫 DISABLED LEAGUE: {} | {:?} y={}¢ n={}¢ | est_profit={}¢ | size={}¢/{}¢ | league={}",
+                "[EXEC] 🚫 DISABLED LEAGUE: {} | {:?} y={}¢ n={}¢ | est_profit={}¢ | size={}¢/{}¢ | est_max={}x | league={}",
                 pair.description, req.arb_type, req.yes_price, req.no_price,
-                profit_cents, req.yes_size, req.no_size, pair.league
+                profit_cents, req.yes_size, req.no_size, est_max_contracts, pair.league
             );
             self.release_in_flight(market_id);
             return Ok(ExecutionResult {

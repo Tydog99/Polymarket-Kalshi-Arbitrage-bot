@@ -102,14 +102,46 @@ impl GammaClient {
     async fn try_lookup_slug(&self, slug: &str) -> Result<Option<(String, String, Vec<String>)>> {
         let url = format!("{}/markets?slug={}", GAMMA_API_BASE, slug);
 
-        let resp = self.http.get(&url).send().await?;
+        // Retry logic for transient failures (Cloudflare throttling, network issues)
+        let mut last_error = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                // Exponential backoff: 100ms, 200ms
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * (1 << (attempt - 1)))).await;
+            }
 
-        if !resp.status().is_success() {
-            return Ok(None);
+            match self.http.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<Vec<GammaMarket>>().await {
+                        Ok(markets) => {
+                            // Success - continue with normal logic below
+                            return self.parse_gamma_market_response(markets);
+                        }
+                        Err(e) => {
+                            last_error = Some(format!("JSON parse error: {}", e));
+                            continue;
+                        }
+                    }
+                }
+                Ok(_resp) => {
+                    // Non-success status, don't retry (likely 404)
+                    return Ok(None);
+                }
+                Err(e) => {
+                    last_error = Some(format!("Request error: {}", e));
+                    continue;
+                }
+            }
         }
 
-        let markets: Vec<GammaMarket> = resp.json().await?;
+        // All retries exhausted
+        if let Some(err) = last_error {
+            tracing::warn!("Gamma lookup failed after 3 attempts for {}: {}", slug, err);
+        }
+        Ok(None)
+    }
 
+    fn parse_gamma_market_response(&self, markets: Vec<GammaMarket>) -> Result<Option<(String, String, Vec<String>)>> {
         if markets.is_empty() {
             return Ok(None);
         }

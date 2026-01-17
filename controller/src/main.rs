@@ -58,12 +58,94 @@ use crate::remote_execution::{HybridExecutor, run_hybrid_execution_loop};
 use crate::remote_protocol::Platform as WsPlatform;
 use crate::remote_trader::RemoteTraderServer;
 use trading::execution::Platform as TradingPlatform;
-use types::{GlobalState, PriceCents};
+use types::{GlobalState, MarketType, PriceCents};
 
 /// Polymarket CLOB API host
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
 /// Polygon chain ID
 const POLYGON_CHAIN_ID: u64 = 137;
+
+fn cli_arg_value(args: &[String], key: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == key)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+fn cli_has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|a| a == flag)
+}
+
+/// Print a summary table of discovery results
+fn print_discovery_summary(result: &types::DiscoveryResult) {
+    use std::collections::BTreeSet;
+
+    // Collect all unique leagues from stats
+    let leagues: BTreeSet<_> = result.stats.by_league_type
+        .keys()
+        .map(|(league, _)| league.clone())
+        .collect();
+
+    if leagues.is_empty() {
+        return;
+    }
+
+    let market_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+    let type_headers = ["Moneyline", "Spread", "Total", "BTTS"];
+
+    // Calculate column widths
+    let league_width = leagues.iter().map(|l| l.len()).max().unwrap_or(6).max(6);
+
+    // Print header
+    info!("┌{:─<width$}┬{:─<48}┬{:─<8}┬{:─<8}┐",
+          "", "", "", "", width = league_width + 2);
+    info!("│{:^width$}│{:^48}│{:^8}│{:^8}│",
+          "DISCOVERY SUMMARY", "", "", "", width = league_width + 2);
+    info!("├{:─<width$}┼{:─<11}─{:─<11}─{:─<11}─{:─<11}┼{:─<8}┼{:─<8}┤",
+          "", "", "", "", "", "", "", width = league_width + 2);
+    info!("│ {:width$} │ {:^9} {:^9} {:^9} {:^9}   │ {:^6} │ {:^6} │",
+          "League", type_headers[0], type_headers[1], type_headers[2], type_headers[3], "Kalshi", "Match",
+          width = league_width);
+    info!("├{:─<width$}┼{:─<11}─{:─<11}─{:─<11}─{:─<11}┼{:─<8}┼{:─<8}┤",
+          "", "", "", "", "", "", "", width = league_width + 2);
+
+    // Print each league row
+    let mut total_kalshi = 0usize;
+    let mut total_matched = 0usize;
+
+    for league in &leagues {
+        let mut row_kalshi = 0usize;
+        let mut row_matched = 0usize;
+        let mut type_strs: Vec<String> = Vec::new();
+
+        for mt in &market_types {
+            if let Some(&(kalshi, matched)) = result.stats.by_league_type.get(&(league.clone(), *mt)) {
+                type_strs.push(format!("{}/{}", matched, kalshi));
+                row_kalshi += kalshi;
+                row_matched += matched;
+            } else {
+                type_strs.push("-".to_string());
+            }
+        }
+
+        info!("│ {:width$} │ {:^9} {:^9} {:^9} {:^9}   │ {:^6} │ {:^6} │",
+              league,
+              type_strs[0], type_strs[1], type_strs[2], type_strs[3],
+              row_kalshi, row_matched,
+              width = league_width);
+
+        total_kalshi += row_kalshi;
+        total_matched += row_matched;
+    }
+
+    // Print footer with totals
+    info!("├{:─<width$}┼{:─<11}─{:─<11}─{:─<11}─{:─<11}┼{:─<8}┼{:─<8}┤",
+          "", "", "", "", "", "", "", width = league_width + 2);
+    info!("│ {:width$} │ {:^9} {:^9} {:^9} {:^9}   │ {:^6} │ {:^6} │",
+          "TOTAL", "", "", "", "", total_kalshi, total_matched, width = league_width);
+    info!("└{:─<width$}┴{:─<48}┴{:─<8}┴{:─<8}┘",
+          "", "", "", "", width = league_width + 2);
+}
 
 /// Background task that periodically discovers new markets
 async fn discovery_refresh_task(
@@ -269,18 +351,57 @@ async fn main() -> Result<()> {
     info!("   Profit threshold: <{:.1}¢ ({:.1}% minimum profit)",
           ARB_THRESHOLD * 100.0, (1.0 - ARB_THRESHOLD) * 100.0);
 
-    // Build league list for discovery from config env.
-    // - If ENABLED_LEAGUES is empty, we monitor all supported leagues.
-    // - Otherwise, we monitor only the explicit set.
-    let leagues: Vec<&str> = {
-        let enabled = enabled_leagues();
-        if enabled.is_empty() {
-            get_league_configs().into_iter().map(|c| c.league_code).collect()
-        } else {
-            enabled.iter().map(|s| s.as_str()).collect()
-        }
+    // --- CLI overrides (faster iteration) ---
+    // Examples:
+    //   cargo run -p controller -- --leagues nba
+    //   cargo run -p controller -- --leagues nba,nfl --pairing-debug --pairing-debug-limit 50
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if cli_has_flag(&args, "--pairing-debug") {
+        std::env::set_var("PAIRING_DEBUG", "1");
+    }
+    if let Some(v) = cli_arg_value(&args, "--pairing-debug-limit") {
+        std::env::set_var("PAIRING_DEBUG_LIMIT", v);
+    }
+
+    // Build league list for discovery from CLI/env.
+    // - `--leagues nba,nfl` overrides env.
+    // - If nothing is specified, we monitor all supported leagues.
+    let cli_leagues: Option<Vec<String>> = cli_arg_value(&args, "--leagues").map(|v| {
+        v.split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+
+    let env_leagues: Vec<String> = enabled_leagues().to_vec();
+
+    let leagues_owned: Vec<String> = match cli_leagues {
+        Some(v) if !v.is_empty() => v,
+        _ if !env_leagues.is_empty() => env_leagues,
+        _ => get_league_configs()
+            .into_iter()
+            .map(|c| c.league_code.to_string())
+            .collect(),
     };
+
+    let leagues: Vec<&str> = leagues_owned.iter().map(|s| s.as_str()).collect();
     info!("   Monitored leagues: {:?}", leagues);
+
+    // Parse --market-type filter (e.g., --market-type moneyline)
+    let market_type_filter: Option<MarketType> = cli_arg_value(&args, "--market-type")
+        .and_then(|s| match s.to_lowercase().as_str() {
+            "moneyline" => Some(MarketType::Moneyline),
+            "spread" => Some(MarketType::Spread),
+            "total" => Some(MarketType::Total),
+            "btts" => Some(MarketType::Btts),
+            _ => {
+                warn!("Unknown market type '{}', ignoring filter", s);
+                None
+            }
+        });
+    if let Some(mt) = &market_type_filter {
+        info!("   Market type filter: {:?}", mt);
+    }
 
     // Check for dry run mode
     let dry_run = std::env::var("DRY_RUN").map(|v| v == "1" || v == "true").unwrap_or(true);
@@ -326,12 +447,13 @@ async fn main() -> Result<()> {
     );
 
     let result = if force_discovery {
-        discovery.discover_all_force(&leagues).await
+        discovery.discover_all_force(&leagues, market_type_filter).await
     } else {
-        discovery.discover_all(&leagues).await
+        discovery.discover_all(&leagues, market_type_filter).await
     };
 
     info!("📊 Market discovery complete:");
+    print_discovery_summary(&result);
     info!("   - Matched market pairs: {}", result.pairs.len());
 
     if !result.errors.is_empty() {
@@ -732,13 +854,14 @@ async fn main() -> Result<()> {
             let mut with_kalshi = 0;
             let mut with_poly = 0;
             let mut with_both = 0;
-            // Track best arbitrage opportunity: (total_cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no)
+            // Track best arbitrage opportunity:
+            // (total_cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no, max_contracts)
             #[allow(clippy::type_complexity)]
-            let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, bool)> = None;
+            let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, bool, i64)> = None;
 
             for market in heartbeat_state.markets.iter().take(market_count) {
-                let (k_yes, k_no, _, _) = market.kalshi.load();
-                let (p_yes, p_no, _, _) = market.poly.load();
+                let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
+                let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.load();
                 let has_k = k_yes > 0 && k_no > 0;
                 let has_p = p_yes > 0 && p_no > 0;
                 if k_yes > 0 || k_no > 0 { with_kalshi += 1; }
@@ -748,18 +871,30 @@ async fn main() -> Result<()> {
 
                     let fee1 = kalshi_fee_cents(k_no);
                     let cost1 = p_yes + k_no + fee1;
+                    let max1 = (p_yes_size.min(k_no_size) / 100) as i64;
 
                     let fee2 = kalshi_fee_cents(k_yes);
                     let cost2 = k_yes + fee2 + p_no;
+                    let max2 = (k_yes_size.min(p_no_size) / 100) as i64;
 
-                    let (best_cost, best_fee, is_poly_yes) = if cost1 <= cost2 {
-                        (cost1, fee1, true)
+                    let (best_cost, best_fee, is_poly_yes, best_max) = if cost1 <= cost2 {
+                        (cost1, fee1, true, max1)
                     } else {
-                        (cost2, fee2, false)
+                        (cost2, fee2, false, max2)
                     };
 
                     if best_arb.is_none() || best_cost < best_arb.as_ref().unwrap().0 {
-                        best_arb = Some((best_cost, market.market_id, p_yes, k_no, k_yes, p_no, best_fee, is_poly_yes));
+                        best_arb = Some((
+                            best_cost,
+                            market.market_id,
+                            p_yes,
+                            k_no,
+                            k_yes,
+                            p_no,
+                            best_fee,
+                            is_poly_yes,
+                            best_max,
+                        ));
                     }
                 }
             }
@@ -769,7 +904,7 @@ async fn main() -> Result<()> {
                    now, market_count, with_kalshi, with_poly, with_both, heartbeat_threshold);
             let _ = std::io::stdout().flush();
 
-            if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes)) = best_arb {
+            if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes, max_contracts)) = best_arb {
                 let gap = cost as i16 - heartbeat_threshold as i16;
                 let pair = heartbeat_state.get_by_id(market_id)
                     .and_then(|m| m.pair());
@@ -790,8 +925,17 @@ async fn main() -> Result<()> {
                 };
                 if gap < 0 {
                     println!();  // Move to new line before logging opportunity
-                    info!("📊 Best opportunity: {} | {} | gap={:+}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
-                          desc, leg_breakdown, gap, p_yes, k_no, k_yes, p_no);
+                    info!(
+                        "📊 Best opportunity: {} | {} | gap={:+}¢ | max={}x | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
+                        desc,
+                        leg_breakdown,
+                        gap,
+                        max_contracts,
+                        p_yes,
+                        k_no,
+                        k_yes,
+                        p_no
+                    );
                     // Log URLs for easy access
                     if let Some(p) = pair.as_ref() {
                         let kalshi_series = p.kalshi_event_ticker
@@ -820,13 +964,14 @@ async fn main() -> Result<()> {
     let discovery_interval = config::discovery_interval_mins();
     let discovery_client = Arc::new(discovery);
     let discovery_state = state.clone();
+    let refresh_leagues = leagues_owned.clone();
     let discovery_handle = tokio::spawn(async move {
         discovery_refresh_task(
             discovery_client,
             discovery_state,
             shutdown_tx,
             discovery_interval,
-            enabled_leagues().to_vec(),
+            refresh_leagues,
         ).await;
     });
 
