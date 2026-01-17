@@ -2404,4 +2404,69 @@ mod tests {
         assert_eq!(lookup_team_canonical("los ratones"), Some("los-ratones"),
                    "los ratones (spaces) should match los-ratones");
     }
+
+    #[test]
+    fn test_market_type_filter_none_includes_all() {
+        // When filter is None, all market types should be included
+        let all_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+        let filter: Option<MarketType> = None;
+
+        let filtered: Vec<_> = all_types.iter()
+            .filter(|mt| filter.map_or(true, |f| f == **mt))
+            .copied()
+            .collect();
+
+        assert_eq!(filtered.len(), 4);
+        assert!(filtered.contains(&MarketType::Moneyline));
+        assert!(filtered.contains(&MarketType::Spread));
+        assert!(filtered.contains(&MarketType::Total));
+        assert!(filtered.contains(&MarketType::Btts));
+    }
+
+    #[test]
+    fn test_market_type_filter_moneyline_only() {
+        // When filter is Moneyline, only Moneyline should be included
+        let all_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+        let filter = Some(MarketType::Moneyline);
+
+        let filtered: Vec<_> = all_types.iter()
+            .filter(|mt| filter.map_or(true, |f| f == **mt))
+            .copied()
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered.contains(&MarketType::Moneyline));
+        assert!(!filtered.contains(&MarketType::Spread));
+    }
+
+    #[test]
+    fn test_market_type_filter_spread_only() {
+        // When filter is Spread, only Spread should be included
+        let all_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+        let filter = Some(MarketType::Spread);
+
+        let filtered: Vec<_> = all_types.iter()
+            .filter(|mt| filter.map_or(true, |f| f == **mt))
+            .copied()
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered.contains(&MarketType::Spread));
+        assert!(!filtered.contains(&MarketType::Moneyline));
+    }
+
+    #[test]
+    fn test_market_type_filter_total_only() {
+        // When filter is Total, only Total should be included
+        let all_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+        let filter = Some(MarketType::Total);
+
+        let filtered: Vec<_> = all_types.iter()
+            .filter(|mt| filter.map_or(true, |f| f == **mt))
+            .copied()
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered.contains(&MarketType::Total));
+    }
 }
