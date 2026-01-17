@@ -270,7 +270,16 @@ fn parse_ws_platforms() -> Vec<WsPlatform> {
 const MAX_LOG_FILES: usize = 10;
 
 /// Initialize logging with both console and file output.
-/// Returns the log file path and a guard that must be kept alive for the duration of the program.
+///
+/// Returns the log file path and a [`WorkerGuard`] that **must be kept alive** for the
+/// entire duration of the program. The guard ensures buffered logs are flushed on shutdown.
+/// Dropping the guard early will cause log loss.
+///
+/// # Usage
+/// ```ignore
+/// let (log_path, _log_guard) = init_logging();
+/// // _log_guard lives until main() exits, ensuring all logs are flushed
+/// ```
 fn init_logging() -> (PathBuf, WorkerGuard) {
     use chrono::Local;
 

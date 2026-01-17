@@ -73,7 +73,12 @@ pub const KALSHI_API_DELAY_MS: u64 = 60;
 /// WebSocket reconnect delay (seconds)
 pub const WS_RECONNECT_DELAY_SECS: u64 = 5;
 
-/// Maximum tokens per Polymarket WebSocket connection (undocumented API limit)
+/// Maximum tokens per Polymarket WebSocket connection.
+///
+/// Polymarket's WebSocket API has an undocumented limit of ~500 tokens per connection.
+/// Exceeding this causes silent subscription failures or connection drops without error messages.
+/// Discovered through production testing - connections with >500 tokens would stop receiving
+/// updates for some tokens with no indication of the problem.
 pub const POLY_MAX_TOKENS_PER_WS: usize = 500;
 
 /// Which leagues to monitor (empty = all)
@@ -92,26 +97,24 @@ pub fn enabled_leagues() -> &'static [String] {
 /// Enable verbose pairing/matching debug logs (emoji-tagged).
 ///
 /// This is intentionally an `info!`-level debug mode so it can be enabled without changing `RUST_LOG`.
-/// - Set `PAIRING_DEBUG=1` to enable.
+/// - Set `PAIRING_DEBUG=1` or use `--pairing-debug` CLI flag to enable.
+///
+/// Note: No caching - allows CLI flags to override env vars after startup.
 pub fn pairing_debug_enabled() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("PAIRING_DEBUG")
-            .map(|v| v == "1" || v.to_lowercase() == "true" || v.to_lowercase() == "yes")
-            .unwrap_or(false)
-    })
+    std::env::var("PAIRING_DEBUG")
+        .map(|v| v == "1" || v.to_lowercase() == "true" || v.to_lowercase() == "yes")
+        .unwrap_or(false)
 }
 
 /// Maximum per-league pairing debug lines emitted for individual market attempts.
-/// - Set `PAIRING_DEBUG_LIMIT=<N>` to override.
+/// - Set `PAIRING_DEBUG_LIMIT=<N>` or use `--pairing-debug-limit <N>` CLI flag to override.
+///
+/// Note: No caching - allows CLI flags to override env vars after startup.
 pub fn pairing_debug_limit() -> usize {
-    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("PAIRING_DEBUG_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(200)
-    })
+    std::env::var("PAIRING_DEBUG_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200)
 }
 
 /// Which leagues to discover but not trade (monitor only)

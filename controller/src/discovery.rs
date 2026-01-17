@@ -129,8 +129,24 @@ impl DiscoveryClient {
     /// Load cache from disk (async)
     async fn load_cache() -> Option<DiscoveryCache> {
         let path = crate::paths::resolve_workspace_file(DISCOVERY_CACHE_PATH);
-        let data = tokio::fs::read_to_string(&path).await.ok()?;
-        serde_json::from_str(&data).ok()
+        let data = match tokio::fs::read_to_string(&path).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Normal case - no cache file yet
+                return None;
+            }
+            Err(e) => {
+                tracing::debug!("[DISCOVERY] Failed to read cache file {:?}: {}", path, e);
+                return None;
+            }
+        };
+        match serde_json::from_str(&data) {
+            Ok(cache) => Some(cache),
+            Err(e) => {
+                tracing::warn!("[DISCOVERY] Cache file {:?} is corrupted, ignoring: {}", path, e);
+                None
+            }
+        }
     }
 
     /// Save cache to disk (async)
@@ -295,7 +311,9 @@ impl DiscoveryClient {
 
             // Just update timestamp to extend TTL
             let refreshed_cache = DiscoveryCache::new(all_pairs.clone());
-            let _ = Self::save_cache(&refreshed_cache).await;
+            if let Err(e) = Self::save_cache(&refreshed_cache).await {
+                tracing::warn!("[DISCOVERY] Failed to refresh cache TTL: {}", e);
+            }
         }
 
         DiscoveryResult {

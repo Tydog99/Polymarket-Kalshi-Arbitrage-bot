@@ -134,10 +134,12 @@ impl GammaClient {
             }
         }
 
-        // All retries exhausted
+        // All retries exhausted - return error so callers can distinguish from "not found"
         if let Some(err) = last_error {
             tracing::warn!("Gamma lookup failed after 3 attempts for {}: {}", slug, err);
+            anyhow::bail!("Gamma API failed after 3 retries for {}: {}", slug, err);
         }
+        // Should never reach here (last_error is always Some if we get here), but be safe
         Ok(None)
     }
 
@@ -266,7 +268,14 @@ fn parse_size(s: &str) -> SizeCents {
         .unwrap_or(0)
 }
 
-/// WebSocket coordinator - spawns multiple connections for large token sets
+/// WebSocket coordinator - spawns multiple connections for large token sets.
+///
+/// Polymarket's WebSocket API silently fails when subscribing to >500 tokens on a single
+/// connection (see [`POLY_MAX_TOKENS_PER_WS`]). This function splits the token list across
+/// multiple parallel connections to work around this limitation.
+///
+/// Each connection manages its own reconnection logic. If any connection exits (error or
+/// shutdown signal), all connections are aborted to trigger a coordinated reconnect.
 pub async fn run_ws(
     state: Arc<GlobalState>,
     exec_tx: mpsc::Sender<FastExecutionRequest>,
@@ -315,7 +324,7 @@ pub async fn run_ws(
 
     for (conn_id, chunk) in tokens.chunks(POLY_MAX_TOKENS_PER_WS).enumerate() {
         let token_start = conn_id * POLY_MAX_TOKENS_PER_WS;
-        let token_end = token_start + chunk.len() - 1;
+        let token_end = token_start + chunk.len().saturating_sub(1);
         info!(
             "[POLY:{}] Assigned tokens {}-{} ({} tokens)",
             conn_id,
@@ -442,7 +451,9 @@ async fn run_single_ws(
                         }
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        let _ = write.send(Message::Pong(data)).await;
+                        if let Err(e) = write.send(Message::Pong(data)).await {
+                            warn!("{} Failed to send pong: {} (connection may be degraded)", log_prefix, e);
+                        }
                         last_message = Instant::now();
                     }
                     Some(Ok(Message::Pong(_))) => {
@@ -620,6 +631,11 @@ async fn send_arb_request(
         detected_ns: clock.now_ns(),
     };
 
-    // send! ~~ 
-    let _ = exec_tx.try_send(req);
+    // Send to execution engine; log if channel is full (backpressure)
+    if let Err(e) = exec_tx.try_send(req) {
+        tracing::warn!(
+            "[POLY] Arb request dropped for market {}: {} (channel backpressure)",
+            market_id, e
+        );
+    }
 }

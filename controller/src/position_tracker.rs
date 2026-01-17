@@ -277,11 +277,15 @@ impl PositionTracker {
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(async move {
                 if let Ok(json) = serde_json::to_string_pretty(&data) {
-                    let _ = tokio::fs::write(&path, json).await;
+                    if let Err(e) = tokio::fs::write(&path, json).await {
+                        tracing::error!("[POSITION] Failed to save positions to {:?}: {}", path, e);
+                    }
                 }
             });
         } else if let Ok(json) = serde_json::to_string_pretty(&data) {
-            let _ = std::fs::write(&path, json);
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::error!("[POSITION] Failed to save positions to {:?}: {}", path, e);
+            }
         }
     }
     
