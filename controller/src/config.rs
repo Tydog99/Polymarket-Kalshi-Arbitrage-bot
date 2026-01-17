@@ -341,7 +341,12 @@ impl LeagueConfig {
     /// Draw markets indicate the league uses team-specific slugs for Moneyline.
     /// American sports (NBA, NFL, etc.) don't have draws and use a single base slug.
     pub fn has_draws(&self) -> bool {
-        self.kalshi_series_btts.is_some()
+        // All soccer leagues have draws (including EFL Championship which doesn't have btts series)
+        // Only American sports (nba, nfl, nhl, mlb, ncaaf) and esports don't have draws
+        !matches!(
+            self.league_code,
+            "nba" | "nfl" | "nhl" | "mlb" | "ncaaf" | "cs2" | "lol" | "cod"
+        )
     }
 }
 
