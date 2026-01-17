@@ -283,6 +283,11 @@ fn init_logging() -> (PathBuf, WorkerGuard) {
     let log_filename = format!("controller-{}.log", timestamp);
     let log_path = logs_dir.join(&log_filename);
 
+    // Get absolute path for logging (canonicalize requires file to exist, so we build it manually)
+    let absolute_log_path = std::env::current_dir()
+        .map(|cwd| cwd.join(&log_path))
+        .unwrap_or_else(|_| log_path.clone());
+
     // Clean up old log files, keeping only the most recent MAX_LOG_FILES
     cleanup_old_logs(&logs_dir, MAX_LOG_FILES);
 
@@ -318,7 +323,7 @@ fn init_logging() -> (PathBuf, WorkerGuard) {
         .with(file_layer)
         .init();
 
-    (log_path, guard)
+    (absolute_log_path, guard)
 }
 
 /// Remove old log files, keeping only the most recent `keep_count` files.
