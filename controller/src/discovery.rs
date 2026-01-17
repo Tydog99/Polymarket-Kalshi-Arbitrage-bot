@@ -12,6 +12,7 @@ use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
@@ -21,7 +22,7 @@ use crate::config;
 use crate::config::{LeagueConfig, get_league_configs, get_league_config};
 use crate::kalshi::KalshiApiClient;
 use crate::polymarket::GammaClient;
-use crate::types::{MarketPair, MarketType, DiscoveryResult, KalshiMarket, KalshiEvent};
+use crate::types::{MarketPair, MarketType, DiscoveryResult, PairingStats, KalshiMarket, KalshiEvent};
 
 /// Max concurrent Gamma API requests
 const GAMMA_CONCURRENCY: usize = 20;
@@ -165,6 +166,7 @@ impl DiscoveryClient {
                     poly_matches: 0,
                     poly_misses: 0,
                     errors: vec![],
+                    pairing_stats: HashMap::new(),
                 };
             }
             Some(cache) => {
@@ -295,9 +297,10 @@ impl DiscoveryClient {
             poly_matches: new_count,
             poly_misses: 0,
             errors: vec![],
+            pairing_stats: HashMap::new(),
         }
     }
-    
+
     /// Discover all market types for a single league (PARALLEL)
     /// If cache is provided, only discovers markets not already in cache
     async fn discover_league(&self, config: &LeagueConfig, cache: Option<&DiscoveryCache>) -> DiscoveryResult {
@@ -492,12 +495,19 @@ impl DiscoveryClient {
                 }
             })
             .collect();
-        
+
+        // Track stats with atomic counters for the async closure
+        let total_tasks = lookup_futures.len();
+        let miss_slug_not_found = Arc::new(AtomicUsize::new(0));
+        let miss_api_error = Arc::new(AtomicUsize::new(0));
+
         // Execute lookups in parallel
         let pairs: Vec<MarketPair> = stream::iter(lookup_futures)
             .map(|task| {
                 let gamma = self.gamma.clone();
                 let semaphore = self.gamma_semaphore.clone();
+                let miss_slug_not_found = miss_slug_not_found.clone();
+                let miss_api_error = miss_api_error.clone();
                 async move {
                     let _permit = semaphore.acquire().await.ok()?;
                     match gamma.lookup_market(&task.poly_slug).await {
@@ -583,6 +593,7 @@ impl DiscoveryClient {
                             })
                         }
                         Ok(None) => {
+                            miss_slug_not_found.fetch_add(1, Ordering::Relaxed);
                             if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
                                 info!(
                                     "❌ [PAIR] NO_MATCH league={} type={:?} series={} kalshi_market={} poly_slug={}",
@@ -592,6 +603,7 @@ impl DiscoveryClient {
                             None
                         }
                         Err(e) => {
+                            miss_api_error.fetch_add(1, Ordering::Relaxed);
                             warn!("  ⚠️ Gamma lookup failed for {}: {}", task.poly_slug, e);
                             None
                         }
@@ -603,7 +615,31 @@ impl DiscoveryClient {
             .collect()
             .await;
 
-        if !pairs.is_empty() {
+        // Log summary stats when pairing_debug is enabled
+        let matched = pairs.len();
+        let slug_misses = miss_slug_not_found.load(Ordering::Relaxed);
+        let api_errors = miss_api_error.load(Ordering::Relaxed);
+
+        if pairing_debug && total_tasks > 0 {
+            let match_rate = (matched as f64 / total_tasks as f64 * 100.0).round() as u32;
+            let mut reasons = Vec::new();
+            if slug_misses > 0 {
+                reasons.push(format!("poly_no_market={}", slug_misses));
+            }
+            if api_errors > 0 {
+                reasons.push(format!("api_error={}", api_errors));
+            }
+            let reasons_str = if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", reasons.join(", "))
+            };
+            info!(
+                "📊 [PAIR] SUMMARY league={} type={:?} total={} matched={} ({}%) misses={}{}",
+                config.league_code, market_type, total_tasks, matched, match_rate,
+                total_tasks - matched, reasons_str
+            );
+        } else if !pairs.is_empty() {
             info!("  ✅ {} {}: matched {} pairs", config.league_code, market_type, pairs.len());
         }
 
@@ -1145,6 +1181,7 @@ impl DiscoveryClient {
             poly_matches: poly_lookup.len() / 2,
             poly_misses: 0,
             errors: vec![],
+            pairing_stats: HashMap::new(),
         }
     }
 }

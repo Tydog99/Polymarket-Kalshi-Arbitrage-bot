@@ -1282,6 +1282,33 @@ pub struct GammaMarket {
     pub closed: Option<bool>,
 }
 
+// === Pairing Statistics ===
+
+/// Tracks match/miss statistics per market type for debugging
+#[derive(Debug, Default, Clone)]
+pub struct PairingStats {
+    /// Total Kalshi markets found
+    pub total: usize,
+    /// Successfully matched with Polymarket
+    pub matched: usize,
+    /// Count of misses by reason
+    pub miss_reasons: std::collections::HashMap<String, usize>,
+}
+
+impl PairingStats {
+    pub fn record_match(&mut self) {
+        self.matched += 1;
+    }
+
+    pub fn record_miss(&mut self, reason: &str) {
+        *self.miss_reasons.entry(reason.to_string()).or_insert(0) += 1;
+    }
+
+    pub fn misses(&self) -> usize {
+        self.total.saturating_sub(self.matched)
+    }
+}
+
 // === Discovery Result ===
 
 #[derive(Debug, Default)]
@@ -1292,4 +1319,6 @@ pub struct DiscoveryResult {
     #[allow(dead_code)]
     pub poly_misses: usize,
     pub errors: Vec<String>,
+    /// Per-market-type pairing statistics (only populated when pairing_debug is enabled)
+    pub pairing_stats: std::collections::HashMap<MarketType, PairingStats>,
 }
