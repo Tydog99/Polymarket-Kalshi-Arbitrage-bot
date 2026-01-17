@@ -40,11 +40,15 @@ mod types;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tailscale::beacon::BeaconSender;
 use tokio::sync::{RwLock, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use cache::TeamCache;
 use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
@@ -262,21 +266,99 @@ fn parse_ws_platforms() -> Vec<WsPlatform> {
         .collect()
 }
 
+/// Maximum number of log files to retain in the logs directory
+const MAX_LOG_FILES: usize = 10;
+
+/// Initialize logging with both console and file output.
+/// Returns the log file path and a guard that must be kept alive for the duration of the program.
+fn init_logging() -> (PathBuf, WorkerGuard) {
+    use chrono::Local;
+
+    // Create logs directory in project root (same level as Cargo.toml)
+    let logs_dir = PathBuf::from(".logs");
+    std::fs::create_dir_all(&logs_dir).expect("Failed to create logs directory");
+
+    // Generate timestamped filename: controller-2026-01-17-143052.log
+    let timestamp = Local::now().format("%Y-%m-%d-%H%M%S");
+    let log_filename = format!("controller-{}.log", timestamp);
+    let log_path = logs_dir.join(&log_filename);
+
+    // Clean up old log files, keeping only the most recent MAX_LOG_FILES
+    cleanup_old_logs(&logs_dir, MAX_LOG_FILES);
+
+    // Create non-blocking file appender
+    let file_appender = tracing_appender::rolling::never(&logs_dir, &log_filename);
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    // Build env filter
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info")
+            .add_directive("controller=info".parse().unwrap())
+            .add_directive("arb_bot=info".parse().unwrap())
+    });
+
+    // Create timer for consistent formatting
+    let timer = tracing_subscriber::fmt::time::ChronoLocal::new("[%H:%M:%S]".to_string());
+
+    // Console layer with color support
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_timer(timer.clone())
+        .with_ansi(true);
+
+    // File layer without ANSI codes
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_timer(timer)
+        .with_ansi(false)
+        .with_writer(non_blocking);
+
+    // Combine layers
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(console_layer)
+        .with(file_layer)
+        .init();
+
+    (log_path, guard)
+}
+
+/// Remove old log files, keeping only the most recent `keep_count` files.
+fn cleanup_old_logs(logs_dir: &PathBuf, keep_count: usize) {
+    let Ok(entries) = std::fs::read_dir(logs_dir) else {
+        return;
+    };
+
+    // Collect log files with their modification times
+    let mut log_files: Vec<(PathBuf, std::time::SystemTime)> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "log")
+                .unwrap_or(false)
+        })
+        .filter_map(|e| {
+            e.metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|t| (e.path(), t))
+        })
+        .collect();
+
+    // Sort by modification time (newest first)
+    log_files.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Remove files beyond keep_count
+    for (path, _) in log_files.into_iter().skip(keep_count) {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging with compact local time format [HH:MM:SS]
-    // Note: the binary crate is `controller`, while the shared library crate is `arb_bot`.
-    // If the user doesn't set `RUST_LOG`, we still want `info` logs from both crates.
-    tracing_subscriber::fmt()
-        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new("[%H:%M:%S]".to_string()))
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("info")
-                    .add_directive("controller=info".parse().unwrap())
-                    .add_directive("arb_bot=info".parse().unwrap())
-            }),
-        )
-        .init();
+    // Initialize logging with both console and file output
+    // The guard must be kept alive for the duration of the program to ensure logs are flushed
+    let (log_file_path, _log_guard) = init_logging();
+    info!("📝 Logging to: {}", log_file_path.display());
 
     // Load environment variables from `.env` (supports workspace-root `.env`)
     paths::load_dotenv();
