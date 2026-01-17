@@ -25,7 +25,7 @@ use crate::polymarket::GammaClient;
 use crate::types::{MarketPair, MarketType, DiscoveryResult, PairingStats, KalshiMarket, KalshiEvent};
 
 /// Max concurrent Gamma API requests
-const GAMMA_CONCURRENCY: usize = 20;
+const GAMMA_CONCURRENCY: usize = 5;
 
 /// Kalshi rate limit: 2 requests per second (very conservative - they rate limit aggressively)
 /// Must be conservative because discovery runs many leagues/series in parallel
