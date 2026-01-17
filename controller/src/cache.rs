@@ -431,6 +431,55 @@ pub fn team_search_terms(league: &str, team_code: &str) -> Option<&'static [&'st
         ("mls", "tor") | ("mls", "tfc") => Some(&["toronto"]),
         ("mls", "van") | ("mls", "vwc") => Some(&["vancouver", "whitecaps"]),
 
+        // LoL Esports - team codes to full names
+        // LCK (Korea)
+        ("lol", "foxy") => Some(&["fearx", "bnk"]),
+        ("lol", "hle") => Some(&["hanwha"]),
+        ("lol", "t1") => Some(&["t1"]),
+        ("lol", "geng") | ("lol", "gen") => Some(&["gen.g", "geng"]),
+        ("lol", "dk") | ("lol", "dwg") => Some(&["damwon", "dplus"]),
+        ("lol", "kt") => Some(&["kt rolster", "rolster"]),
+        ("lol", "drx") => Some(&["drx"]),
+        ("lol", "kdf") => Some(&["kwangdong", "freecs"]),
+        ("lol", "bro") => Some(&["brion", "fredit"]),
+        ("lol", "ns") => Some(&["nongshim", "redforce"]),
+
+        // LPL (China)
+        ("lol", "wb") | ("lol", "wbg") => Some(&["weibo"]),
+        ("lol", "al") => Some(&["anyone", "legend"]),
+        ("lol", "jdg") => Some(&["jd gaming", "jdg"]),
+        ("lol", "blg") => Some(&["bilibili"]),
+        ("lol", "tes") => Some(&["top esports"]),
+        ("lol", "edg") => Some(&["edward", "edg"]),
+        ("lol", "lng") => Some(&["lng"]),
+        ("lol", "rng") => Some(&["royal", "never give up"]),
+        ("lol", "ig") => Some(&["invictus"]),
+        ("lol", "fpx") => Some(&["funplus", "phoenix"]),
+        ("lol", "omg") => Some(&["omg"]),
+        ("lol", "lgd") => Some(&["lgd"]),
+
+        // LEC (Europe)
+        ("lol", "fnc") => Some(&["fnatic"]),
+        ("lol", "g2") => Some(&["g2 esports", "g2"]),
+        ("lol", "mad") => Some(&["mad lions"]),
+        ("lol", "vit") => Some(&["vitality"]),
+        ("lol", "rge") => Some(&["rogue"]),
+        ("lol", "xl") => Some(&["excel"]),
+        ("lol", "bds") => Some(&["bds"]),
+        ("lol", "sk") => Some(&["sk gaming"]),
+
+        // LCS (North America)
+        ("lol", "tl") => Some(&["team liquid", "liquid"]),
+        ("lol", "c9") => Some(&["cloud9", "cloud 9"]),
+        ("lol", "100") | ("lol", "100t") => Some(&["100 thieves"]),
+        ("lol", "eg") => Some(&["evil geniuses"]),
+        ("lol", "fly") => Some(&["flyquest"]),
+        ("lol", "tsm") => Some(&["tsm"]),
+        ("lol", "clg") => Some(&["counter logic", "clg"]),
+        ("lol", "dig") => Some(&["dignitas"]),
+        ("lol", "gg") => Some(&["golden guardians"]),
+        ("lol", "imt") => Some(&["immortals"]),
+
         _ => None,
     }
 }
@@ -671,5 +720,59 @@ mod tests {
 
         assert!(nyk_terms.unwrap().iter().any(|t| knicks.contains(t)));
         assert!(bkn_terms.unwrap().iter().any(|t| nets.contains(t)));
+    }
+
+    // LoL Esports team search terms tests
+
+    #[test]
+    fn test_team_search_terms_lol_foxy() {
+        // FOXY is not a substring of "BNK FearX Youth"
+        let terms = team_search_terms("lol", "foxy");
+        assert!(terms.is_some());
+        let terms = terms.unwrap();
+
+        // Verify it matches "BNK FearX Youth"
+        let outcome = "BNK FearX Youth".to_lowercase();
+        assert!(terms.iter().any(|t| outcome.contains(t)),
+            "FOXY should match 'BNK FearX Youth' via search terms {:?}", terms);
+    }
+
+    #[test]
+    fn test_team_search_terms_lol_hle() {
+        // HLE is not a substring of "Hanwha Life Esports Challengers"
+        let terms = team_search_terms("lol", "hle");
+        assert!(terms.is_some());
+        let terms = terms.unwrap();
+
+        // Verify it matches "Hanwha Life Esports Challengers"
+        let outcome = "Hanwha Life Esports Challengers".to_lowercase();
+        assert!(terms.iter().any(|t| outcome.contains(t)),
+            "HLE should match 'Hanwha Life Esports Challengers' via search terms {:?}", terms);
+    }
+
+    #[test]
+    fn test_team_search_terms_lol_al() {
+        // AL is not a substring of "Anyone's Legend"
+        let terms = team_search_terms("lol", "al");
+        assert!(terms.is_some());
+        let terms = terms.unwrap();
+
+        // Verify it matches "Anyone's Legend"
+        let outcome = "Anyone's Legend".to_lowercase();
+        assert!(terms.iter().any(|t| outcome.contains(t)),
+            "AL should match 'Anyone\\'s Legend' via search terms {:?}", terms);
+    }
+
+    #[test]
+    fn test_team_search_terms_lol_wb() {
+        // WB is not a substring of "Weibo Gaming"
+        let terms = team_search_terms("lol", "wb");
+        assert!(terms.is_some());
+        let terms = terms.unwrap();
+
+        // Verify it matches "Weibo Gaming"
+        let outcome = "Weibo Gaming".to_lowercase();
+        assert!(terms.iter().any(|t| outcome.contains(t)),
+            "WB should match 'Weibo Gaming' via search terms {:?}", terms);
     }
 }
