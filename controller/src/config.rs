@@ -73,6 +73,9 @@ pub const KALSHI_API_DELAY_MS: u64 = 60;
 /// WebSocket reconnect delay (seconds)
 pub const WS_RECONNECT_DELAY_SECS: u64 = 5;
 
+/// Maximum tokens per Polymarket WebSocket connection (undocumented API limit)
+pub const POLY_MAX_TOKENS_PER_WS: usize = 500;
+
 /// Which leagues to monitor (empty = all)
 /// Set ENABLED_LEAGUES env var to comma-separated list, e.g., "cs2,lol,cod"
 pub fn enabled_leagues() -> &'static [String] {
