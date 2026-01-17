@@ -659,11 +659,12 @@ impl DiscoveryClient {
                 }
             }
             MarketType::Spread => {
+                // Polymarket uses "spread-home-{value}" format for American sports
                 if let Some(floor) = market.floor_strike {
                     let floor_str = format!("{:.1}", floor).replace(".", "pt");
-                    format!("{}-spread-{}", base, floor_str)
+                    format!("{}-spread-home-{}", base, floor_str)
                 } else {
-                    format!("{}-spread", base)
+                    format!("{}-spread-home", base)
                 }
             }
             MarketType::Total => {
