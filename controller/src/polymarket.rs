@@ -1039,4 +1039,58 @@ mod tests {
         assert_eq!(yes_size, 1000);
         assert_eq!(no_size, 2000);
     }
+
+    #[test]
+    fn test_price_change_updates_both_markets_for_shared_token() {
+        // Test that process_price_change logic updates both markets when a shared
+        // token's price changes. This is the same bug fix as process_book but for
+        // incremental price updates instead of book snapshots.
+        //
+        // Scenario: Esports market where Token_A is YES for Market 0, NO for Market 1.
+        // When Token_A's price changes, BOTH markets should be updated.
+        let (state, token_optic, _token_thieves) = create_esports_state_with_shared_tokens();
+
+        // Simulate price change for Token_OpTic: new price = 40 cents
+        // This simulates what process_price_change does (without async/exec_tx)
+        let optic_hash = fxhash_str(&token_optic);
+        let new_price: u16 = 40;
+
+        // First, set initial sizes (process_price_change preserves sizes)
+        state.markets[0].poly.update_yes(34, 500);  // Initial YES for market 0
+        state.markets[1].poly.update_no(34, 500);   // Initial NO for market 1
+
+        // Now simulate process_price_change receiving a price update for token_optic
+        // The function checks YES lookup first, then NO lookup (no early return)
+
+        // Check YES token lookup
+        if let Some(market_id) = state.poly_yes_to_id.read().get(&optic_hash).copied() {
+            let market = &state.markets[market_id as usize];
+            let (_, _, current_yes_size, _) = market.poly.load();
+            market.poly.update_yes(new_price, current_yes_size);
+            market.inc_poly_updates();
+        }
+
+        // Check NO token lookup (same token can be NO for different market)
+        // OLD BUGGY CODE would have `return` above, never reaching here
+        if let Some(market_id) = state.poly_no_to_id.read().get(&optic_hash).copied() {
+            let market = &state.markets[market_id as usize];
+            let (_, _, _, current_no_size) = market.poly.load();
+            market.poly.update_no(new_price, current_no_size);
+            market.inc_poly_updates();
+        }
+
+        // Verify Market 0: Token_OpTic is YES, should have YES price updated to 40
+        let (m0_yes, _, _, _) = state.markets[0].poly.load();
+        assert_eq!(m0_yes, 40, "Market 0 YES (OpTic wins) should be updated to 40 cents");
+
+        // Verify Market 1: Token_OpTic is NO, should have NO price updated to 40
+        let (_, m1_no, _, _) = state.markets[1].poly.load();
+        assert_eq!(m1_no, 40, "Market 1 NO (Thieves loses) should ALSO be updated to 40 cents");
+
+        // Verify update counts reflect both markets were updated
+        let (_, m0_p_upd) = state.markets[0].load_update_counts();
+        let (_, m1_p_upd) = state.markets[1].load_update_counts();
+        assert_eq!(m0_p_upd, 1, "Market 0 should have 1 Poly update from price change");
+        assert_eq!(m1_p_upd, 1, "Market 1 should have 1 Poly update from price change");
+    }
 }

@@ -39,7 +39,6 @@ mod types;
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1226,10 +1225,12 @@ async fn main() -> Result<()> {
                                 let item_branch = if is_last { "└" } else { "├" };
 
                                 // Strip redundant market type, deduplicate, and truncate to 55 chars
+                                // Use char-aware truncation to avoid panic on UTF-8 boundaries
                                 let stripped = strip_market_type_suffix(&m.description, mt);
                                 let deduped = deduplicate_market_name(&stripped);
-                                let desc: String = if deduped.len() > 55 {
-                                    format!("{}...", &deduped[..52])
+                                let desc: String = if deduped.chars().count() > 55 {
+                                    let truncated: String = deduped.chars().take(52).collect();
+                                    format!("{}...", truncated)
                                 } else {
                                     deduped
                                 };

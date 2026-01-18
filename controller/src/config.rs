@@ -151,10 +151,19 @@ pub fn verbose_heartbeat_enabled() -> bool {
 pub fn heartbeat_interval_secs() -> u64 {
     static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("HEARTBEAT_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10)
+        match std::env::var("HEARTBEAT_INTERVAL_SECS") {
+            Ok(v) if !v.is_empty() => match v.parse() {
+                Ok(val) => val,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Invalid HEARTBEAT_INTERVAL_SECS='{}': {} - using default 10s",
+                        v, e
+                    );
+                    10
+                }
+            },
+            _ => 10,
+        }
     })
 }
 
@@ -400,10 +409,19 @@ pub fn get_league_config(league: &str) -> Option<LeagueConfig> {
 pub fn discovery_interval_mins() -> u64 {
     static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("DISCOVERY_INTERVAL_MINS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(15)
+        match std::env::var("DISCOVERY_INTERVAL_MINS") {
+            Ok(v) if !v.is_empty() => match v.parse() {
+                Ok(val) => val,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Invalid DISCOVERY_INTERVAL_MINS='{}': {} - using default 15m",
+                        v, e
+                    );
+                    15
+                }
+            },
+            _ => 15,
+        }
     })
 }
 
