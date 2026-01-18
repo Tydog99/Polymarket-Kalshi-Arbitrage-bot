@@ -38,7 +38,7 @@ WebSocket Feeds (kalshi.rs, polymarket.rs)
     ↓
 Global State with Lock-Free Orderbook Cache (types.rs)
     ↓
-Heartbeat Arbitrage Detection (main.rs, every 60s)
+Heartbeat Arbitrage Detection (main.rs, every 10s default)
     ↓
 Execution Loop (execution.rs)
     ↓
@@ -170,34 +170,46 @@ This section documents how market tickers are constructed on each platform and h
 Kalshi uses a structured ticker format:
 
 ```
-{SERIES}-{DATE}{AWAY}{HOME}-{SUFFIX}
+{SERIES}-{DATE}{TEAM1}{TEAM2}-{SUFFIX}
 ```
 
-**Example:** `KXNBASPREAD-26JAN17WASDEN-DEN12`
+**Team order varies by sport:**
+- **US Sports (NBA, NFL, NHL, MLB, etc.):** AWAY-HOME order (team1=away, team2=home)
+- **Soccer (EPL, Bundesliga, La Liga, etc.):** HOME-AWAY order (team1=home, team2=away)
+
+**Example (NBA):** `KXNBASPREAD-26JAN17WASDEN-DEN12`
 
 | Component | Value | Meaning |
 |-----------|-------|---------|
 | Series | `KXNBASPREAD` | NBA spread markets |
 | Date | `26JAN17` | January 17, 2026 |
-| Away Team | `WAS` | Washington Wizards (away) |
-| Home Team | `DEN` | Denver Nuggets (home) |
+| Team1 (Away) | `WAS` | Washington Wizards (away) |
+| Team2 (Home) | `DEN` | Denver Nuggets (home) |
 | Suffix | `DEN12` | Denver wins by 12+ points |
 
-**Key insight:** Standard sports convention - **AWAY team listed FIRST, HOME team listed SECOND**.
+**Example (EPL):** `KXEPLML-25DEC25AVLCFC-CFC` (Aston Villa home vs Chelsea away)
+
+**Key insight:** The code uses `home_team_first` config flag to handle this difference - see `config.rs`.
 
 ### Polymarket Slug Format
 
-Polymarket uses URL-friendly slugs:
+Polymarket uses URL-friendly slugs with the same team order as Kalshi:
 
 ```
-{league}-{away}-{home}-{date}-{market_type}-{qualifier}
+{league}-{team1}-{team2}-{date}-{market_type}-{qualifier}
 ```
 
-**Examples:**
+**Team order matches Kalshi:** US sports = away-home, Soccer = home-away
+
+**Examples (NBA - away first):**
 - Moneyline: `nba-was-den-2026-01-17`
 - Spread (home favored): `nba-was-den-2026-01-17-spread-home-12pt5`
 - Spread (away favored): `nba-okc-mia-2026-01-17-spread-away-8pt5`
 - Total: `nba-was-den-2026-01-17-total-230pt5`
+
+**Examples (EPL - home first):**
+- Moneyline: `epl-avl-cfc-2025-12-25-avl` (Aston Villa to win)
+- Spread: `epl-avl-cfc-2025-12-25-spread-home-1pt5`
 
 ### Spread Market Logic (Critical)
 

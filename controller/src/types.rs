@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use rustc_hash::FxHashMap;
 use parking_lot::RwLock;
@@ -168,6 +168,10 @@ pub struct AtomicMarketState {
     pair: RwLock<Option<Arc<MarketPair>>>,
     /// Unique market identifier for O(1) lookups
     pub market_id: u16,
+    /// Count of price updates from Kalshi WebSocket
+    pub kalshi_updates: AtomicU32,
+    /// Count of price updates from Polymarket WebSocket
+    pub poly_updates: AtomicU32,
 }
 
 impl AtomicMarketState {
@@ -179,6 +183,8 @@ impl AtomicMarketState {
             poly_last_update_unix_ms: AtomicU64::new(0),
             pair: RwLock::new(None),
             market_id,
+            kalshi_updates: AtomicU32::new(0),
+            poly_updates: AtomicU32::new(0),
         }
     }
 
@@ -214,6 +220,27 @@ impl AtomicMarketState {
         (
             self.kalshi_last_update_unix_ms.load(Ordering::Acquire),
             self.poly_last_update_unix_ms.load(Ordering::Acquire),
+        )
+    }
+
+    /// Increment Kalshi update counter
+    #[inline]
+    pub fn inc_kalshi_updates(&self) {
+        self.kalshi_updates.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment Polymarket update counter
+    #[inline]
+    pub fn inc_poly_updates(&self) {
+        self.poly_updates.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Load both update counters (kalshi_updates, poly_updates)
+    #[inline]
+    pub fn load_update_counts(&self) -> (u32, u32) {
+        (
+            self.kalshi_updates.load(Ordering::Relaxed),
+            self.poly_updates.load(Ordering::Relaxed),
         )
     }
 

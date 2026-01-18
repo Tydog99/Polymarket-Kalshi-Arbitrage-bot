@@ -209,8 +209,10 @@ impl ExecutionEngine {
 
         if max_contracts < 1 {
             warn!(
-                "[EXEC] Liquidity fail: {:?} | yes_size={}¢ no_size={}¢ | backing off 10s",
-                req.arb_type, req.yes_size, req.no_size
+                "[EXEC] ⚠️ Insufficient liquidity: {} | {:?} | yes={}¢ ({}¢ size) no={}¢ ({}¢ size) | need 100¢ min",
+                pair.description, req.arb_type,
+                req.yes_price, req.yes_size,
+                req.no_price, req.no_size
             );
             // Use delayed release to avoid spam from low-liquidity markets
             self.release_in_flight_delayed(market_id);
@@ -224,7 +226,11 @@ impl ExecutionEngine {
         }
 
         // Circuit breaker check
-        if let Err(_reason) = self.circuit_breaker.can_execute(&pair.pair_id, max_contracts).await {
+        if let Err(reason) = self.circuit_breaker.can_execute(&pair.pair_id, max_contracts).await {
+            warn!(
+                "[EXEC] ⛔ Circuit breaker blocked: {} | market={} | pair={} | contracts={}",
+                reason, pair.description, pair.pair_id, max_contracts
+            );
             self.release_in_flight(market_id);
             return Ok(ExecutionResult {
                 market_id,
@@ -733,10 +739,19 @@ pub async fn run_execution_loop(
                     );
                 }
                 Ok(result) => {
-                    if result.error != Some("Already in-flight") {
+                    // Skip logging for errors that already have detailed logs
+                    let already_logged = matches!(
+                        result.error,
+                        Some("Already in-flight") | Some("Insufficient liquidity")
+                    );
+                    if !already_logged {
+                        let detail = engine.state.get_by_id(result.market_id)
+                            .and_then(|m| m.pair())
+                            .map(|p| format!("{} ({})", p.description, p.pair_id))
+                            .unwrap_or_else(|| format!("market_id={}", result.market_id));
                         warn!(
-                            "[EXEC] ⚠️ market_id={}: {:?}",
-                            result.market_id, result.error
+                            "[EXEC] ⚠️ {}: {:?}",
+                            detail, result.error
                         );
                     }
                 }

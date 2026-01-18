@@ -146,6 +146,42 @@ DRY_RUN=0 CONTROLLER_PLATFORMS=kalshi cargo run -p controller --release
 DISCOVERY_ONLY=1 FORCE_DISCOVERY=1 cargo run -p controller --release
 ```
 
+### Heartbeat Output
+
+The controller displays a heartbeat every 10 seconds (configurable) with market status. The table shows price update deltas since the last heartbeat.
+
+**Default Mode** - Compact table showing markets by league and type:
+```
+[14:32:05] 💓 234 markets | K:892 P:1847 updates/min
+📊 Best opportunity: NBA Game | P_yes(34¢) + K_no(33¢) + K_fee(2¢) = 69¢ | gap=-31¢ | max=50x
+┌──────────┬────────────┬────────────┬────────────┬────────────┐
+│ League   │ Moneyline  │ Spread     │ Total      │ BTTS       │
+├──────────┼────────────┼────────────┼────────────┼────────────┤
+│ nba      │ 8 (+42)    │ 12 (+89)   │ 6 (+45)    │ -          │
+│ epl      │ 6 (+17)    │ 4 (+23)    │ 3 (+12)    │ 5 (+34)    │
+└──────────┴────────────┴────────────┴────────────┴────────────┘
+```
+The `(+N)` shows price updates since the last heartbeat (delta, not cumulative).
+
+**Configuration:**
+```bash
+# Change heartbeat interval (default: 10 seconds)
+HEARTBEAT_INTERVAL_SECS=5 cargo run -p controller --release
+# Or via CLI flag
+cargo run -p controller --release -- --heartbeat-interval 5
+```
+
+**Verbose Mode** - Hierarchical tree with per-market details:
+```bash
+# Enable via environment variable
+VERBOSE_HEARTBEAT=1 cargo run -p controller --release
+
+# Or via CLI flag
+cargo run -p controller --release -- --verbose-heartbeat
+```
+
+Shows each market with prices (K:yes/no, P:yes/no), gap from threshold, and update counts.
+
 ## Remote Trader (Optional)
 
 For distributed execution across machines:
@@ -176,6 +212,8 @@ See `trader/README.md` for setup and required environment variables.
 |----------|---------|-------------|
 | `DRY_RUN` | `1` | `1` or `true` = paper trading, `0` = live execution |
 | `RUST_LOG` | `info` | Logging level (`debug`, `info`, `warn`, `error`) |
+| `VERBOSE_HEARTBEAT` | `false` | `1` or `true` = show detailed hierarchical heartbeat output (or use `--verbose-heartbeat` CLI flag) |
+| `HEARTBEAT_INTERVAL_SECS` | `10` | Seconds between heartbeat updates (or use `--heartbeat-interval N` CLI flag) |
 
 ### Discovery & Market Configuration
 
@@ -185,7 +223,6 @@ See `trader/README.md` for setup and required environment variables.
 | `FORCE_DISCOVERY` | `false` | `1` or `true` = clear cache and re-fetch all markets |
 | `DISCOVERY_INTERVAL_MINS` | `15` | Minutes between discovery refreshes (0 = disabled) |
 | `ENABLED_LEAGUES` | *(all)* | Comma-separated leagues to monitor (see below) |
-| `PRICE_LOGGING` | `false` | `1` or `true` = enable detailed price logging (performance impact) |
 
 **Supported leagues**: `epl`, `bundesliga`, `laliga`, `seriea`, `ligue1`, `ucl`, `uel`, `eflc`, `nba`, `nfl`, `nhl`, `mlb`, `mls`, `ncaaf`, `cs2`, `lol`, `cod`
 
@@ -242,6 +279,97 @@ Example: `ENABLED_LEAGUES=cs2,lol,cod` to monitor only esports.
 | `POLYMARKET_API_KEY` | Polymarket Gamma API key |
 | `POLYMARKET_API_SECRET` | Polymarket API secret |
 | `POLYMARKET_FUNDER` | Polymarket wallet address (falls back to `POLY_FUNDER`) |
+
+---
+
+## Token Assignment (Kalshi ↔ Polymarket Mapping)
+
+When pairing Kalshi markets with Polymarket, the bot must correctly assign which Polymarket token corresponds to "YES" for the Kalshi market. This is critical - incorrect assignment means betting on the **same team** instead of opposite outcomes.
+
+### The Problem
+
+Kalshi tickers contain a team suffix (e.g., `MUN` in `KXEPLSPREAD-26JAN18MUNEVE-MUN1`), but Polymarket outcomes may be:
+- **Team names**: `["Manchester United FC", "Everton FC"]`
+- **Yes/No**: `["Yes", "No"]` (team-specific markets like "Will MUN win?")
+
+The suffix `MUN` is **not** a substring of `"Manchester United FC"`, so naive matching fails.
+
+### Token Assignment Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Polymarket API returns: token1, token2, outcomes                │
+└─────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ CHECK FIRST: Are outcomes ["Yes", "No"] or ["Over", "Under"]?   │
+│                                                                 │
+│ Examples:                                                       │
+│ - epl-ars-mun-2026-01-25-mun → outcomes=["Yes", "No"]          │
+│ - nba-lal-bos-spread-lal-5pt5 → outcomes=["Yes", "No"]         │
+│ - nba-lal-bos-total-220pt5 → outcomes=["Over", "Under"]        │
+└─────────────────────────────────────────────────────────────────┘
+                                   │
+                    ┌──────────────┴──────────────┐
+                    │                             │
+              YES (is Yes/No)               NO (team names)
+                    │                             │
+                    ▼                             ▼
+┌─────────────────────────┐   ┌───────────────────────────────────┐
+│ Use API order:          │   │ Match Kalshi suffix to outcomes:  │
+│ token1 = YES            │   │ 1. Direct substring match         │
+│ token2 = NO             │   │ 2. team_search_terms() lookup     │
+│                         │   │ 3. Fallback to API order (warn)   │
+└─────────────────────────┘   └───────────────────────────────────┘
+```
+
+### Concrete Example: Manchester United Spread
+
+**Phase 1: Kalshi Market Discovery**
+```
+Ticker: KXEPLSPREAD-26JAN18MUNEVE-MUN1
+        └─────────────┬──────────────┘
+                      │
+Extracted: team1=MUN (away), team2=EVE (home), suffix=MUN1
+```
+
+**Phase 2: Polymarket Gamma API Lookup**
+```
+Slug: epl-mun-eve-2026-01-18-spread-away-1pt5
+
+Response:
+  token1: "0x1234abcd..."
+  token2: "0x5678efgh..."
+  outcomes: ["Manchester United FC", "Everton FC"]
+```
+
+**Phase 3: Token Assignment**
+```
+suffix = "MUN1" → team_code = "mun" (strip numeric)
+
+Direct match: "manchester united fc".contains("mun") = FALSE
+
+Lookup: team_search_terms("epl", "mun") = ["manchester", "man utd", "united"]
+
+Search term match: "manchester united fc".contains("manchester") = TRUE
+
+Result: token1 = YES (Man United), token2 = NO (Everton)
+```
+
+### Team Search Terms
+
+For team codes that aren't substrings of full names, `cache::team_search_terms()` provides searchable fragments:
+
+| Code | Team | Search Terms |
+|------|------|--------------|
+| `MUN` | Manchester United | `["manchester", "man utd", "united"]` |
+| `NFO` | Nottingham Forest | `["nottingham", "forest"]` |
+| `AVL` | Aston Villa | `["aston", "villa"]` |
+| `LAL` | Los Angeles Lakers | `["lakers", "los angeles"]` |
+| `KC` | Kansas City Chiefs | `["chiefs", "kansas city"]` |
+
+See `controller/src/cache.rs` for the complete mapping across all supported leagues.
 
 ---
 

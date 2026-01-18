@@ -73,29 +73,13 @@ pub const KALSHI_API_DELAY_MS: u64 = 60;
 /// WebSocket reconnect delay (seconds)
 pub const WS_RECONNECT_DELAY_SECS: u64 = 5;
 
-/// Enable verbose heartbeat output with per-market details.
-/// - Set `VERBOSE_HEARTBEAT=1` or pass `--verbose-heartbeat`.
-pub fn verbose_heartbeat_enabled() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("VERBOSE_HEARTBEAT")
-            .map(|v| v == "1" || v.to_lowercase() == "true" || v.to_lowercase() == "yes")
-            .unwrap_or(false)
-    })
-}
-
-/// Heartbeat interval in seconds for the diagnostics loop.
-/// - Set `HEARTBEAT_INTERVAL_SECS=N` or pass `--heartbeat-interval N`.
-pub fn heartbeat_interval_secs() -> u64 {
-    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("HEARTBEAT_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0 && *v <= 3600)
-            .unwrap_or(10)
-    })
-}
+/// Maximum tokens per Polymarket WebSocket connection.
+///
+/// Polymarket's WebSocket API has an undocumented limit of ~500 tokens per connection.
+/// Exceeding this causes silent subscription failures or connection drops without error messages.
+/// Discovered through production testing - connections with >500 tokens would stop receiving
+/// updates for some tokens with no indication of the problem.
+pub const POLY_MAX_TOKENS_PER_WS: usize = 500;
 
 /// Which leagues to monitor (empty = all)
 /// Set ENABLED_LEAGUES env var to comma-separated list, e.g., "cs2,lol,cod"
@@ -113,26 +97,24 @@ pub fn enabled_leagues() -> &'static [String] {
 /// Enable verbose pairing/matching debug logs (emoji-tagged).
 ///
 /// This is intentionally an `info!`-level debug mode so it can be enabled without changing `RUST_LOG`.
-/// - Set `PAIRING_DEBUG=1` to enable.
+/// - Set `PAIRING_DEBUG=1` or use `--pairing-debug` CLI flag to enable.
+///
+/// Note: No caching - allows CLI flags to override env vars after startup.
 pub fn pairing_debug_enabled() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("PAIRING_DEBUG")
-            .map(|v| v == "1" || v.to_lowercase() == "true" || v.to_lowercase() == "yes")
-            .unwrap_or(false)
-    })
+    std::env::var("PAIRING_DEBUG")
+        .map(|v| v == "1" || v.to_lowercase() == "true" || v.to_lowercase() == "yes")
+        .unwrap_or(false)
 }
 
 /// Maximum per-league pairing debug lines emitted for individual market attempts.
-/// - Set `PAIRING_DEBUG_LIMIT=<N>` to override.
+/// - Set `PAIRING_DEBUG_LIMIT=<N>` or use `--pairing-debug-limit <N>` CLI flag to override.
+///
+/// Note: No caching - allows CLI flags to override env vars after startup.
 pub fn pairing_debug_limit() -> usize {
-    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("PAIRING_DEBUG_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(200)
-    })
+    std::env::var("PAIRING_DEBUG_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200)
 }
 
 /// Which leagues to discover but not trade (monitor only)
@@ -153,14 +135,35 @@ pub fn is_league_disabled(league: &str) -> bool {
     disabled_leagues().contains(&league.to_lowercase())
 }
 
-/// Price logging enabled (set PRICE_LOGGING=1 to enable)
-#[allow(dead_code)]
-pub fn price_logging_enabled() -> bool {
+/// Enable verbose heartbeat output with hierarchical tree view.
+/// Set `VERBOSE_HEARTBEAT=1` or use `--verbose-heartbeat` CLI flag.
+pub fn verbose_heartbeat_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("PRICE_LOGGING")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
+        std::env::var("VERBOSE_HEARTBEAT")
+            .map(|v| v == "1" || v.to_lowercase() == "true" || v.to_lowercase() == "yes")
             .unwrap_or(false)
+    })
+}
+
+/// Heartbeat interval in seconds for arbitrage detection loop.
+/// Set `HEARTBEAT_INTERVAL_SECS=N` or use `--heartbeat-interval=N` CLI flag (default: 10 seconds).
+pub fn heartbeat_interval_secs() -> u64 {
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match std::env::var("HEARTBEAT_INTERVAL_SECS") {
+            Ok(v) if !v.is_empty() => match v.parse() {
+                Ok(val) => val,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Invalid HEARTBEAT_INTERVAL_SECS='{}': {} - using default 10s",
+                        v, e
+                    );
+                    10
+                }
+            },
+            _ => 10,
+        }
     })
 }
 
@@ -178,12 +181,15 @@ pub struct LeagueConfig {
     pub poly_series_id: Option<&'static str>,
     /// Kalshi web URL slug for this league (e.g., "counterstrike-2-game")
     pub kalshi_web_slug: &'static str,
+    /// Team order in Kalshi tickers: true = HOME-AWAY (soccer), false = AWAY-HOME (US sports)
+    /// This affects spread slug generation (spread-home vs spread-away).
+    pub home_team_first: bool,
 }
 
 /// Get all supported leagues with their configurations
 pub fn get_league_configs() -> Vec<LeagueConfig> {
     vec![
-        // Major European leagues (full market types)
+        // Major European leagues (full market types) - HOME-AWAY ticker order
         LeagueConfig {
             league_code: "epl",
             poly_prefix: "epl",
@@ -193,6 +199,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: Some("KXEPLBTTS"),
             poly_series_id: None,
             kalshi_web_slug: "premier-league-game",
+            home_team_first: true,
         },
         LeagueConfig {
             league_code: "bundesliga",
@@ -203,6 +210,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: Some("KXBUNDESLIGABTTS"),
             poly_series_id: None,
             kalshi_web_slug: "bundesliga-game",
+            home_team_first: true,
         },
         LeagueConfig {
             league_code: "laliga",
@@ -213,6 +221,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: Some("KXLALIGABTTS"),
             poly_series_id: None,
             kalshi_web_slug: "la-liga-game",
+            home_team_first: true,
         },
         LeagueConfig {
             league_code: "seriea",
@@ -223,6 +232,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: Some("KXSERIEABTTS"),
             poly_series_id: None,
             kalshi_web_slug: "serie-a-game",
+            home_team_first: true,
         },
         LeagueConfig {
             league_code: "ligue1",
@@ -233,6 +243,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: Some("KXLIGUE1BTTS"),
             poly_series_id: None,
             kalshi_web_slug: "ligue-1-game",
+            home_team_first: true,
         },
         LeagueConfig {
             league_code: "ucl",
@@ -243,8 +254,9 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: Some("KXUCLBTTS"),
             poly_series_id: None,
             kalshi_web_slug: "champions-league-game",
+            home_team_first: true,
         },
-        // Secondary European leagues (moneyline only)
+        // Secondary European leagues (moneyline only) - HOME-AWAY ticker order
         LeagueConfig {
             league_code: "uel",
             poly_prefix: "uel",
@@ -254,6 +266,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: None,
             kalshi_web_slug: "europa-league-game",
+            home_team_first: true,
         },
         LeagueConfig {
             league_code: "eflc",
@@ -264,8 +277,21 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: None,
             kalshi_web_slug: "efl-championship-game",
+            home_team_first: true,
         },
-        // US Sports
+        // MLS (soccer) - HOME-AWAY ticker order
+        LeagueConfig {
+            league_code: "mls",
+            poly_prefix: "mls",
+            kalshi_series_game: "KXMLSGAME",
+            kalshi_series_spread: None,
+            kalshi_series_total: None,
+            kalshi_series_btts: None,
+            poly_series_id: None,
+            kalshi_web_slug: "mls-game",
+            home_team_first: true,
+        },
+        // US Sports - AWAY-HOME ticker order
         LeagueConfig {
             league_code: "nba",
             poly_prefix: "nba",
@@ -275,6 +301,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: None,
             kalshi_web_slug: "nba-game",
+            home_team_first: false,
         },
         LeagueConfig {
             league_code: "nfl",
@@ -285,6 +312,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: None,
             kalshi_web_slug: "nfl-game",
+            home_team_first: false,
         },
         LeagueConfig {
             league_code: "nhl",
@@ -295,6 +323,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: None,
             kalshi_web_slug: "nhl-game",
+            home_team_first: false,
         },
         LeagueConfig {
             league_code: "mlb",
@@ -305,16 +334,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: None,
             kalshi_web_slug: "mlb-game",
-        },
-        LeagueConfig {
-            league_code: "mls",
-            poly_prefix: "mls",
-            kalshi_series_game: "KXMLSGAME",
-            kalshi_series_spread: None,
-            kalshi_series_total: None,
-            kalshi_series_btts: None,
-            poly_series_id: None,
-            kalshi_web_slug: "mls-game",
+            home_team_first: false,
         },
         LeagueConfig {
             league_code: "ncaaf",
@@ -325,8 +345,9 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: None,
             kalshi_web_slug: "ncaaf-game",
+            home_team_first: false,
         },
-        // Esports
+        // Esports - no home/away concept, default to false
         LeagueConfig {
             league_code: "cs2",
             poly_prefix: "cs2",
@@ -336,6 +357,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: Some("10310"),
             kalshi_web_slug: "counterstrike-2-game",
+            home_team_first: false,
         },
         LeagueConfig {
             league_code: "lol",
@@ -346,6 +368,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: Some("10311"),
             kalshi_web_slug: "league-of-legends-game",
+            home_team_first: false,
         },
         LeagueConfig {
             league_code: "cod",
@@ -356,6 +379,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_btts: None,
             poly_series_id: Some("10427"),
             kalshi_web_slug: "call-of-duty-game",
+            home_team_first: false,
         },
     ]
 }
@@ -385,10 +409,19 @@ pub fn get_league_config(league: &str) -> Option<LeagueConfig> {
 pub fn discovery_interval_mins() -> u64 {
     static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("DISCOVERY_INTERVAL_MINS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(15)
+        match std::env::var("DISCOVERY_INTERVAL_MINS") {
+            Ok(v) if !v.is_empty() => match v.parse() {
+                Ok(val) => val,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Invalid DISCOVERY_INTERVAL_MINS='{}': {} - using default 15m",
+                        v, e
+                    );
+                    15
+                }
+            },
+            _ => 15,
+        }
     })
 }
 

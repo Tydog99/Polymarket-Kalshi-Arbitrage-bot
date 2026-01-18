@@ -39,12 +39,54 @@ mod types;
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
-use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tailscale::beacon::BeaconSender;
 use tokio::sync::{RwLock, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+/// Global counter for lines printed since last table clear.
+static LINES_SINCE_TABLE: AtomicUsize = AtomicUsize::new(0);
+
+/// Custom tracing layer that counts output lines for table replacement.
+/// Estimates visual lines based on message length and terminal width.
+struct LineCountingLayer;
+
+impl<S> tracing_subscriber::Layer<S> for LineCountingLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        // Get actual terminal width, fallback to 80
+        let term_width = terminal_size::terminal_size()
+            .map(|(w, _)| w.0 as usize)
+            .unwrap_or(80);
+
+        // Extract message length from event
+        struct MsgLen(usize);
+        impl tracing::field::Visit for MsgLen {
+            fn record_debug(&mut self, _field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0 += format!("{:?}", value).len();
+            }
+            fn record_str(&mut self, _field: &tracing::field::Field, value: &str) {
+                self.0 += value.len();
+            }
+        }
+
+        let mut visitor = MsgLen(60); // Base overhead for timestamp, level, target, emojis
+        event.record(&mut visitor);
+
+        // Calculate visual lines - be conservative (emojis take 2 chars, add buffer)
+        // Use 1.5x message length estimate and always at least 1 line
+        let visual_lines = ((visitor.0 * 3 / 2) / term_width).max(1) + 1;
+        LINES_SINCE_TABLE.fetch_add(visual_lines, Ordering::Relaxed);
+    }
+}
 
 use cache::TeamCache;
 use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
@@ -283,6 +325,55 @@ fn parse_bool_env(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Deduplicate market names that have repeated prefixes.
+/// e.g., "Union Berlin vs Dortmund - Union Berlin vs Dortmund Winner?"
+///    -> "Union Berlin vs Dortmund Winner?"
+fn deduplicate_market_name(description: &str) -> String {
+    if let Some(sep_pos) = description.find(" - ") {
+        let prefix = &description[..sep_pos];
+        let suffix = &description[sep_pos + 3..];
+        // If suffix starts with prefix, keep only suffix
+        if suffix.starts_with(prefix) {
+            return suffix.to_string();
+        }
+    }
+    description.to_string()
+}
+
+/// Strip redundant market type text from description when displayed under a type header.
+/// e.g., "Leeds at Everton: Spreads - Everton wins by..." -> "Leeds at Everton - Everton wins by..."
+///       "Leeds at Everton: Totals 2.5" -> "Leeds at Everton 2.5"
+///       "Leeds at Everton: Both Teams to Score" -> "Leeds at Everton"
+///       "Leeds vs Everton Winner?" -> "Leeds vs Everton"
+fn strip_market_type_suffix(description: &str, market_type: &types::MarketType) -> String {
+    match market_type {
+        types::MarketType::Moneyline => {
+            description
+                .replace(" Winner?", "")
+                .replace(" Winner", "")
+                .replace("(Tie)", "(Draw)")
+                .replace("(tie)", "(Draw)")
+        }
+        types::MarketType::Spread => {
+            description
+                .replace(": Spreads - ", " - ")
+                .replace(": Spreads ", " ")
+                .replace(" wins by over ", " by ")
+                .replace(" goals?", "")
+        }
+        types::MarketType::Total => {
+            description
+                .replace(": Totals ", " ")
+                .replace(": Totals", "")
+        }
+        types::MarketType::Btts => {
+            description
+                .replace(": Both Teams to Score", "")
+                .replace(" Both Teams to Score", "")
+        }
+    }
+}
+
 fn parse_ws_platforms() -> Vec<WsPlatform> {
     // Default to both platforms.
     let raw =
@@ -297,21 +388,114 @@ fn parse_ws_platforms() -> Vec<WsPlatform> {
         .collect()
 }
 
+/// Maximum number of log files to retain in the logs directory
+const MAX_LOG_FILES: usize = 10;
+
+/// Initialize logging with both console and file output.
+///
+/// Returns the log file path and a [`WorkerGuard`] that **must be kept alive** for the
+/// entire duration of the program. The guard ensures buffered logs are flushed on shutdown.
+/// Dropping the guard early will cause log loss.
+///
+/// # Usage
+/// ```ignore
+/// let (log_path, _log_guard) = init_logging();
+/// // _log_guard lives until main() exits, ensuring all logs are flushed
+/// ```
+fn init_logging() -> (PathBuf, WorkerGuard) {
+    use chrono::Local;
+
+    // Create logs directory in project root (same level as Cargo.toml)
+    let logs_dir = PathBuf::from(".logs");
+    std::fs::create_dir_all(&logs_dir).expect("Failed to create logs directory");
+
+    // Generate timestamped filename: controller-2026-01-17-143052.log
+    let timestamp = Local::now().format("%Y-%m-%d-%H%M%S");
+    let log_filename = format!("controller-{}.log", timestamp);
+    let log_path = logs_dir.join(&log_filename);
+
+    // Get absolute path for logging (canonicalize requires file to exist, so we build it manually)
+    let absolute_log_path = std::env::current_dir()
+        .map(|cwd| cwd.join(&log_path))
+        .unwrap_or_else(|_| log_path.clone());
+
+    // Clean up old log files, keeping only the most recent MAX_LOG_FILES
+    cleanup_old_logs(&logs_dir, MAX_LOG_FILES);
+
+    // Create non-blocking file appender
+    let file_appender = tracing_appender::rolling::never(&logs_dir, &log_filename);
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    // Build env filter
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info")
+            .add_directive("controller=info".parse().unwrap())
+            .add_directive("arb_bot=info".parse().unwrap())
+    });
+
+    // Create timer for consistent formatting
+    let timer = tracing_subscriber::fmt::time::ChronoLocal::new("[%H:%M:%S]".to_string());
+
+    // Console layer with color support
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_timer(timer.clone())
+        .with_ansi(true);
+
+    // File layer without ANSI codes
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_timer(timer)
+        .with_ansi(false)
+        .with_writer(non_blocking);
+
+    // Combine layers (including LineCountingLayer for table replacement)
+    tracing_subscriber::registry()
+        .with(LineCountingLayer)
+        .with(env_filter)
+        .with(console_layer)
+        .with(file_layer)
+        .init();
+
+    (absolute_log_path, guard)
+}
+
+/// Remove old log files, keeping only the most recent `keep_count` files.
+fn cleanup_old_logs(logs_dir: &PathBuf, keep_count: usize) {
+    let Ok(entries) = std::fs::read_dir(logs_dir) else {
+        return;
+    };
+
+    // Collect log files with their modification times
+    let mut log_files: Vec<(PathBuf, std::time::SystemTime)> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "log")
+                .unwrap_or(false)
+        })
+        .filter_map(|e| {
+            e.metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|t| (e.path(), t))
+        })
+        .collect();
+
+    // Sort by modification time (newest first)
+    log_files.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Remove files beyond keep_count
+    for (path, _) in log_files.into_iter().skip(keep_count) {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging with compact local time format [HH:MM:SS]
-    // Note: the binary crate is `controller`, while the shared library crate is `arb_bot`.
-    // If the user doesn't set `RUST_LOG`, we still want `info` logs from both crates.
-    tracing_subscriber::fmt()
-        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new("[%H:%M:%S]".to_string()))
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("info")
-                    .add_directive("controller=info".parse().unwrap())
-                    .add_directive("arb_bot=info".parse().unwrap())
-            }),
-        )
-        .init();
+    // Initialize logging with both console and file output
+    // The guard must be kept alive for the duration of the program to ensure logs are flushed
+    let (log_file_path, _log_guard) = init_logging();
+    info!("📝 Logging to: {}", log_file_path.display());
 
     // Load environment variables from `.env` (supports workspace-root `.env`)
     paths::load_dotenv();
@@ -390,7 +574,14 @@ async fn main() -> Result<()> {
     // Examples:
     //   cargo run -p controller -- --leagues nba
     //   cargo run -p controller -- --leagues nba,nfl --pairing-debug --pairing-debug-limit 50
+    //   cargo run -p controller -- --verbose-heartbeat --heartbeat-interval 5
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if cli_has_flag(&args, "--verbose-heartbeat") {
+        std::env::set_var("VERBOSE_HEARTBEAT", "1");
+    }
+    if let Some(v) = cli_arg_value(&args, "--heartbeat-interval") {
+        std::env::set_var("HEARTBEAT_INTERVAL_SECS", v);
+    }
     if cli_has_flag(&args, "--pairing-debug") {
         std::env::set_var("PAIRING_DEBUG", "1");
     }
@@ -888,22 +1079,52 @@ async fn main() -> Result<()> {
     let heartbeat_threshold = threshold_cents;
     let heartbeat_handle = tokio::spawn(async move {
         use crate::types::kalshi_fee_cents;
+        use std::collections::HashMap;
+
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
             config::heartbeat_interval_secs(),
         ));
+
+        // Track previous update totals for delta calculation
+        let mut prev_kalshi_updates: u64 = 0;
+        let mut prev_poly_updates: u64 = 0;
+
+        // Clear line counter from startup logs before first heartbeat
+        LINES_SINCE_TABLE.store(0, Ordering::SeqCst);
+
+        // Track previous stats for delta calculation
+        let mut prev_league_type_stats: HashMap<(String, MarketType), (u32, u32)> = HashMap::new();
         loop {
             interval.tick().await;
             let market_count = heartbeat_state.market_count();
             let verbose = config::verbose_heartbeat_enabled();
             let now_ms = now_unix_ms();
-            let mut with_kalshi = 0;
-            let mut with_poly = 0;
-            let mut with_both = 0;
-            let mut max_k_age_ms: u64 = 0;
-            let mut max_p_age_ms: u64 = 0;
 
-            // In verbose mode, collect a sample of markets to print.
-            let mut verbose_lines: Vec<String> = Vec::new();
+            // Aggregate stats by (league, market_type)
+            // Value: (market_count, kalshi_updates, poly_updates)
+            let mut league_type_stats: HashMap<(String, MarketType), (usize, u32, u32)> = HashMap::new();
+
+            // For verbose mode: collect market details
+            struct MarketDetail {
+                description: String,
+                league: String,
+                market_type: MarketType,
+                k_yes: u16,
+                k_no: u16,
+                p_yes: u16,
+                p_no: u16,
+                gap: i16,
+                k_updates: u32,
+                p_updates: u32,
+                k_last_ms: u64,
+                p_last_ms: u64,
+            }
+            let mut market_details: Vec<MarketDetail> = Vec::new();
+
+            // Totals for header
+            let mut total_kalshi_updates: u64 = 0;
+            let mut total_poly_updates: u64 = 0;
+            let mut with_both = 0usize;
             // Track best arbitrage opportunity:
             // (total_cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no, max_contracts)
             #[allow(clippy::type_complexity)]
@@ -912,43 +1133,51 @@ async fn main() -> Result<()> {
             for market in heartbeat_state.markets.iter().take(market_count) {
                 let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
                 let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.load();
+                let (k_upd, p_upd) = market.load_update_counts();
                 let (k_last_ms, p_last_ms) = market.last_updates_unix_ms();
+
+                total_kalshi_updates += k_upd as u64;
+                total_poly_updates += p_upd as u64;
 
                 let has_k = k_yes > 0 && k_no > 0;
                 let has_p = p_yes > 0 && p_no > 0;
-                if k_yes > 0 || k_no > 0 { with_kalshi += 1; }
-                if p_yes > 0 || p_no > 0 { with_poly += 1; }
 
-                if k_last_ms > 0 && k_last_ms <= now_ms {
-                    max_k_age_ms = max_k_age_ms.max(now_ms - k_last_ms);
-                }
-                if p_last_ms > 0 && p_last_ms <= now_ms {
-                    max_p_age_ms = max_p_age_ms.max(now_ms - p_last_ms);
-                }
+                // Aggregate by league/type
+                if let Some(pair) = market.pair() {
+                    let key = (pair.league.to_string(), pair.market_type);
+                    let entry = league_type_stats.entry(key).or_insert((0, 0, 0));
+                    entry.0 += 1;
+                    entry.1 += k_upd;
+                    entry.2 += p_upd;
 
-                if verbose && verbose_lines.len() < 25 {
-                    if let Some(pair) = market.pair() {
-                        let k_age = fmt_age(now_ms, k_last_ms);
-                        let p_age = fmt_age(now_ms, p_last_ms);
-                        let k_time = fmt_unix_ms_hhmmss(k_last_ms);
-                        let p_time = fmt_unix_ms_hhmmss(p_last_ms);
-                        verbose_lines.push(format!(
-                            "[{}] {} | K y/n={}/{} sz={}/{} last={} ({} ago) | P y/n={}/{} sz={}/{} last={} ({} ago)",
-                            market.market_id,
-                            pair.description,
+                    // For verbose mode, collect ALL discovered markets (not just those with both prices)
+                    if verbose {
+                        // Calculate gap only if both platforms have prices
+                        let gap = if has_k && has_p {
+                            let fee1 = kalshi_fee_cents(k_no);
+                            let cost1 = p_yes + k_no + fee1;
+                            let fee2 = kalshi_fee_cents(k_yes);
+                            let cost2 = k_yes + fee2 + p_no;
+                            let best_cost = cost1.min(cost2);
+                            best_cost as i16 - heartbeat_threshold as i16
+                        } else {
+                            i16::MAX // Sentinel value indicating no gap calculable
+                        };
+
+                        market_details.push(MarketDetail {
+                            description: pair.description.to_string(),
+                            league: pair.league.to_string(),
+                            market_type: pair.market_type,
                             k_yes,
                             k_no,
-                            k_yes_size,
-                            k_no_size,
-                            k_time,
-                            k_age,
                             p_yes,
                             p_no,
-                            p_yes_size,
-                            p_no_size,
-                            p_time,
-                            p_age
-                        ));
+                            gap,
+                            k_updates: k_upd,
+                            p_updates: p_upd,
+                            k_last_ms,
+                            p_last_ms,
+                        });
                     }
                 }
 
@@ -985,30 +1214,123 @@ async fn main() -> Result<()> {
                 }
             }
 
-            let now = chrono::Local::now().format("%H:%M:%S");
-            let max_k_age = if max_k_age_ms == 0 { "--".to_string() } else { fmt_age(now_ms, now_ms.saturating_sub(max_k_age_ms)) };
-            let max_p_age = if max_p_age_ms == 0 { "--".to_string() } else { fmt_age(now_ms, now_ms.saturating_sub(max_p_age_ms)) };
-            print!(
-                "\r[{}]  INFO 💓 {} markets | K:{} (max_age {}) P:{} (max_age {}) Both:{} | threshold={}¢    ",
-                now,
-                market_count,
-                with_kalshi,
-                max_k_age,
-                with_poly,
-                max_p_age,
-                with_both,
-                heartbeat_threshold
-            );
-            let _ = std::io::stdout().flush();
+            // Calculate update deltas since last heartbeat
+            let kalshi_delta = total_kalshi_updates.saturating_sub(prev_kalshi_updates);
+            let poly_delta = total_poly_updates.saturating_sub(prev_poly_updates);
+            prev_kalshi_updates = total_kalshi_updates;
+            prev_poly_updates = total_poly_updates;
 
             if verbose {
+                // Verbose mode: hierarchical tree view
                 println!();
-                info!("💓 VERBOSE heartbeat snapshot @ {} (showing up to {} markets)", now, verbose_lines.len());
-                for line in &verbose_lines {
-                    info!("  {}", line);
+                info!("💓 VERBOSE - {} markets", market_count);
+                println!();
+
+                // Group by league, then by market type
+                let mut by_league: HashMap<String, Vec<&MarketDetail>> = HashMap::new();
+                for detail in &market_details {
+                    by_league.entry(detail.league.clone()).or_default().push(detail);
                 }
+
+                let mut sorted_leagues: Vec<_> = by_league.keys().cloned().collect();
+                sorted_leagues.sort();
+
+                for league in sorted_leagues {
+                    let markets = by_league.get(&league).unwrap();
+                    let league_updates: u64 = markets.iter().map(|m| m.k_updates as u64 + m.p_updates as u64).sum();
+
+                    println!("📊 {} ({} markets, {} updates)",
+                             league.to_uppercase(), markets.len(), league_updates);
+
+                    // Group by market type
+                    let mut by_type: HashMap<MarketType, Vec<&&MarketDetail>> = HashMap::new();
+                    for m in markets {
+                        by_type.entry(m.market_type).or_default().push(m);
+                    }
+
+                    let type_order = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+                    let type_count = by_type.len();
+                    let mut type_idx = 0;
+
+                    for mt in type_order.iter() {
+                        if let Some(type_markets) = by_type.get_mut(mt) {
+                            // Sort markets by description to group by event
+                            type_markets.sort_by(|a, b| a.description.cmp(&b.description));
+
+                            type_idx += 1;
+                            let is_last_type = type_idx == type_count;
+                            let branch = if is_last_type { "└" } else { "├" };
+
+                            println!("{}─ {:?} ({})", branch, mt, type_markets.len());
+
+                            // Show all markets
+                            for (i, m) in type_markets.iter().enumerate() {
+                                let is_last = i == type_markets.len() - 1;
+                                let prefix = if is_last_type { " " } else { "│" };
+                                let item_branch = if is_last { "└" } else { "├" };
+
+                                // Strip redundant market type, deduplicate, and truncate to 55 chars
+                                // Use char-aware truncation to avoid panic on UTF-8 boundaries
+                                let stripped = strip_market_type_suffix(&m.description, mt);
+                                let deduped = deduplicate_market_name(&stripped);
+                                let desc: String = if deduped.chars().count() > 55 {
+                                    let truncated: String = deduped.chars().take(52).collect();
+                                    format!("{}...", truncated)
+                                } else {
+                                    deduped
+                                };
+
+                                // Format Kalshi prices (-- if no prices)
+                                let k_str = if m.k_yes > 0 && m.k_no > 0 {
+                                    format!("{:02}/{:02}", m.k_yes, m.k_no)
+                                } else {
+                                    "--/--".to_string()
+                                };
+
+                                // Format Polymarket prices (-- if no prices)
+                                let p_str = if m.p_yes > 0 && m.p_no > 0 {
+                                    format!("{:02}/{:02}", m.p_yes, m.p_no)
+                                } else {
+                                    "--/--".to_string()
+                                };
+
+                                // Format gap (-- if not calculable)
+                                let gap_str = if m.gap == i16::MAX {
+                                    "\x1b[33m--\x1b[0m".to_string() // Yellow for missing
+                                } else if m.gap < 0 {
+                                    format!("\x1b[32m{:+}¢\x1b[0m", m.gap) // Green for arb
+                                } else {
+                                    format!("{:+}¢", m.gap)
+                                };
+
+                                let k_time = fmt_unix_ms_hhmmss(m.k_last_ms);
+                                let p_time = fmt_unix_ms_hhmmss(m.p_last_ms);
+                                let k_age = fmt_age(now_ms, m.k_last_ms);
+                                let p_age = fmt_age(now_ms, m.p_last_ms);
+
+                                println!(
+                                    "{}  {}── {:30} K:{} P:{} gap:{} upd:K{}/P{} last:K{}({}) P{}({})",
+                                         prefix, item_branch, desc,
+                                         k_str, p_str,
+                                         gap_str, m.k_updates, m.p_updates,
+                                         k_time, k_age, p_time, p_age
+                                );
+                            }
+                        }
+                    }
+                    println!();
+                }
+
+                println!("Legend: gap = cost - {}¢ | negative = arb opportunity", heartbeat_threshold);
+                println!();
+            } else {
+                // Default mode: compact summary
+                println!();
+                info!("💓 {} markets | K:{} P:{} updates/min",
+                      market_count, kalshi_delta, poly_delta);
             }
 
+            // Log best opportunity
             if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes, max_contracts)) = best_arb {
                 let gap = cost as i16 - heartbeat_threshold as i16;
                 let pair = heartbeat_state.get_by_id(market_id)
@@ -1059,8 +1381,68 @@ async fn main() -> Result<()> {
                     }
                 }
             } else if with_both == 0 {
-                println!();  // Move to new line before warning
                 warn!("⚠️  No markets with both Kalshi and Polymarket prices - verify WebSocket connections");
+            }
+
+            // Print league summary table (replaces previous table using ANSI escape codes)
+            let market_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+            let type_headers = ["Moneyline", "Spread", "Total", "BTTS"];
+
+            let mut leagues: Vec<String> = league_type_stats.keys()
+                .map(|(l, _)| l.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            leagues.sort();
+
+            if !leagues.is_empty() {
+                static PREV_TABLE_LINES: AtomicUsize = AtomicUsize::new(0);
+
+                // Get lines logged since last table and reset counter
+                let extra_lines = LINES_SINCE_TABLE.swap(0, Ordering::SeqCst);
+                let prev_lines = PREV_TABLE_LINES.load(Ordering::Relaxed);
+
+                // Only replace table if few/no interleaved logs (preserve important logs)
+                // If many logs appeared, just print fresh table below them
+                // In verbose mode, skip replacement since println!() lines aren't tracked
+                if prev_lines > 0 && extra_lines <= 3 && !verbose {
+                    use std::io::Write;
+                    // Move up to start of previous table, clear to end of screen
+                    print!("\x1b[{}A\x1b[J", prev_lines);
+                    std::io::stdout().flush().ok();
+                }
+
+                // Print header
+                println!("┌──────────┬────────────┬────────────┬────────────┬────────────┐");
+                println!("│ {:8} │ {:^10} │ {:^10} │ {:^10} │ {:^10} │",
+                         "League", type_headers[0], type_headers[1], type_headers[2], type_headers[3]);
+                println!("├──────────┼────────────┼────────────┼────────────┼────────────┤");
+
+                for league in &leagues {
+                    let mut cells: Vec<String> = Vec::new();
+                    for mt in &market_types {
+                        if let Some(&(count, k_upd, p_upd)) = league_type_stats.get(&(league.clone(), *mt)) {
+                            let key = (league.clone(), *mt);
+                            let (prev_k, prev_p) = prev_league_type_stats.get(&key).copied().unwrap_or((0, 0));
+                            let delta = (k_upd.saturating_sub(prev_k)) + (p_upd.saturating_sub(prev_p));
+                            cells.push(format!("{} (+{})", count, delta));
+                        } else {
+                            cells.push("-".to_string());
+                        }
+                    }
+                    println!("│ {:8} │ {:^10} │ {:^10} │ {:^10} │ {:^10} │",
+                             league, cells[0], cells[1], cells[2], cells[3]);
+                }
+
+                println!("└──────────┴────────────┴────────────┴────────────┴────────────┘");
+
+                // Update previous stats for next iteration
+                for (key, &(_, k_upd, p_upd)) in &league_type_stats {
+                    prev_league_type_stats.insert(key.clone(), (k_upd, p_upd));
+                }
+
+                // Store table height: 3 header lines + league rows + 1 footer
+                PREV_TABLE_LINES.store(4 + leagues.len(), Ordering::Relaxed);
             }
         }
     });
@@ -1085,4 +1467,174 @@ async fn main() -> Result<()> {
     let _ = tokio::join!(kalshi_handle, poly_handle, heartbeat_handle, exec_handle, discovery_handle);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deduplicate_market_name_with_duplicate_prefix() {
+        // Full duplication with additional text
+        assert_eq!(
+            deduplicate_market_name("Union Berlin vs Dortmund - Union Berlin vs Dortmund Winner?"),
+            "Union Berlin vs Dortmund Winner?"
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_market_name_exact_duplicate() {
+        // Exact duplicate on both sides
+        assert_eq!(
+            deduplicate_market_name("Dortmund at Union Berlin: Totals - Dortmund at Union Berlin: Totals"),
+            "Dortmund at Union Berlin: Totals"
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_market_name_no_separator() {
+        // No separator - should return unchanged
+        assert_eq!(
+            deduplicate_market_name("Simple Market Name"),
+            "Simple Market Name"
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_market_name_no_duplicate() {
+        // Has separator but suffix doesn't start with prefix
+        assert_eq!(
+            deduplicate_market_name("Team A vs Team B - Winner takes all"),
+            "Team A vs Team B - Winner takes all"
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_market_name_partial_match() {
+        // Prefix is partial match but not exact start
+        assert_eq!(
+            deduplicate_market_name("Lakers vs Celtics - Lakers win by 10+"),
+            "Lakers vs Celtics - Lakers win by 10+"
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_market_name_spread_example() {
+        // Real spread market example
+        assert_eq!(
+            deduplicate_market_name("Lakers at Celtics: Spread - Lakers at Celtics: Spread +5.5"),
+            "Lakers at Celtics: Spread +5.5"
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_market_name_empty() {
+        assert_eq!(deduplicate_market_name(""), "");
+    }
+
+    #[test]
+    fn test_deduplicate_market_name_only_separator() {
+        assert_eq!(deduplicate_market_name(" - "), "");
+    }
+
+    // Tests for strip_market_type_suffix
+
+    #[test]
+    fn test_strip_spread_suffix() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Leeds at Everton: Spreads - Everton wins by over 1.5 goals?",
+                &types::MarketType::Spread
+            ),
+            "Leeds at Everton - Everton by 1.5"
+        );
+    }
+
+    #[test]
+    fn test_strip_spread_suffix_short() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Leeds at Everton - Manchester City wins by over 2.5 goals?",
+                &types::MarketType::Spread
+            ),
+            "Leeds at Everton - Manchester City by 2.5"
+        );
+    }
+
+    #[test]
+    fn test_strip_totals_suffix() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Leeds at Everton: Totals 2.5",
+                &types::MarketType::Total
+            ),
+            "Leeds at Everton 2.5"
+        );
+    }
+
+    #[test]
+    fn test_strip_totals_suffix_no_value() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Leeds at Everton: Totals",
+                &types::MarketType::Total
+            ),
+            "Leeds at Everton"
+        );
+    }
+
+    #[test]
+    fn test_strip_btts_suffix() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Leeds at Everton: Both Teams to Score",
+                &types::MarketType::Btts
+            ),
+            "Leeds at Everton"
+        );
+    }
+
+    #[test]
+    fn test_strip_moneyline_unchanged() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Leeds at Everton - Everton wins",
+                &types::MarketType::Moneyline
+            ),
+            "Leeds at Everton - Everton wins"
+        );
+    }
+
+    #[test]
+    fn test_strip_moneyline_winner() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Union Berlin vs Dortmund Winner?",
+                &types::MarketType::Moneyline
+            ),
+            "Union Berlin vs Dortmund"
+        );
+    }
+
+    #[test]
+    fn test_strip_moneyline_winner_no_question() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Union Berlin vs Dortmund Winner",
+                &types::MarketType::Moneyline
+            ),
+            "Union Berlin vs Dortmund"
+        );
+    }
+
+    #[test]
+    fn test_strip_moneyline_tie_to_draw() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Union Berlin vs Dortmund (Tie)",
+                &types::MarketType::Moneyline
+            ),
+            "Union Berlin vs Dortmund (Draw)"
+        );
+    }
 }
