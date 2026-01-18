@@ -1059,15 +1059,19 @@ async fn main() -> Result<()> {
                     entry.1 += k_upd;
                     entry.2 += p_upd;
 
-                    // For verbose mode, collect market details
-                    if verbose && has_k && has_p {
-                        // Calculate gap (best cross-platform cost - threshold)
-                        let fee1 = kalshi_fee_cents(k_no);
-                        let cost1 = p_yes + k_no + fee1;
-                        let fee2 = kalshi_fee_cents(k_yes);
-                        let cost2 = k_yes + fee2 + p_no;
-                        let best_cost = cost1.min(cost2);
-                        let gap = best_cost as i16 - heartbeat_threshold as i16;
+                    // For verbose mode, collect ALL discovered markets (not just those with both prices)
+                    if verbose {
+                        // Calculate gap only if both platforms have prices
+                        let gap = if has_k && has_p {
+                            let fee1 = kalshi_fee_cents(k_no);
+                            let cost1 = p_yes + k_no + fee1;
+                            let fee2 = kalshi_fee_cents(k_yes);
+                            let cost2 = k_yes + fee2 + p_no;
+                            let best_cost = cost1.min(cost2);
+                            best_cost as i16 - heartbeat_threshold as i16
+                        } else {
+                            i16::MAX // Sentinel value indicating no gap calculable
+                        };
 
                         market_details.push(MarketDetail {
                             description: pair.description.to_string(),
@@ -1176,15 +1180,32 @@ async fn main() -> Result<()> {
                                     m.description.clone()
                                 };
 
-                                let gap_str = if m.gap < 0 {
+                                // Format Kalshi prices (-- if no prices)
+                                let k_str = if m.k_yes > 0 && m.k_no > 0 {
+                                    format!("{:02}/{:02}", m.k_yes, m.k_no)
+                                } else {
+                                    "--/--".to_string()
+                                };
+
+                                // Format Polymarket prices (-- if no prices)
+                                let p_str = if m.p_yes > 0 && m.p_no > 0 {
+                                    format!("{:02}/{:02}", m.p_yes, m.p_no)
+                                } else {
+                                    "--/--".to_string()
+                                };
+
+                                // Format gap (-- if not calculable)
+                                let gap_str = if m.gap == i16::MAX {
+                                    "\x1b[33m--\x1b[0m".to_string() // Yellow for missing
+                                } else if m.gap < 0 {
                                     format!("\x1b[32m{:+}¢\x1b[0m", m.gap) // Green for arb
                                 } else {
                                     format!("{:+}¢", m.gap)
                                 };
 
-                                println!("{}  {}── {:30} K:{:02}/{:02} P:{:02}/{:02} gap:{} upd:K{}/P{}",
+                                println!("{}  {}── {:30} K:{} P:{} gap:{} upd:K{}/P{}",
                                          prefix, item_branch, desc,
-                                         m.k_yes, m.k_no, m.p_yes, m.p_no,
+                                         k_str, p_str,
                                          gap_str, m.k_updates, m.p_updates);
                             }
                         }
@@ -1275,7 +1296,8 @@ async fn main() -> Result<()> {
 
                 // Only replace table if few/no interleaved logs (preserve important logs)
                 // If many logs appeared, just print fresh table below them
-                if prev_lines > 0 && extra_lines <= 3 {
+                // In verbose mode, skip replacement since println!() lines aren't tracked
+                if prev_lines > 0 && extra_lines <= 3 && !verbose {
                     use std::io::Write;
                     // Move up to start of previous table, clear to end of screen
                     print!("\x1b[{}A\x1b[J", prev_lines);

@@ -1550,6 +1550,7 @@ static ESPORTS_TEAM_ALIASES: &[(&str, &[&str])] = &[
     ("ultra-prime", &["up", "ultra prime"]),
     ("invictus-gaming", &["ig", "ig1", "invictus", "invictus gaming"]),
     ("thundertalk-gaming", &["tt", "thundertalk", "thundertalk gaming", "thundertalk-gaming"]),
+    ("thundertalk", &["tt"]),
 
     // LCK (Korea LoL)
     ("t1", &["t1", "skt", "sk telecom"]),
