@@ -693,11 +693,25 @@ impl DiscoveryClient {
                                 );
                             }
 
+                            // Build description with outcome/line info
+                            let desc = if task.market_type == MarketType::Moneyline {
+                                // For moneyline, use yes_sub_title to show outcome
+                                if let Some(ref sub) = task.market.yes_sub_title {
+                                    format!("{} ({})", task.event.title, sub)
+                                } else {
+                                    format!("{} - {}", task.event.title, task.market.title)
+                                }
+                            } else if let Some(line) = task.market.floor_strike {
+                                format!("{} - {} {}", task.event.title, task.market.title, line)
+                            } else {
+                                format!("{} - {}", task.event.title, task.market.title)
+                            };
+
                             Some(MarketPair {
                                 pair_id: format!("{}-{}", task.poly_slug, task.market.ticker).into(),
                                 league: task.league.into(),
                                 market_type: task.market_type,
-                                description: format!("{} - {}", task.event.title, task.market.title).into(),
+                                description: desc.into(),
                                 kalshi_event_ticker: task.event.event_ticker.clone().into(),
                                 kalshi_market_ticker: task.market.ticker.into(),
                                 kalshi_event_slug: task.kalshi_web_slug.into(),
@@ -1111,11 +1125,24 @@ impl DiscoveryClient {
             );
         }
 
+        // Build description with outcome/line info
+        let desc = if market_type == MarketType::Moneyline {
+            if let Some(ref sub) = market.yes_sub_title {
+                format!("{} ({})", market.title.replace(" Winner?", "").replace(" Winner", ""), sub)
+            } else {
+                market.title.to_string()
+            }
+        } else if let Some(line) = market.floor_strike {
+            format!("{} {}", market.title, line)
+        } else {
+            market.title.to_string()
+        };
+
         Some(MarketPair {
             pair_id: format!("{}-{}", poly_slug, market.ticker).into(),
             league: config.league_code.into(),
             market_type,
-            description: market.title.to_string().into(),
+            description: desc.into(),
             kalshi_event_ticker: event_ticker.into(),
             kalshi_market_ticker: market.ticker.clone().into(),
             kalshi_event_slug: config.kalshi_web_slug.into(),
@@ -1321,11 +1348,20 @@ impl DiscoveryClient {
                                 (no_token.clone(), yes_token.clone())
                             };
 
+                            // Build description with outcome info for moneyline
+                            let desc = if let Some(ref sub) = market.yes_sub_title {
+                                format!("{} ({})", event.title, sub)
+                            } else if let Some(line) = market.floor_strike {
+                                format!("{} - {} {}", event.title, market.title, line)
+                            } else {
+                                format!("{} - {}", event.title, market.title)
+                            };
+
                             pairs.push(MarketPair {
                                 pair_id: format!("{}-{}", slug, market.ticker).into(),
                                 league: config.league_code.into(),
                                 market_type: MarketType::Moneyline,
-                                description: format!("{} - {}", event.title, market.title).into(),
+                                description: desc.into(),
                                 kalshi_event_ticker: event.event_ticker.clone().into(),
                                 kalshi_market_ticker: market.ticker.into(),
                                 kalshi_event_slug: config.kalshi_web_slug.into(),
@@ -1550,7 +1586,6 @@ static ESPORTS_TEAM_ALIASES: &[(&str, &[&str])] = &[
     ("edward-gaming", &["edg", "edward", "edward gaming"]),
     ("royal-never-give-up", &["rng", "royal", "royal never give up"]),
     ("ninjas-in-pyjamas", &["nip", "ninjas", "ninjas in pyjamas"]),
-    ("tt-gaming", &["tt", "tt gaming"]),
     ("ultra-prime", &["up", "ultra prime"]),
     ("invictus-gaming", &["ig", "ig1", "invictus", "invictus gaming"]),
     ("thundertalk-gaming", &["tt", "thundertalk", "thundertalk gaming", "thundertalk-gaming"]),

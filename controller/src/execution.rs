@@ -739,8 +739,12 @@ pub async fn run_execution_loop(
                     );
                 }
                 Ok(result) => {
-                    if result.error != Some("Already in-flight") {
-                        // Get market details for better logging
+                    // Skip logging for errors that already have detailed logs
+                    let already_logged = matches!(
+                        result.error,
+                        Some("Already in-flight") | Some("Insufficient liquidity")
+                    );
+                    if !already_logged {
                         let detail = engine.state.get_by_id(result.market_id)
                             .and_then(|m| m.pair())
                             .map(|p| format!("{} ({})", p.description, p.pair_id))

@@ -291,6 +291,55 @@ fn parse_bool_env(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Deduplicate market names that have repeated prefixes.
+/// e.g., "Union Berlin vs Dortmund - Union Berlin vs Dortmund Winner?"
+///    -> "Union Berlin vs Dortmund Winner?"
+fn deduplicate_market_name(description: &str) -> String {
+    if let Some(sep_pos) = description.find(" - ") {
+        let prefix = &description[..sep_pos];
+        let suffix = &description[sep_pos + 3..];
+        // If suffix starts with prefix, keep only suffix
+        if suffix.starts_with(prefix) {
+            return suffix.to_string();
+        }
+    }
+    description.to_string()
+}
+
+/// Strip redundant market type text from description when displayed under a type header.
+/// e.g., "Leeds at Everton: Spreads - Everton wins by..." -> "Leeds at Everton - Everton wins by..."
+///       "Leeds at Everton: Totals 2.5" -> "Leeds at Everton 2.5"
+///       "Leeds at Everton: Both Teams to Score" -> "Leeds at Everton"
+///       "Leeds vs Everton Winner?" -> "Leeds vs Everton"
+fn strip_market_type_suffix(description: &str, market_type: &types::MarketType) -> String {
+    match market_type {
+        types::MarketType::Moneyline => {
+            description
+                .replace(" Winner?", "")
+                .replace(" Winner", "")
+                .replace("(Tie)", "(Draw)")
+                .replace("(tie)", "(Draw)")
+        }
+        types::MarketType::Spread => {
+            description
+                .replace(": Spreads - ", " - ")
+                .replace(": Spreads ", " ")
+                .replace(" wins by over ", " by ")
+                .replace(" goals?", "")
+        }
+        types::MarketType::Total => {
+            description
+                .replace(": Totals ", " ")
+                .replace(": Totals", "")
+        }
+        types::MarketType::Btts => {
+            description
+                .replace(": Both Teams to Score", "")
+                .replace(" Both Teams to Score", "")
+        }
+    }
+}
+
 fn parse_ws_platforms() -> Vec<WsPlatform> {
     // Default to both platforms.
     let raw =
@@ -1160,7 +1209,10 @@ async fn main() -> Result<()> {
                     let mut type_idx = 0;
 
                     for mt in type_order.iter() {
-                        if let Some(type_markets) = by_type.get(mt) {
+                        if let Some(type_markets) = by_type.get_mut(mt) {
+                            // Sort markets by description to group by event
+                            type_markets.sort_by(|a, b| a.description.cmp(&b.description));
+
                             type_idx += 1;
                             let is_last_type = type_idx == type_count;
                             let branch = if is_last_type { "└" } else { "├" };
@@ -1173,11 +1225,13 @@ async fn main() -> Result<()> {
                                 let prefix = if is_last_type { " " } else { "│" };
                                 let item_branch = if is_last { "└" } else { "├" };
 
-                                // Truncate description to 30 chars
-                                let desc: String = if m.description.len() > 30 {
-                                    format!("{}...", &m.description[..27])
+                                // Strip redundant market type, deduplicate, and truncate to 55 chars
+                                let stripped = strip_market_type_suffix(&m.description, mt);
+                                let deduped = deduplicate_market_name(&stripped);
+                                let desc: String = if deduped.len() > 55 {
+                                    format!("{}...", &deduped[..52])
                                 } else {
-                                    m.description.clone()
+                                    deduped
                                 };
 
                                 // Format Kalshi prices (-- if no prices)
@@ -1359,4 +1413,174 @@ async fn main() -> Result<()> {
     let _ = tokio::join!(kalshi_handle, poly_handle, heartbeat_handle, exec_handle, discovery_handle);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deduplicate_market_name_with_duplicate_prefix() {
+        // Full duplication with additional text
+        assert_eq!(
+            deduplicate_market_name("Union Berlin vs Dortmund - Union Berlin vs Dortmund Winner?"),
+            "Union Berlin vs Dortmund Winner?"
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_market_name_exact_duplicate() {
+        // Exact duplicate on both sides
+        assert_eq!(
+            deduplicate_market_name("Dortmund at Union Berlin: Totals - Dortmund at Union Berlin: Totals"),
+            "Dortmund at Union Berlin: Totals"
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_market_name_no_separator() {
+        // No separator - should return unchanged
+        assert_eq!(
+            deduplicate_market_name("Simple Market Name"),
+            "Simple Market Name"
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_market_name_no_duplicate() {
+        // Has separator but suffix doesn't start with prefix
+        assert_eq!(
+            deduplicate_market_name("Team A vs Team B - Winner takes all"),
+            "Team A vs Team B - Winner takes all"
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_market_name_partial_match() {
+        // Prefix is partial match but not exact start
+        assert_eq!(
+            deduplicate_market_name("Lakers vs Celtics - Lakers win by 10+"),
+            "Lakers vs Celtics - Lakers win by 10+"
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_market_name_spread_example() {
+        // Real spread market example
+        assert_eq!(
+            deduplicate_market_name("Lakers at Celtics: Spread - Lakers at Celtics: Spread +5.5"),
+            "Lakers at Celtics: Spread +5.5"
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_market_name_empty() {
+        assert_eq!(deduplicate_market_name(""), "");
+    }
+
+    #[test]
+    fn test_deduplicate_market_name_only_separator() {
+        assert_eq!(deduplicate_market_name(" - "), "");
+    }
+
+    // Tests for strip_market_type_suffix
+
+    #[test]
+    fn test_strip_spread_suffix() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Leeds at Everton: Spreads - Everton wins by over 1.5 goals?",
+                &types::MarketType::Spread
+            ),
+            "Leeds at Everton - Everton by 1.5"
+        );
+    }
+
+    #[test]
+    fn test_strip_spread_suffix_short() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Leeds at Everton - Manchester City wins by over 2.5 goals?",
+                &types::MarketType::Spread
+            ),
+            "Leeds at Everton - Manchester City by 2.5"
+        );
+    }
+
+    #[test]
+    fn test_strip_totals_suffix() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Leeds at Everton: Totals 2.5",
+                &types::MarketType::Total
+            ),
+            "Leeds at Everton 2.5"
+        );
+    }
+
+    #[test]
+    fn test_strip_totals_suffix_no_value() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Leeds at Everton: Totals",
+                &types::MarketType::Total
+            ),
+            "Leeds at Everton"
+        );
+    }
+
+    #[test]
+    fn test_strip_btts_suffix() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Leeds at Everton: Both Teams to Score",
+                &types::MarketType::Btts
+            ),
+            "Leeds at Everton"
+        );
+    }
+
+    #[test]
+    fn test_strip_moneyline_unchanged() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Leeds at Everton - Everton wins",
+                &types::MarketType::Moneyline
+            ),
+            "Leeds at Everton - Everton wins"
+        );
+    }
+
+    #[test]
+    fn test_strip_moneyline_winner() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Union Berlin vs Dortmund Winner?",
+                &types::MarketType::Moneyline
+            ),
+            "Union Berlin vs Dortmund"
+        );
+    }
+
+    #[test]
+    fn test_strip_moneyline_winner_no_question() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Union Berlin vs Dortmund Winner",
+                &types::MarketType::Moneyline
+            ),
+            "Union Berlin vs Dortmund"
+        );
+    }
+
+    #[test]
+    fn test_strip_moneyline_tie_to_draw() {
+        assert_eq!(
+            strip_market_type_suffix(
+                "Union Berlin vs Dortmund (Tie)",
+                &types::MarketType::Moneyline
+            ),
+            "Union Berlin vs Dortmund (Draw)"
+        );
+    }
 }
