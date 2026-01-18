@@ -293,10 +293,6 @@ Having problems? This guide covers common issues and how to fix them.
    - Set `RUST_LOG=info` or `RUST_LOG=warn`
    - `RUST_LOG=debug` or `trace` is very verbose
 
-3. **Reduce price logging:**
-   - Set `PRICE_LOGGING=0`
-   - Price logging is very resource-intensive
-
 ### Bot uses too much memory
 
 **Solution:**

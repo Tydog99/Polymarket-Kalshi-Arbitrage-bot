@@ -146,6 +146,42 @@ DRY_RUN=0 CONTROLLER_PLATFORMS=kalshi cargo run -p controller --release
 DISCOVERY_ONLY=1 FORCE_DISCOVERY=1 cargo run -p controller --release
 ```
 
+### Heartbeat Output
+
+The controller displays a heartbeat every 10 seconds (configurable) with market status. The table shows price update deltas since the last heartbeat.
+
+**Default Mode** - Compact table showing markets by league and type:
+```
+[14:32:05] 💓 234 markets | K:892 P:1847 updates/min
+📊 Best opportunity: NBA Game | P_yes(34¢) + K_no(33¢) + K_fee(2¢) = 69¢ | gap=-31¢ | max=50x
+┌──────────┬────────────┬────────────┬────────────┬────────────┐
+│ League   │ Moneyline  │ Spread     │ Total      │ BTTS       │
+├──────────┼────────────┼────────────┼────────────┼────────────┤
+│ nba      │ 8 (+42)    │ 12 (+89)   │ 6 (+45)    │ -          │
+│ epl      │ 6 (+17)    │ 4 (+23)    │ 3 (+12)    │ 5 (+34)    │
+└──────────┴────────────┴────────────┴────────────┴────────────┘
+```
+The `(+N)` shows price updates since the last heartbeat (delta, not cumulative).
+
+**Configuration:**
+```bash
+# Change heartbeat interval (default: 10 seconds)
+HEARTBEAT_INTERVAL_SECS=5 cargo run -p controller --release
+# Or via CLI flag
+cargo run -p controller --release -- --heartbeat-interval 5
+```
+
+**Verbose Mode** - Hierarchical tree with per-market details:
+```bash
+# Enable via environment variable
+VERBOSE_HEARTBEAT=1 cargo run -p controller --release
+
+# Or via CLI flag
+cargo run -p controller --release -- --verbose-heartbeat
+```
+
+Shows each market with prices (K:yes/no, P:yes/no), gap from threshold, and update counts.
+
 ## Remote Trader (Optional)
 
 For distributed execution across machines:
@@ -176,6 +212,8 @@ See `trader/README.md` for setup and required environment variables.
 |----------|---------|-------------|
 | `DRY_RUN` | `1` | `1` or `true` = paper trading, `0` = live execution |
 | `RUST_LOG` | `info` | Logging level (`debug`, `info`, `warn`, `error`) |
+| `VERBOSE_HEARTBEAT` | `false` | `1` or `true` = show detailed hierarchical heartbeat output (or use `--verbose-heartbeat` CLI flag) |
+| `HEARTBEAT_INTERVAL_SECS` | `10` | Seconds between heartbeat updates (or use `--heartbeat-interval N` CLI flag) |
 
 ### Discovery & Market Configuration
 
@@ -185,7 +223,6 @@ See `trader/README.md` for setup and required environment variables.
 | `FORCE_DISCOVERY` | `false` | `1` or `true` = clear cache and re-fetch all markets |
 | `DISCOVERY_INTERVAL_MINS` | `15` | Minutes between discovery refreshes (0 = disabled) |
 | `ENABLED_LEAGUES` | *(all)* | Comma-separated leagues to monitor (see below) |
-| `PRICE_LOGGING` | `false` | `1` or `true` = enable detailed price logging (performance impact) |
 
 **Supported leagues**: `epl`, `bundesliga`, `laliga`, `seriea`, `ligue1`, `ucl`, `uel`, `eflc`, `nba`, `nfl`, `nhl`, `mlb`, `mls`, `ncaaf`, `cs2`, `lol`, `cod`
 

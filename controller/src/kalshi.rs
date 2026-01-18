@@ -613,6 +613,7 @@ fn process_kalshi_snapshot(market: &crate::types::AtomicMarketState, body: &Kals
 
     // Store
     market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
+    market.inc_kalshi_updates();
 }
 
 /// Process Kalshi orderbook delta
@@ -667,6 +668,7 @@ fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiW
     };
 
     market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
+    market.inc_kalshi_updates();
 }
 
 /// Send arb request from Kalshi handler

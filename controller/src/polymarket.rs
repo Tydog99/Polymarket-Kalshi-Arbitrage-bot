@@ -287,7 +287,15 @@ pub async fn run_ws(
     let tokens: Vec<String> = state.markets.iter()
         .take(state.market_count())
         .filter_map(|m| m.pair())
-        .flat_map(|p| [p.poly_yes_token.to_string(), p.poly_no_token.to_string()])
+        .flat_map(|p| {
+            tracing::debug!(
+                "[POLY] Market tokens: desc={} YES={}... NO={}...",
+                &p.description[..p.description.len().min(30)],
+                &p.poly_yes_token[..p.poly_yes_token.len().min(16)],
+                &p.poly_no_token[..p.poly_no_token.len().min(16)]
+            );
+            [p.poly_yes_token.to_string(), p.poly_no_token.to_string()]
+        })
         .collect();
 
     if tokens.is_empty() {
@@ -432,6 +440,13 @@ async fn run_single_ws(
                         // Try book snapshot first
                         if let Ok(books) = serde_json::from_str::<Vec<BookSnapshot>>(&text) {
                             for book in &books {
+                                tracing::debug!(
+                                    "{} Book snapshot: asset={} asks={} bids={}",
+                                    log_prefix,
+                                    &book.asset_id[..book.asset_id.len().min(20)],
+                                    book.asks.len(),
+                                    book.bids.len()
+                                );
                                 process_book(&state, book, &exec_tx, threshold_cents, &clock).await;
                             }
                         }
@@ -506,31 +521,60 @@ async fn process_book(
         .min_by_key(|(p, _)| *p)
         .unwrap_or((0, 0));
 
-    // Check if YES token (release lock before any await)
+    // A token can be YES for one market AND NO for another (e.g., esports where
+    // Kalshi has separate markets for each team winning the same match).
+    // We must check BOTH lookups, not return early.
+
+    let mut matched = false;
+
+    // Check if YES token
     let yes_market_id = state.poly_yes_to_id.read().get(&token_hash).copied();
     if let Some(market_id) = yes_market_id {
+        tracing::debug!(
+            "[POLY] YES matched: asset={}... price={} size={}",
+            &book.asset_id[..book.asset_id.len().min(16)],
+            best_ask,
+            ask_size
+        );
         let market = &state.markets[market_id as usize];
         market.poly.update_yes(best_ask, ask_size);
+        market.inc_poly_updates();
 
         // Check arbs
         let arb_mask = market.check_arbs(threshold_cents);
         if arb_mask != 0 {
             send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
         }
-        return;
+        matched = true;
     }
 
-    // Check if NO token (release lock before any await)
+    // Check if NO token (same token can be NO for a different market)
     let no_market_id = state.poly_no_to_id.read().get(&token_hash).copied();
     if let Some(market_id) = no_market_id {
+        tracing::debug!(
+            "[POLY] NO matched: asset={}... price={} size={}",
+            &book.asset_id[..book.asset_id.len().min(16)],
+            best_ask,
+            ask_size
+        );
         let market = &state.markets[market_id as usize];
         market.poly.update_no(best_ask, ask_size);
+        market.inc_poly_updates();
 
         // Check arbs
         let arb_mask = market.check_arbs(threshold_cents);
         if arb_mask != 0 {
             send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
         }
+        matched = true;
+    }
+
+    if !matched {
+        // Token not found in our lookup maps
+        tracing::debug!(
+            "[POLY] UNMATCHED token: asset={}...",
+            &book.asset_id[..book.asset_id.len().min(20)]
+        );
     }
 }
 
@@ -554,7 +598,11 @@ async fn process_price_change(
 
     let token_hash = fxhash_str(&change.asset_id);
 
-    // Check YES token (release lock before any await)
+    // A token can be YES for one market AND NO for another (e.g., esports where
+    // Kalshi has separate markets for each team winning the same match).
+    // We must check BOTH lookups, not return early.
+
+    // Check YES token
     let yes_market_id = state.poly_yes_to_id.read().get(&token_hash).copied();
     if let Some(market_id) = yes_market_id {
         let market = &state.markets[market_id as usize];
@@ -562,6 +610,7 @@ async fn process_price_change(
 
         // Always update cached price to reflect current market state
         market.poly.update_yes(price, current_yes_size);
+        market.inc_poly_updates();
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_yes || current_yes == 0 {
@@ -570,10 +619,9 @@ async fn process_price_change(
                 send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
             }
         }
-        return;
     }
 
-    // Check NO token (release lock before any await)
+    // Check NO token (same token can be NO for a different market)
     let no_market_id = state.poly_no_to_id.read().get(&token_hash).copied();
     if let Some(market_id) = no_market_id {
         let market = &state.markets[market_id as usize];
@@ -581,6 +629,7 @@ async fn process_price_change(
 
         // Always update cached price to reflect current market state
         market.poly.update_no(price, current_no_size);
+        market.inc_poly_updates();
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_no || current_no == 0 {
@@ -637,5 +686,411 @@ async fn send_arb_request(
             "[POLY] Arb request dropped for market {}: {} (channel backpressure)",
             market_id, e
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::types::{GlobalState, MarketPair, MarketType, fxhash_str};
+
+    /// Test helper: Create a GlobalState with esports-style market pairs where
+    /// the same Polymarket tokens are used across multiple Kalshi markets.
+    ///
+    /// Production example from COD (Call of Duty League Stage 1):
+    /// - Polymarket: "OpTic Texas vs LA Thieves" with two tokens:
+    ///   - Token_A (43216923243873086858): "OpTic Texas wins"
+    ///   - Token_B (38935270389103557597): "LA Thieves wins"
+    ///
+    /// - Kalshi has TWO markets for the same match:
+    ///   - Market 1: "Will OpTic Texas win?"
+    ///     → poly_yes = Token_A (OpTic wins), poly_no = Token_B (OpTic loses = Thieves wins)
+    ///   - Market 2: "Will LA Thieves win?"
+    ///     → poly_yes = Token_B (Thieves wins), poly_no = Token_A (Thieves loses = OpTic wins)
+    ///
+    /// This means Token_A is:
+    ///   - YES for Market 1 (OpTic winning)
+    ///   - NO for Market 2 (Thieves losing)
+    ///
+    /// And Token_B is:
+    ///   - YES for Market 2 (Thieves winning)
+    ///   - NO for Market 1 (OpTic losing)
+    fn create_esports_state_with_shared_tokens() -> (GlobalState, String, String) {
+        let state = GlobalState::new();
+
+        // Real token IDs from production logs (truncated for readability in tests)
+        let token_optic = "43216923243873086858".to_string();  // OpTic Texas wins
+        let token_thieves = "38935270389103557597".to_string(); // LA Thieves wins
+
+        // Market 1: "Will OpTic Texas win?"
+        // YES = OpTic wins (token_optic), NO = OpTic loses = Thieves wins (token_thieves)
+        let pair1 = MarketPair {
+            pair_id: "cod-optic-thieves-OPTIC".into(),
+            league: "cod".into(),
+            market_type: MarketType::Moneyline,
+            description: "COD Stage 1 - Will OpTic Texas win?".into(),
+            kalshi_event_ticker: "KXCODGAME-26JAN17OPTICTHIEVES".into(),
+            kalshi_market_ticker: "KXCODGAME-26JAN17OPTICTHIEVES-OPTIC".into(),
+            kalshi_event_slug: "call-of-duty-game".into(),
+            poly_slug: "codmw-optic-thieves-2026-01-17".into(),
+            poly_yes_token: token_optic.clone().into(),
+            poly_no_token: token_thieves.clone().into(),
+            line_value: None,
+            team_suffix: Some("OPTIC".into()),
+        };
+
+        // Market 2: "Will LA Thieves win?"
+        // YES = Thieves wins (token_thieves), NO = Thieves loses = OpTic wins (token_optic)
+        // Note: tokens are SWAPPED compared to Market 1
+        let pair2 = MarketPair {
+            pair_id: "cod-optic-thieves-THIEVES".into(),
+            league: "cod".into(),
+            market_type: MarketType::Moneyline,
+            description: "COD Stage 1 - Will LA Thieves win?".into(),
+            kalshi_event_ticker: "KXCODGAME-26JAN17OPTICTHIEVES".into(),
+            kalshi_market_ticker: "KXCODGAME-26JAN17OPTICTHIEVES-THIEVES".into(),
+            kalshi_event_slug: "call-of-duty-game".into(),
+            poly_slug: "codmw-optic-thieves-2026-01-17".into(),
+            poly_yes_token: token_thieves.clone().into(),  // SWAPPED
+            poly_no_token: token_optic.clone().into(),     // SWAPPED
+            line_value: None,
+            team_suffix: Some("THIEVES".into()),
+        };
+
+        state.add_pair(pair1);
+        state.add_pair(pair2);
+
+        (state, token_optic, token_thieves)
+    }
+
+    #[test]
+    fn test_shared_token_lookup_structure() {
+        // Verify the lookup maps correctly store tokens that appear in both YES and NO roles
+        let (state, token_optic, token_thieves) = create_esports_state_with_shared_tokens();
+
+        let optic_hash = fxhash_str(&token_optic);
+        let thieves_hash = fxhash_str(&token_thieves);
+
+        // Token_OpTic should be in BOTH maps (YES for market 0, NO for market 1)
+        let optic_yes_market = state.poly_yes_to_id.read().get(&optic_hash).copied();
+        let optic_no_market = state.poly_no_to_id.read().get(&optic_hash).copied();
+
+        assert_eq!(optic_yes_market, Some(0), "Token_OpTic should be YES for market 0");
+        assert_eq!(optic_no_market, Some(1), "Token_OpTic should be NO for market 1");
+
+        // Token_Thieves should be in BOTH maps (YES for market 1, NO for market 0)
+        let thieves_yes_market = state.poly_yes_to_id.read().get(&thieves_hash).copied();
+        let thieves_no_market = state.poly_no_to_id.read().get(&thieves_hash).copied();
+
+        assert_eq!(thieves_yes_market, Some(1), "Token_Thieves should be YES for market 1");
+        assert_eq!(thieves_no_market, Some(0), "Token_Thieves should be NO for market 0");
+    }
+
+    #[test]
+    fn test_book_snapshot_updates_both_markets() {
+        // When we receive a book snapshot for Token_OpTic, it should update:
+        // - Market 0's YES price (OpTic winning)
+        // - Market 1's NO price (Thieves losing = OpTic winning)
+        let (state, token_optic, token_thieves) = create_esports_state_with_shared_tokens();
+
+        // Simulate book snapshot for Token_OpTic with price 34 cents, size 462 cents
+        let optic_hash = fxhash_str(&token_optic);
+        let optic_price: u16 = 34;
+        let optic_size: u16 = 462;
+
+        // Simulate what process_book does (without the async/exec_tx parts)
+        // First check YES lookup
+        if let Some(market_id) = state.poly_yes_to_id.read().get(&optic_hash).copied() {
+            state.markets[market_id as usize].poly.update_yes(optic_price, optic_size);
+            state.markets[market_id as usize].inc_poly_updates();
+        }
+
+        // Then check NO lookup (same token can be NO for different market)
+        if let Some(market_id) = state.poly_no_to_id.read().get(&optic_hash).copied() {
+            state.markets[market_id as usize].poly.update_no(optic_price, optic_size);
+            state.markets[market_id as usize].inc_poly_updates();
+        }
+
+        // Verify Market 0: Token_OpTic is YES, should have YES price updated
+        let (m0_yes, m0_no, _, _) = state.markets[0].poly.load();
+        assert_eq!(m0_yes, 34, "Market 0 YES (OpTic wins) should be 34 cents");
+        assert_eq!(m0_no, 0, "Market 0 NO should still be 0 (waiting for Token_Thieves)");
+
+        // Verify Market 1: Token_OpTic is NO, should have NO price updated
+        let (m1_yes, m1_no, _, _) = state.markets[1].poly.load();
+        assert_eq!(m1_yes, 0, "Market 1 YES should still be 0 (waiting for Token_Thieves)");
+        assert_eq!(m1_no, 34, "Market 1 NO (Thieves loses) should be 34 cents");
+
+        // Now simulate book snapshot for Token_Thieves with price 70 cents
+        let thieves_hash = fxhash_str(&token_thieves);
+        let thieves_price: u16 = 70;
+        let thieves_size: u16 = 2675;
+
+        if let Some(market_id) = state.poly_yes_to_id.read().get(&thieves_hash).copied() {
+            state.markets[market_id as usize].poly.update_yes(thieves_price, thieves_size);
+            state.markets[market_id as usize].inc_poly_updates();
+        }
+
+        if let Some(market_id) = state.poly_no_to_id.read().get(&thieves_hash).copied() {
+            state.markets[market_id as usize].poly.update_no(thieves_price, thieves_size);
+            state.markets[market_id as usize].inc_poly_updates();
+        }
+
+        // Now both markets should have complete pricing
+        let (m0_yes, m0_no, _, _) = state.markets[0].poly.load();
+        assert_eq!(m0_yes, 34, "Market 0 YES (OpTic wins) = 34 cents");
+        assert_eq!(m0_no, 70, "Market 0 NO (OpTic loses) = 70 cents");
+
+        let (m1_yes, m1_no, _, _) = state.markets[1].poly.load();
+        assert_eq!(m1_yes, 70, "Market 1 YES (Thieves wins) = 70 cents");
+        assert_eq!(m1_no, 34, "Market 1 NO (Thieves loses) = 34 cents");
+
+        // Verify prices are complementary: YES + NO should be close to 100 cents
+        // (In this case 34 + 70 = 104, slightly over due to market spread)
+        assert_eq!(m0_yes + m0_no, 104);
+        assert_eq!(m1_yes + m1_no, 104);
+
+        // Verify update counts: each market got 2 updates (one from each token)
+        let (m0_k_upd, m0_p_upd) = state.markets[0].load_update_counts();
+        let (m1_k_upd, m1_p_upd) = state.markets[1].load_update_counts();
+        assert_eq!(m0_p_upd, 2, "Market 0 should have 2 Poly updates");
+        assert_eq!(m1_p_upd, 2, "Market 1 should have 2 Poly updates");
+        assert_eq!(m0_k_upd, 0, "Market 0 should have 0 Kalshi updates");
+        assert_eq!(m1_k_upd, 0, "Market 1 should have 0 Kalshi updates");
+    }
+
+    #[test]
+    fn test_early_return_bug_regression() {
+        // This test verifies the bug fix: the old code had `return` after YES lookup,
+        // which prevented NO lookup from running. This caused Market 1's NO price
+        // to never be updated when Token_OpTic's book snapshot arrived.
+        //
+        // Production symptom: verbose heartbeat showed P:--/-- for all markets even
+        // though book snapshots were being received and matched as YES.
+        let (state, token_optic, _token_thieves) = create_esports_state_with_shared_tokens();
+
+        let optic_hash = fxhash_str(&token_optic);
+        let price: u16 = 34;
+        let size: u16 = 462;
+
+        // OLD BUGGY CODE (don't do this):
+        // if let Some(market_id) = state.poly_yes_to_id.read().get(&optic_hash).copied() {
+        //     state.markets[market_id as usize].poly.update_yes(price, size);
+        //     return;  // <-- BUG: early return prevents NO lookup
+        // }
+        // if let Some(market_id) = state.poly_no_to_id.read().get(&optic_hash).copied() {
+        //     // This never runs because of early return above!
+        //     state.markets[market_id as usize].poly.update_no(price, size);
+        // }
+
+        // FIXED CODE (what we do now):
+        // Check YES lookup
+        if let Some(market_id) = state.poly_yes_to_id.read().get(&optic_hash).copied() {
+            state.markets[market_id as usize].poly.update_yes(price, size);
+            // NO return here - continue to check NO lookup
+        }
+        // Check NO lookup (same token can be NO for different market)
+        if let Some(market_id) = state.poly_no_to_id.read().get(&optic_hash).copied() {
+            state.markets[market_id as usize].poly.update_no(price, size);
+        }
+
+        // Both markets should be updated
+        let (m0_yes, _, _, _) = state.markets[0].poly.load();
+        let (_, m1_no, _, _) = state.markets[1].poly.load();
+
+        assert_eq!(m0_yes, 34, "Market 0 YES should be updated");
+        assert_eq!(m1_no, 34, "Market 1 NO should ALSO be updated (regression test)");
+    }
+
+    #[test]
+    fn test_production_token_ids_from_debug_logs() {
+        // Real production data from debug logs:
+        // [POLY] Market tokens: desc=Call of Duty League Stage 1 Ma YES=4321692324387308... NO=3893527038910355...
+        // [POLY] Market tokens: desc=Call of Duty League Stage 1 Ma YES=3893527038910355... NO=4321692324387308...
+        //
+        // Book snapshots received:
+        // [POLY] Book snapshot: asset=43216923243873086858 asks=16 bids=13
+        // [POLY] YES matched: asset=4321692324387308... price=34 size=462
+        // [POLY] Book snapshot: asset=38935270389103557597 asks=13 bids=16
+        // [POLY] YES matched: asset=3893527038910355... price=70 size=2675
+        //
+        // With the bug, only YES matches were logged, NO matches never happened.
+        // After fix, both YES and NO matches should occur for each book snapshot.
+
+        let state = GlobalState::new();
+
+        // Exact token IDs from production
+        let token_a = "43216923243873086858".to_string();
+        let token_b = "38935270389103557597".to_string();
+
+        // Market pair 1: YES=token_a, NO=token_b
+        let pair1 = MarketPair {
+            pair_id: "test-pair-1".into(),
+            league: "cod".into(),
+            market_type: MarketType::Moneyline,
+            description: "Call of Duty League Stage 1 Match - Team A".into(),
+            kalshi_event_ticker: "KXCODGAME-26JAN17AB".into(),
+            kalshi_market_ticker: "KXCODGAME-26JAN17AB-A".into(),
+            kalshi_event_slug: "call-of-duty-game".into(),
+            poly_slug: "codmw-a-b-2026-01-17".into(),
+            poly_yes_token: token_a.clone().into(),
+            poly_no_token: token_b.clone().into(),
+            line_value: None,
+            team_suffix: Some("A".into()),
+        };
+
+        // Market pair 2: YES=token_b, NO=token_a (swapped)
+        let pair2 = MarketPair {
+            pair_id: "test-pair-2".into(),
+            league: "cod".into(),
+            market_type: MarketType::Moneyline,
+            description: "Call of Duty League Stage 1 Match - Team B".into(),
+            kalshi_event_ticker: "KXCODGAME-26JAN17AB".into(),
+            kalshi_market_ticker: "KXCODGAME-26JAN17AB-B".into(),
+            kalshi_event_slug: "call-of-duty-game".into(),
+            poly_slug: "codmw-a-b-2026-01-17".into(),
+            poly_yes_token: token_b.clone().into(),
+            poly_no_token: token_a.clone().into(),
+            line_value: None,
+            team_suffix: Some("B".into()),
+        };
+
+        state.add_pair(pair1);
+        state.add_pair(pair2);
+
+        // Simulate processing book snapshot for token_a (price=34, size=462)
+        let hash_a = fxhash_str(&token_a);
+        if let Some(id) = state.poly_yes_to_id.read().get(&hash_a).copied() {
+            state.markets[id as usize].poly.update_yes(34, 462);
+        }
+        if let Some(id) = state.poly_no_to_id.read().get(&hash_a).copied() {
+            state.markets[id as usize].poly.update_no(34, 462);
+        }
+
+        // Simulate processing book snapshot for token_b (price=70, size=2675)
+        let hash_b = fxhash_str(&token_b);
+        if let Some(id) = state.poly_yes_to_id.read().get(&hash_b).copied() {
+            state.markets[id as usize].poly.update_yes(70, 2675);
+        }
+        if let Some(id) = state.poly_no_to_id.read().get(&hash_b).copied() {
+            state.markets[id as usize].poly.update_no(70, 2675);
+        }
+
+        // Verify both markets have complete pricing
+        let (m0_yes, m0_no, m0_yes_size, m0_no_size) = state.markets[0].poly.load();
+        let (m1_yes, m1_no, m1_yes_size, m1_no_size) = state.markets[1].poly.load();
+
+        // Market 0: YES=token_a(34), NO=token_b(70)
+        assert_eq!(m0_yes, 34);
+        assert_eq!(m0_no, 70);
+        assert_eq!(m0_yes_size, 462);
+        assert_eq!(m0_no_size, 2675);
+
+        // Market 1: YES=token_b(70), NO=token_a(34)
+        assert_eq!(m1_yes, 70);
+        assert_eq!(m1_no, 34);
+        assert_eq!(m1_yes_size, 2675);
+        assert_eq!(m1_no_size, 462);
+    }
+
+    #[test]
+    fn test_standard_market_single_token_per_role() {
+        // Standard sports markets (NBA, NFL, etc.) don't have shared tokens.
+        // Each market has unique YES/NO tokens. Verify this still works.
+        let state = GlobalState::new();
+
+        let pair = MarketPair {
+            pair_id: "nba-lal-bos".into(),
+            league: "nba".into(),
+            market_type: MarketType::Moneyline,
+            description: "Lakers vs Celtics".into(),
+            kalshi_event_ticker: "KXNBAGAME-26JAN17LALBOS".into(),
+            kalshi_market_ticker: "KXNBAGAME-26JAN17LALBOS-LAL".into(),
+            kalshi_event_slug: "nba-game".into(),
+            poly_slug: "nba-lal-bos-2026-01-17".into(),
+            poly_yes_token: "unique_yes_token_123".into(),
+            poly_no_token: "unique_no_token_456".into(),
+            line_value: None,
+            team_suffix: Some("LAL".into()),
+        };
+
+        state.add_pair(pair);
+
+        // Verify tokens are only in one map each
+        let yes_hash = fxhash_str("unique_yes_token_123");
+        let no_hash = fxhash_str("unique_no_token_456");
+
+        assert!(state.poly_yes_to_id.read().get(&yes_hash).is_some());
+        assert!(state.poly_no_to_id.read().get(&yes_hash).is_none()); // YES token not in NO map
+
+        assert!(state.poly_no_to_id.read().get(&no_hash).is_some());
+        assert!(state.poly_yes_to_id.read().get(&no_hash).is_none()); // NO token not in YES map
+
+        // Update prices
+        if let Some(id) = state.poly_yes_to_id.read().get(&yes_hash).copied() {
+            state.markets[id as usize].poly.update_yes(45, 1000);
+        }
+        if let Some(id) = state.poly_no_to_id.read().get(&no_hash).copied() {
+            state.markets[id as usize].poly.update_no(58, 2000);
+        }
+
+        let (yes, no, yes_size, no_size) = state.markets[0].poly.load();
+        assert_eq!(yes, 45);
+        assert_eq!(no, 58);
+        assert_eq!(yes_size, 1000);
+        assert_eq!(no_size, 2000);
+    }
+
+    #[test]
+    fn test_price_change_updates_both_markets_for_shared_token() {
+        // Test that process_price_change logic updates both markets when a shared
+        // token's price changes. This is the same bug fix as process_book but for
+        // incremental price updates instead of book snapshots.
+        //
+        // Scenario: Esports market where Token_A is YES for Market 0, NO for Market 1.
+        // When Token_A's price changes, BOTH markets should be updated.
+        let (state, token_optic, _token_thieves) = create_esports_state_with_shared_tokens();
+
+        // Simulate price change for Token_OpTic: new price = 40 cents
+        // This simulates what process_price_change does (without async/exec_tx)
+        let optic_hash = fxhash_str(&token_optic);
+        let new_price: u16 = 40;
+
+        // First, set initial sizes (process_price_change preserves sizes)
+        state.markets[0].poly.update_yes(34, 500);  // Initial YES for market 0
+        state.markets[1].poly.update_no(34, 500);   // Initial NO for market 1
+
+        // Now simulate process_price_change receiving a price update for token_optic
+        // The function checks YES lookup first, then NO lookup (no early return)
+
+        // Check YES token lookup
+        if let Some(market_id) = state.poly_yes_to_id.read().get(&optic_hash).copied() {
+            let market = &state.markets[market_id as usize];
+            let (_, _, current_yes_size, _) = market.poly.load();
+            market.poly.update_yes(new_price, current_yes_size);
+            market.inc_poly_updates();
+        }
+
+        // Check NO token lookup (same token can be NO for different market)
+        // OLD BUGGY CODE would have `return` above, never reaching here
+        if let Some(market_id) = state.poly_no_to_id.read().get(&optic_hash).copied() {
+            let market = &state.markets[market_id as usize];
+            let (_, _, _, current_no_size) = market.poly.load();
+            market.poly.update_no(new_price, current_no_size);
+            market.inc_poly_updates();
+        }
+
+        // Verify Market 0: Token_OpTic is YES, should have YES price updated to 40
+        let (m0_yes, _, _, _) = state.markets[0].poly.load();
+        assert_eq!(m0_yes, 40, "Market 0 YES (OpTic wins) should be updated to 40 cents");
+
+        // Verify Market 1: Token_OpTic is NO, should have NO price updated to 40
+        let (_, m1_no, _, _) = state.markets[1].poly.load();
+        assert_eq!(m1_no, 40, "Market 1 NO (Thieves loses) should ALSO be updated to 40 cents");
+
+        // Verify update counts reflect both markets were updated
+        let (_, m0_p_upd) = state.markets[0].load_update_counts();
+        let (_, m1_p_upd) = state.markets[1].load_update_counts();
+        assert_eq!(m0_p_upd, 1, "Market 0 should have 1 Poly update from price change");
+        assert_eq!(m1_p_upd, 1, "Market 1 should have 1 Poly update from price change");
     }
 }

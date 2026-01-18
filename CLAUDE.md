@@ -38,7 +38,7 @@ WebSocket Feeds (kalshi.rs, polymarket.rs)
     ↓
 Global State with Lock-Free Orderbook Cache (types.rs)
     ↓
-Heartbeat Arbitrage Detection (main.rs, every 60s)
+Heartbeat Arbitrage Detection (main.rs, every 10s default)
     ↓
 Execution Loop (execution.rs)
     ↓
