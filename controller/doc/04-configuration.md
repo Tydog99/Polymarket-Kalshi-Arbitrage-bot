@@ -41,7 +41,6 @@ POLY_FUNDER=0xYOUR_POLYMARKET_WALLET_ADDRESS_HERE
 DRY_RUN=1
 RUST_LOG=info
 FORCE_DISCOVERY=0
-PRICE_LOGGING=0
 
 # ============================================
 # TEST MODE (Leave as is for normal use)
@@ -104,7 +103,6 @@ These settings control how the bot behaves:
 | `DRY_RUN` | `1` = Safe mode<br>`0` = Live trading | **START WITH `1`** - This makes the bot test without using real money. Only change to `0` when you're ready for real trading! |
 | `RUST_LOG` | `info`, `debug`, `warn`, `error` | How much detail to show in logs. `info` is good for most users. |
 | `FORCE_DISCOVERY` | `0` = Use cache<br>`1` = Refresh | Usually keep at `0`. Set to `1` if markets aren't matching properly. |
-| `PRICE_LOGGING` | `0` = Normal<br>`1` = Verbose | Usually keep at `0`. Set to `1` to see every price update (lots of output!). |
 
 ### Circuit Breaker Settings (Risk Management)
 
@@ -188,7 +186,6 @@ POLY_FUNDER=0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
 DRY_RUN=1
 RUST_LOG=info
 FORCE_DISCOVERY=0
-PRICE_LOGGING=0
 
 # Circuit Breaker
 CB_ENABLED=true

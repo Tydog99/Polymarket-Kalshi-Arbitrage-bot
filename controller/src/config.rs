@@ -158,17 +158,6 @@ pub fn heartbeat_interval_secs() -> u64 {
     })
 }
 
-/// Price logging enabled (set PRICE_LOGGING=1 to enable)
-#[allow(dead_code)]
-pub fn price_logging_enabled() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("PRICE_LOGGING")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false)
-    })
-}
-
 /// League configuration for market discovery
 #[derive(Debug, Clone)]
 pub struct LeagueConfig {

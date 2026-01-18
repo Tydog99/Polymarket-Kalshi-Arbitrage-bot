@@ -139,7 +139,6 @@ DISCOVERY_ONLY=1 FORCE_DISCOVERY=1 cargo run -p controller --release
 | `RUST_LOG` | `info` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
 | `FORCE_DISCOVERY` | `0` | `1` = re-fetch market mappings (ignore cache) |
 | `DISCOVERY_INTERVAL_MINS` | `15` | Minutes between runtime discovery scans (0 = disabled) |
-| `PRICE_LOGGING` | `0` | `1` = verbose price update logging |
 
 ### Remote Trader (Controller ↔ Trader on separate machines)
 

@@ -223,7 +223,6 @@ See `trader/README.md` for setup and required environment variables.
 | `FORCE_DISCOVERY` | `false` | `1` or `true` = clear cache and re-fetch all markets |
 | `DISCOVERY_INTERVAL_MINS` | `15` | Minutes between discovery refreshes (0 = disabled) |
 | `ENABLED_LEAGUES` | *(all)* | Comma-separated leagues to monitor (see below) |
-| `PRICE_LOGGING` | `false` | `1` or `true` = enable detailed price logging (performance impact) |
 
 **Supported leagues**: `epl`, `bundesliga`, `laliga`, `seriea`, `ligue1`, `ucl`, `uel`, `eflc`, `nba`, `nfl`, `nhl`, `mlb`, `mls`, `ncaaf`, `cs2`, `lol`, `cod`
 
