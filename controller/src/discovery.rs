@@ -1294,7 +1294,11 @@ impl DiscoveryClient {
 
                             // Validation: if swapped, verify kalshi_team matches poly_team2
                             // If neither matches, we have an alias gap that needs fixing
-                            if swapped && std::env::var("ALIAS_VALIDATION").is_ok() {
+                            // Enabled by default; set ALIAS_VALIDATION=0 to disable
+                            let alias_validation = std::env::var("ALIAS_VALIDATION")
+                                .map(|v| v != "0" && v.to_lowercase() != "false")
+                                .unwrap_or(true);
+                            if swapped && alias_validation {
                                 let poly_team2 = if norm1 == *poly_team1 { &norm2 } else { &norm1 };
                                 let matches_team2 = teams_match_canonical(&kalshi_team_norm, poly_team2);
                                 if !matches_team2 {
