@@ -518,7 +518,12 @@ pub async fn run_ws(
                                 match kalshi_msg.msg_type.as_str() {
                                     "orderbook_snapshot" => {
                                         if let Some(body) = &kalshi_msg.msg {
+                                            let now_ms = SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis() as u64;
                                             process_kalshi_snapshot(market, body);
+                                            market.mark_kalshi_update_unix_ms(now_ms);
 
                                             // Check for arbs
                                             let arb_mask = market.check_arbs(threshold_cents);
@@ -529,7 +534,12 @@ pub async fn run_ws(
                                     }
                                     "orderbook_delta" => {
                                         if let Some(body) = &kalshi_msg.msg {
+                                            let now_ms = SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis() as u64;
                                             process_kalshi_delta(market, body);
+                                            market.mark_kalshi_update_unix_ms(now_ms);
 
                                             let arb_mask = market.check_arbs(threshold_cents);
                                             if arb_mask != 0 {
