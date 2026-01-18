@@ -76,6 +76,41 @@ fn cli_has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn fmt_age(now_ms: u64, then_ms: u64) -> String {
+    if then_ms == 0 || then_ms > now_ms {
+        return "--".to_string();
+    }
+    let delta_ms = now_ms - then_ms;
+    if delta_ms < 1_000 {
+        format!("{}ms", delta_ms)
+    } else if delta_ms < 60_000 {
+        format!("{:.1}s", (delta_ms as f64) / 1000.0)
+    } else if delta_ms < 3_600_000 {
+        format!("{:.1}m", (delta_ms as f64) / 60_000.0)
+    } else {
+        format!("{:.1}h", (delta_ms as f64) / 3_600_000.0)
+    }
+}
+
+fn fmt_unix_ms_hhmmss(unix_ms: u64) -> String {
+    if unix_ms == 0 {
+        return "--:--:--".to_string();
+    }
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_millis_opt(unix_ms as i64)
+        .single()
+        .map(|dt| dt.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "--:--:--".to_string())
+}
+
 /// Print a summary table of discovery results
 fn print_discovery_summary(result: &types::DiscoveryResult) {
     use std::collections::BTreeSet;
@@ -361,6 +396,12 @@ async fn main() -> Result<()> {
     }
     if let Some(v) = cli_arg_value(&args, "--pairing-debug-limit") {
         std::env::set_var("PAIRING_DEBUG_LIMIT", v);
+    }
+    if cli_has_flag(&args, "--verbose-heartbeat") {
+        std::env::set_var("VERBOSE_HEARTBEAT", "1");
+    }
+    if let Some(v) = cli_arg_value(&args, "--heartbeat-interval") {
+        std::env::set_var("HEARTBEAT_INTERVAL_SECS", v);
     }
 
     // Build league list for discovery from CLI/env.
@@ -847,13 +888,22 @@ async fn main() -> Result<()> {
     let heartbeat_threshold = threshold_cents;
     let heartbeat_handle = tokio::spawn(async move {
         use crate::types::kalshi_fee_cents;
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+            config::heartbeat_interval_secs(),
+        ));
         loop {
             interval.tick().await;
             let market_count = heartbeat_state.market_count();
+            let verbose = config::verbose_heartbeat_enabled();
+            let now_ms = now_unix_ms();
             let mut with_kalshi = 0;
             let mut with_poly = 0;
             let mut with_both = 0;
+            let mut max_k_age_ms: u64 = 0;
+            let mut max_p_age_ms: u64 = 0;
+
+            // In verbose mode, collect a sample of markets to print.
+            let mut verbose_lines: Vec<String> = Vec::new();
             // Track best arbitrage opportunity:
             // (total_cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no, max_contracts)
             #[allow(clippy::type_complexity)]
@@ -862,10 +912,46 @@ async fn main() -> Result<()> {
             for market in heartbeat_state.markets.iter().take(market_count) {
                 let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
                 let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.load();
+                let (k_last_ms, p_last_ms) = market.last_updates_unix_ms();
+
                 let has_k = k_yes > 0 && k_no > 0;
                 let has_p = p_yes > 0 && p_no > 0;
                 if k_yes > 0 || k_no > 0 { with_kalshi += 1; }
                 if p_yes > 0 || p_no > 0 { with_poly += 1; }
+
+                if k_last_ms > 0 && k_last_ms <= now_ms {
+                    max_k_age_ms = max_k_age_ms.max(now_ms - k_last_ms);
+                }
+                if p_last_ms > 0 && p_last_ms <= now_ms {
+                    max_p_age_ms = max_p_age_ms.max(now_ms - p_last_ms);
+                }
+
+                if verbose && verbose_lines.len() < 25 {
+                    if let Some(pair) = market.pair() {
+                        let k_age = fmt_age(now_ms, k_last_ms);
+                        let p_age = fmt_age(now_ms, p_last_ms);
+                        let k_time = fmt_unix_ms_hhmmss(k_last_ms);
+                        let p_time = fmt_unix_ms_hhmmss(p_last_ms);
+                        verbose_lines.push(format!(
+                            "[{}] {} | K y/n={}/{} sz={}/{} last={} ({} ago) | P y/n={}/{} sz={}/{} last={} ({} ago)",
+                            market.market_id,
+                            pair.description,
+                            k_yes,
+                            k_no,
+                            k_yes_size,
+                            k_no_size,
+                            k_time,
+                            k_age,
+                            p_yes,
+                            p_no,
+                            p_yes_size,
+                            p_no_size,
+                            p_time,
+                            p_age
+                        ));
+                    }
+                }
+
                 if has_k && has_p {
                     with_both += 1;
 
@@ -900,9 +986,28 @@ async fn main() -> Result<()> {
             }
 
             let now = chrono::Local::now().format("%H:%M:%S");
-            print!("\r[{}]  INFO 💓 {} markets | K:{} P:{} Both:{} | threshold={}¢    ",
-                   now, market_count, with_kalshi, with_poly, with_both, heartbeat_threshold);
+            let max_k_age = if max_k_age_ms == 0 { "--".to_string() } else { fmt_age(now_ms, now_ms.saturating_sub(max_k_age_ms)) };
+            let max_p_age = if max_p_age_ms == 0 { "--".to_string() } else { fmt_age(now_ms, now_ms.saturating_sub(max_p_age_ms)) };
+            print!(
+                "\r[{}]  INFO 💓 {} markets | K:{} (max_age {}) P:{} (max_age {}) Both:{} | threshold={}¢    ",
+                now,
+                market_count,
+                with_kalshi,
+                max_k_age,
+                with_poly,
+                max_p_age,
+                with_both,
+                heartbeat_threshold
+            );
             let _ = std::io::stdout().flush();
+
+            if verbose {
+                println!();
+                info!("💓 VERBOSE heartbeat snapshot @ {} (showing up to {} markets)", now, verbose_lines.len());
+                for line in &verbose_lines {
+                    info!("  {}", line);
+                }
+            }
 
             if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes, max_contracts)) = best_arb {
                 let gap = cost as i16 - heartbeat_threshold as i16;

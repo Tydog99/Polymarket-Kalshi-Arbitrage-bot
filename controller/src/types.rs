@@ -160,6 +160,10 @@ pub struct AtomicMarketState {
     pub kalshi: AtomicOrderbook,
     /// Polymarket platform orderbook state
     pub poly: AtomicOrderbook,
+    /// Last known Kalshi update time (unix ms). 0 = unknown / never updated.
+    kalshi_last_update_unix_ms: AtomicU64,
+    /// Last known Polymarket update time (unix ms). 0 = unknown / never updated.
+    poly_last_update_unix_ms: AtomicU64,
     /// Market pair metadata (supports runtime addition via interior mutability)
     pair: RwLock<Option<Arc<MarketPair>>>,
     /// Unique market identifier for O(1) lookups
@@ -171,6 +175,8 @@ impl AtomicMarketState {
         Self {
             kalshi: AtomicOrderbook::new(),
             poly: AtomicOrderbook::new(),
+            kalshi_last_update_unix_ms: AtomicU64::new(0),
+            poly_last_update_unix_ms: AtomicU64::new(0),
             pair: RwLock::new(None),
             market_id,
         }
@@ -186,6 +192,29 @@ impl AtomicMarketState {
     #[inline]
     pub fn set_pair(&self, pair: Arc<MarketPair>) {
         *self.pair.write() = Some(pair);
+    }
+
+    /// Record last update time for Kalshi (unix ms).
+    #[inline]
+    pub fn mark_kalshi_update_unix_ms(&self, unix_ms: u64) {
+        self.kalshi_last_update_unix_ms
+            .store(unix_ms, Ordering::Release);
+    }
+
+    /// Record last update time for Polymarket (unix ms).
+    #[inline]
+    pub fn mark_poly_update_unix_ms(&self, unix_ms: u64) {
+        self.poly_last_update_unix_ms
+            .store(unix_ms, Ordering::Release);
+    }
+
+    /// Get last update times (kalshi_unix_ms, poly_unix_ms).
+    #[inline]
+    pub fn last_updates_unix_ms(&self) -> (u64, u64) {
+        (
+            self.kalshi_last_update_unix_ms.load(Ordering::Acquire),
+            self.poly_last_update_unix_ms.load(Ordering::Acquire),
+        )
     }
 
     #[inline(always)]

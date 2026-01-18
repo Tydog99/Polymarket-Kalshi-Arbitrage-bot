@@ -73,6 +73,30 @@ pub const KALSHI_API_DELAY_MS: u64 = 60;
 /// WebSocket reconnect delay (seconds)
 pub const WS_RECONNECT_DELAY_SECS: u64 = 5;
 
+/// Enable verbose heartbeat output with per-market details.
+/// - Set `VERBOSE_HEARTBEAT=1` or pass `--verbose-heartbeat`.
+pub fn verbose_heartbeat_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("VERBOSE_HEARTBEAT")
+            .map(|v| v == "1" || v.to_lowercase() == "true" || v.to_lowercase() == "yes")
+            .unwrap_or(false)
+    })
+}
+
+/// Heartbeat interval in seconds for the diagnostics loop.
+/// - Set `HEARTBEAT_INTERVAL_SECS=N` or pass `--heartbeat-interval N`.
+pub fn heartbeat_interval_secs() -> u64 {
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("HEARTBEAT_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0 && *v <= 3600)
+            .unwrap_or(10)
+    })
+}
+
 /// Which leagues to monitor (empty = all)
 /// Set ENABLED_LEAGUES env var to comma-separated list, e.g., "cs2,lol,cod"
 pub fn enabled_leagues() -> &'static [String] {
