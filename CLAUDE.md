@@ -106,7 +106,7 @@ CONTROLLER_PLATFORMS=kalshi,polymarket dotenvx run -- cargo run --release
 dotenvx run -- cargo run --release
 ```
 
-**Circuit breaker:** `CB_ENABLED`, `CB_MAX_POSITION_PER_MARKET`, `CB_MAX_TOTAL_POSITION`, `CB_MAX_DAILY_LOSS`, `CB_MAX_CONSECUTIVE_ERRORS`, `CB_COOLDOWN_SECS`
+**Circuit breaker:** `CB_ENABLED`, `CB_MAX_POSITION_PER_MARKET`, `CB_MAX_TOTAL_POSITION`, `CB_MAX_DAILY_LOSS`, `CB_MAX_CONSECUTIVE_ERRORS`, `CB_COOLDOWN_SECS`, `CB_MIN_CONTRACTS` (minimum contracts to execute, trades are capped to remaining capacity)
 
 ## Tailscale Setup (Remote Trading)
 

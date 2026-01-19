@@ -2,6 +2,7 @@
 //! with optional local execution for authorized platforms.
 
 use anyhow::{anyhow, Result};
+use chrono::Local;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -107,13 +108,37 @@ impl HybridExecutor {
             return Ok(());
         }
 
-        let max_contracts = (req.yes_size.min(req.no_size) / 100) as i64;
+        let mut max_contracts = (req.yes_size.min(req.no_size) / 100) as i64;
         if max_contracts < 1 {
             self.release_in_flight_delayed(market_id);
             return Ok(());
         }
 
-        // Circuit breaker check
+        // Circuit breaker: get remaining capacity and cap if needed
+        let capacity = self.circuit_breaker.get_remaining_capacity(&pair.pair_id).await;
+        let min_contracts = self.circuit_breaker.min_contracts();
+
+        // Skip trade if insufficient capacity
+        if capacity.effective < min_contracts {
+            warn!(
+                "[HYBRID] ⛔ Insufficient capacity: {} | remaining={} | min={}",
+                pair.description, capacity.effective, min_contracts
+            );
+            self.release_in_flight_delayed(market_id);
+            return Ok(());
+        }
+
+        // Cap contracts to remaining capacity if needed
+        if max_contracts > capacity.effective {
+            info!(
+                "[HYBRID] 📉 Capped: {} -> {} contracts | market={} | per_market={} total={}",
+                max_contracts, capacity.effective, pair.description,
+                capacity.per_market, capacity.total
+            );
+            max_contracts = capacity.effective;
+        }
+
+        // Safety net: verify with can_execute (should always pass after capping)
         if let Err(_reason) = self
             .circuit_breaker
             .can_execute(&pair.pair_id, max_contracts)
@@ -156,12 +181,11 @@ impl HybridExecutor {
             .to_lowercase();
         let kalshi_event_ticker_lower = pair.kalshi_event_ticker.to_lowercase();
         let poly_url = build_polymarket_url(&pair.league, &pair.poly_slug);
-        info!(
-            "[REMOTE_EXEC] 🔗 Kalshi: {}/{}/{}/{} | Polymarket: {}",
-            KALSHI_WEB_BASE,
-            kalshi_series,
-            pair.kalshi_event_slug,
-            kalshi_event_ticker_lower,
+        let kalshi_url = format!("{}/{}/{}/{}", KALSHI_WEB_BASE, kalshi_series, pair.kalshi_event_slug, kalshi_event_ticker_lower);
+        // OSC 8 hyperlinks (must use print! as tracing escapes control chars)
+        println!("[{}]  \x1b[32mINFO\x1b[0m controller::remote_execution: [REMOTE_EXEC] 🔗 \x1b]8;;{}\x07Kalshi\x1b]8;;\x07 | \x1b]8;;{}\x07Polymarket\x1b]8;;\x07",
+            Local::now().format("%H:%M:%S"),
+            kalshi_url,
             poly_url
         );
 
@@ -485,6 +509,7 @@ mod tests {
             max_consecutive_errors: 999,
             cooldown_secs: 0,
             enabled: false,
+            min_contracts: 1,
         }))
     }
 

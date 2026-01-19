@@ -148,6 +148,7 @@ mod circuit_breaker_tests {
             max_consecutive_errors: 3,
             cooldown_secs: 60,
             enabled: true,
+            min_contracts: 1,
         }
     }
     
@@ -306,6 +307,7 @@ mod e2e_tests {
             max_consecutive_errors: 5,
             cooldown_secs: 60,
             enabled: true,
+            min_contracts: 1,
         };
         
         let cb = CircuitBreaker::new(config);
@@ -817,6 +819,7 @@ mod execution_tests {
             max_consecutive_errors: 3,
             cooldown_secs: 60,
             enabled: true,
+            min_contracts: 1,
         };
 
         let cb = CircuitBreaker::new(config);
@@ -1338,6 +1341,7 @@ mod process_mock_tests {
             max_consecutive_errors: 5,
             cooldown_secs: 60,
             enabled: true,
+            min_contracts: 1,
         }
     }
 

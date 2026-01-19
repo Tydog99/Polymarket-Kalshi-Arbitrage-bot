@@ -13,21 +13,24 @@ use tracing::{error, warn, info};
 pub struct CircuitBreakerConfig {
     /// Maximum position size per market (in contracts)
     pub max_position_per_market: i64,
-    
+
     /// Maximum total position across all markets (in contracts)
     pub max_total_position: i64,
-    
+
     /// Maximum daily loss (in dollars) before halting
     pub max_daily_loss: f64,
-    
+
     /// Maximum number of consecutive errors before halting
     pub max_consecutive_errors: u32,
-    
+
     /// Cooldown period after a trip (seconds)
     pub cooldown_secs: u64,
-    
+
     /// Whether circuit breakers are enabled
     pub enabled: bool,
+
+    /// Minimum contracts to execute (trades below this are skipped)
+    pub min_contracts: i64,
 }
 
 impl CircuitBreakerConfig {
@@ -61,6 +64,11 @@ impl CircuitBreakerConfig {
             enabled: std::env::var("CB_ENABLED")
                 .map(|v| v == "1" || v == "true")
                 .unwrap_or(true), // Enabled by default for safety
+
+            min_contracts: std::env::var("CB_MIN_CONTRACTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
         }
     }
 }
@@ -95,6 +103,17 @@ impl std::fmt::Display for TripReason {
             }
         }
     }
+}
+
+/// Remaining capacity for trading, used for capping trade sizes
+#[derive(Debug, Clone, Copy)]
+pub struct RemainingCapacity {
+    /// Remaining capacity for this specific market
+    pub per_market: i64,
+    /// Remaining capacity across all markets
+    pub total: i64,
+    /// Effective remaining capacity (minimum of per_market and total)
+    pub effective: i64,
 }
 
 /// Position tracking for a single market
@@ -150,6 +169,7 @@ impl CircuitBreaker {
         info!("[CB]   Max daily loss: ${:.2}", config.max_daily_loss);
         info!("[CB]   Max consecutive errors: {}", config.max_consecutive_errors);
         info!("[CB]   Cooldown: {}s", config.cooldown_secs);
+        info!("[CB]   Min contracts: {}", config.min_contracts);
         
         Self {
             config,
@@ -170,7 +190,46 @@ impl CircuitBreaker {
         }
         !self.halted.load(Ordering::SeqCst)
     }
-    
+
+    /// Get the minimum contracts threshold
+    pub fn min_contracts(&self) -> i64 {
+        self.config.min_contracts
+    }
+
+    /// Get remaining capacity for a specific market
+    /// Returns how many more contracts can be traded for this market
+    pub async fn get_remaining_capacity(&self, market_id: &str) -> RemainingCapacity {
+        if !self.config.enabled {
+            return RemainingCapacity {
+                per_market: i64::MAX,
+                total: i64::MAX,
+                effective: i64::MAX,
+            };
+        }
+
+        let positions = self.positions.read().await;
+
+        // Calculate remaining per-market capacity
+        let current_market_position = positions
+            .get(market_id)
+            .map(|p| p.total_contracts())
+            .unwrap_or(0);
+        let per_market = self.config.max_position_per_market - current_market_position;
+
+        // Calculate remaining total capacity
+        let total_position: i64 = positions.values().map(|p| p.total_contracts()).sum();
+        let total = self.config.max_total_position - total_position;
+
+        // Effective is the minimum of both
+        let effective = per_market.min(total).max(0);
+
+        RemainingCapacity {
+            per_market: per_market.max(0),
+            total: total.max(0),
+            effective,
+        }
+    }
+
     /// Check if we can execute a trade for a specific market
     pub async fn can_execute(&self, market_id: &str, contracts: i64) -> Result<(), TripReason> {
         if !self.config.enabled {
@@ -362,7 +421,7 @@ impl std::fmt::Display for CircuitBreakerStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_circuit_breaker_position_limit() {
         let config = CircuitBreakerConfig {
@@ -372,21 +431,22 @@ mod tests {
             max_consecutive_errors: 3,
             cooldown_secs: 60,
             enabled: true,
+            min_contracts: 1,
         };
-        
+
         let cb = CircuitBreaker::new(config);
-        
+
         // Should allow initial trade
         assert!(cb.can_execute("market1", 5).await.is_ok());
-        
+
         // Record the trade
         cb.record_success("market1", 5, 5, 0.0).await;
-        
+
         // Should reject trade exceeding per-market limit
         let result = cb.can_execute("market1", 10).await;
         assert!(matches!(result, Err(TripReason::MaxPositionPerMarket { .. })));
     }
-    
+
     #[tokio::test]
     async fn test_consecutive_errors() {
         let config = CircuitBreakerConfig {
@@ -396,17 +456,127 @@ mod tests {
             max_consecutive_errors: 3,
             cooldown_secs: 60,
             enabled: true,
+            min_contracts: 1,
         };
-        
+
         let cb = CircuitBreaker::new(config);
-        
+
         // Record errors
         cb.record_error().await;
         cb.record_error().await;
         assert!(cb.is_trading_allowed());
-        
+
         // Third error should trip
         cb.record_error().await;
         assert!(!cb.is_trading_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_get_remaining_capacity_empty() {
+        let config = CircuitBreakerConfig {
+            max_position_per_market: 100,
+            max_total_position: 500,
+            max_daily_loss: 100.0,
+            max_consecutive_errors: 3,
+            cooldown_secs: 60,
+            enabled: true,
+            min_contracts: 1,
+        };
+
+        let cb = CircuitBreaker::new(config);
+
+        // With no positions, capacity should equal limits
+        let capacity = cb.get_remaining_capacity("market1").await;
+        assert_eq!(capacity.per_market, 100);
+        assert_eq!(capacity.total, 500);
+        assert_eq!(capacity.effective, 100); // min(100, 500)
+    }
+
+    #[tokio::test]
+    async fn test_get_remaining_capacity_after_trade() {
+        let config = CircuitBreakerConfig {
+            max_position_per_market: 100,
+            max_total_position: 500,
+            max_daily_loss: 100.0,
+            max_consecutive_errors: 3,
+            cooldown_secs: 60,
+            enabled: true,
+            min_contracts: 1,
+        };
+
+        let cb = CircuitBreaker::new(config);
+
+        // Record a trade of 30 contracts
+        cb.record_success("market1", 15, 15, 0.0).await;
+
+        // Capacity for market1 should be reduced
+        let capacity = cb.get_remaining_capacity("market1").await;
+        assert_eq!(capacity.per_market, 70); // 100 - 30
+        assert_eq!(capacity.total, 470);     // 500 - 30
+        assert_eq!(capacity.effective, 70);  // min(70, 470)
+
+        // Capacity for a different market should only be limited by total
+        let capacity2 = cb.get_remaining_capacity("market2").await;
+        assert_eq!(capacity2.per_market, 100); // Full per-market limit
+        assert_eq!(capacity2.total, 470);      // 500 - 30
+        assert_eq!(capacity2.effective, 100);  // min(100, 470)
+    }
+
+    #[tokio::test]
+    async fn test_get_remaining_capacity_total_limit_constrains() {
+        let config = CircuitBreakerConfig {
+            max_position_per_market: 100,
+            max_total_position: 50, // Total is less than per-market
+            max_daily_loss: 100.0,
+            max_consecutive_errors: 3,
+            cooldown_secs: 60,
+            enabled: true,
+            min_contracts: 1,
+        };
+
+        let cb = CircuitBreaker::new(config);
+
+        // Effective should be constrained by total
+        let capacity = cb.get_remaining_capacity("market1").await;
+        assert_eq!(capacity.per_market, 100);
+        assert_eq!(capacity.total, 50);
+        assert_eq!(capacity.effective, 50); // min(100, 50)
+    }
+
+    #[tokio::test]
+    async fn test_get_remaining_capacity_disabled() {
+        let config = CircuitBreakerConfig {
+            max_position_per_market: 100,
+            max_total_position: 500,
+            max_daily_loss: 100.0,
+            max_consecutive_errors: 3,
+            cooldown_secs: 60,
+            enabled: false, // Disabled
+            min_contracts: 1,
+        };
+
+        let cb = CircuitBreaker::new(config);
+
+        // When disabled, capacity should be unlimited
+        let capacity = cb.get_remaining_capacity("market1").await;
+        assert_eq!(capacity.per_market, i64::MAX);
+        assert_eq!(capacity.total, i64::MAX);
+        assert_eq!(capacity.effective, i64::MAX);
+    }
+
+    #[tokio::test]
+    async fn test_min_contracts_getter() {
+        let config = CircuitBreakerConfig {
+            max_position_per_market: 100,
+            max_total_position: 500,
+            max_daily_loss: 100.0,
+            max_consecutive_errors: 3,
+            cooldown_secs: 60,
+            enabled: true,
+            min_contracts: 5,
+        };
+
+        let cb = CircuitBreaker::new(config);
+        assert_eq!(cb.min_contracts(), 5);
     }
 }

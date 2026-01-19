@@ -45,6 +45,7 @@ fn cb_disabled() -> Arc<CircuitBreaker> {
         max_consecutive_errors: 999,
         cooldown_secs: 0,
         enabled: false,
+        min_contracts: 1,
     }))
 }
 

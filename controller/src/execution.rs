@@ -4,6 +4,7 @@
 //! position reconciliation, and automatic exposure management.
 
 use anyhow::{Result, anyhow};
+use chrono::Local;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -225,11 +226,41 @@ impl ExecutionEngine {
             });
         }
 
-        // Circuit breaker check
+        // Circuit breaker: get remaining capacity and cap if needed
+        let capacity = self.circuit_breaker.get_remaining_capacity(&pair.pair_id).await;
+        let min_contracts = self.circuit_breaker.min_contracts();
+
+        // Skip trade if insufficient capacity
+        if capacity.effective < min_contracts {
+            warn!(
+                "[EXEC] ⛔ Insufficient capacity: {} | market={} | remaining={} | min={}",
+                pair.description, pair.pair_id, capacity.effective, min_contracts
+            );
+            self.release_in_flight(market_id);
+            return Ok(ExecutionResult {
+                market_id,
+                success: false,
+                profit_cents: 0,
+                latency_ns: self.clock.now_ns() - req.detected_ns,
+                error: Some("Insufficient capacity"),
+            });
+        }
+
+        // Cap contracts to remaining capacity if needed
+        if max_contracts > capacity.effective {
+            info!(
+                "[EXEC] 📉 Capped: {} -> {} contracts | market={} | per_market={} total={}",
+                max_contracts, capacity.effective, pair.description,
+                capacity.per_market, capacity.total
+            );
+            max_contracts = capacity.effective;
+        }
+
+        // Safety net: verify with can_execute (should always pass after capping)
         if let Err(reason) = self.circuit_breaker.can_execute(&pair.pair_id, max_contracts).await {
             warn!(
-                "[EXEC] ⛔ Circuit breaker blocked: {} | market={} | pair={} | contracts={}",
-                reason, pair.description, pair.pair_id, max_contracts
+                "[EXEC] ⛔ Circuit breaker blocked (post-cap): {} | market={} | contracts={}",
+                reason, pair.description, max_contracts
             );
             self.release_in_flight(market_id);
             return Ok(ExecutionResult {
@@ -271,12 +302,11 @@ impl ExecutionEngine {
             .to_lowercase();
         let kalshi_event_ticker_lower = pair.kalshi_event_ticker.to_lowercase();
         let poly_url = build_polymarket_url(&pair.league, &pair.poly_slug);
-        info!(
-            "[EXEC] 🔗 Kalshi: {}/{}/{}/{} | Polymarket: {}",
-            KALSHI_WEB_BASE,
-            kalshi_series,
-            pair.kalshi_event_slug,
-            kalshi_event_ticker_lower,
+        let kalshi_url = format!("{}/{}/{}/{}", KALSHI_WEB_BASE, kalshi_series, pair.kalshi_event_slug, kalshi_event_ticker_lower);
+        // OSC 8 hyperlinks (must use print! as tracing escapes control chars)
+        println!("[{}]  \x1b[32mINFO\x1b[0m controller::execution: [EXEC] 🔗 \x1b]8;;{}\x07Kalshi\x1b]8;;\x07 | \x1b]8;;{}\x07Polymarket\x1b]8;;\x07",
+            Local::now().format("%H:%M:%S"),
+            kalshi_url,
             poly_url
         );
 
@@ -747,7 +777,7 @@ pub async fn run_execution_loop(
                     if !already_logged {
                         let detail = engine.state.get_by_id(result.market_id)
                             .and_then(|m| m.pair())
-                            .map(|p| format!("{} ({})", p.description, p.pair_id))
+                            .map(|p| p.description.to_string())
                             .unwrap_or_else(|| format!("market_id={}", result.market_id));
                         warn!(
                             "[EXEC] ⚠️ {}: {:?}",
