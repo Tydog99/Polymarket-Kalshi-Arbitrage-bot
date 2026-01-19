@@ -38,7 +38,9 @@ pub struct PriceLevel {
 
 #[derive(Deserialize, Debug)]
 pub struct PriceChangeEvent {
-    pub event_type: Option<String>,
+    /// Array of price changes - the primary content of this message type.
+    /// Polymarket price_change messages don't have an event_type field,
+    /// they're identified by having this price_changes array.
     #[serde(default)]
     pub price_changes: Option<Vec<PriceChangeItem>>,
 }
@@ -437,26 +439,32 @@ async fn run_single_ws(
                     Some(Ok(Message::Text(text))) => {
                         last_message = Instant::now();
 
-                        // Try book snapshot first
+                        // Log raw message for debugging (first 200 chars)
+                        tracing::trace!("{} Raw WS: {}...", log_prefix, &text[..text.len().min(200)]);
+
+                        // Try book snapshot first (array of book objects)
                         if let Ok(books) = serde_json::from_str::<Vec<BookSnapshot>>(&text) {
-                            for book in &books {
-                                tracing::debug!(
-                                    "{} Book snapshot: asset={} asks={} bids={}",
-                                    log_prefix,
-                                    &book.asset_id[..book.asset_id.len().min(20)],
-                                    book.asks.len(),
-                                    book.bids.len()
-                                );
-                                process_book(&state, book, &exec_tx, threshold_cents, &clock).await;
+                            if !books.is_empty() {
+                                for book in &books {
+                                    tracing::debug!(
+                                        "{} Book snapshot: asset={} asks={} bids={}",
+                                        log_prefix,
+                                        &book.asset_id[..book.asset_id.len().min(20)],
+                                        book.asks.len(),
+                                        book.bids.len()
+                                    );
+                                    process_book(&state, book, &exec_tx, threshold_cents, &clock).await;
+                                }
                             }
+                            // Even if empty, this was a valid book array, don't try other parsers
                         }
-                        // Try price change event
+                        // Try price change event (single object with price_changes array)
+                        // Note: Polymarket price_change messages don't have event_type field,
+                        // they just have market + price_changes array directly
                         else if let Ok(event) = serde_json::from_str::<PriceChangeEvent>(&text) {
-                            if event.event_type.as_deref() == Some("price_change") {
-                                if let Some(changes) = &event.price_changes {
-                                    for change in changes {
-                                        process_price_change(&state, change, &exec_tx, threshold_cents, &clock).await;
-                                    }
+                            if let Some(changes) = &event.price_changes {
+                                for change in changes {
+                                    process_price_change(&state, change, &exec_tx, threshold_cents, &clock).await;
                                 }
                             }
                         }
@@ -587,8 +595,9 @@ async fn process_price_change(
     threshold_cents: PriceCents,
     clock: &NanoClock,
 ) {
-    // Only process ASK side updates
-    if !matches!(change.side.as_deref(), Some("ASK" | "ask")) {
+    // Only process SELL (ask) side updates
+    // Polymarket uses "SELL" for asks and "BUY" for bids
+    if !matches!(change.side.as_deref(), Some("SELL" | "sell")) {
         return;
     }
 
