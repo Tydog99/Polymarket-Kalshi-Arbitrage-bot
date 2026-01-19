@@ -1300,7 +1300,7 @@ async fn main() -> Result<()> {
                                 } else if m.gap < 0 {
                                     format!("\x1b[32m{:+}¢\x1b[0m", m.gap) // Green for arb
                                 } else {
-                                    format!("{:+}¢", m.gap)
+                                    format!("\x1b[31m{:+}¢\x1b[0m", m.gap) // Red for no arb
                                 };
 
                                 let k_time = fmt_unix_ms_hhmmss(m.k_last_ms);
@@ -1309,7 +1309,7 @@ async fn main() -> Result<()> {
                                 let p_age = fmt_age(now_ms, m.p_last_ms);
 
                                 println!(
-                                    "{}  {}── {:30} K:{} P:{} gap:{} upd:K{}/P{} last:K{}({}) P{}({})",
+                                    "{}  {}── \x1b[97m{:<55}\x1b[0m \x1b[36mK:{} P:{}\x1b[0m gap:{}    \x1b[33mupd:K{}/P{}\x1b[0m \x1b[90mlast:K{}({}) P{}({})\x1b[0m",
                                          prefix, item_branch, desc,
                                          k_str, p_str,
                                          gap_str, m.k_updates, m.p_updates,
@@ -1372,11 +1372,11 @@ async fn main() -> Result<()> {
                             .to_lowercase();
                         let kalshi_event_ticker_lower = p.kalshi_event_ticker.to_lowercase();
                         let poly_url = config::build_polymarket_url(&p.league, &p.poly_slug);
-                        info!("   🔗 Kalshi: {}/{}/{}/{} | Polymarket: {}",
-                              config::KALSHI_WEB_BASE,
-                              kalshi_series,
-                              p.kalshi_event_slug,
-                              kalshi_event_ticker_lower,
+                        let kalshi_url = format!("{}/{}/{}/{}", config::KALSHI_WEB_BASE, kalshi_series, p.kalshi_event_slug, kalshi_event_ticker_lower);
+                        // OSC 8 hyperlinks (must use print! as tracing escapes control chars)
+                        println!("[{}]  \x1b[32mINFO\x1b[0m controller: 🔗 \x1b]8;;{}\x07Kalshi\x1b]8;;\x07 | \x1b]8;;{}\x07Polymarket\x1b]8;;\x07",
+                              chrono::Local::now().format("%H:%M:%S"),
+                              kalshi_url,
                               poly_url);
                     }
                 }
