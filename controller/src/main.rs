@@ -1126,9 +1126,9 @@ async fn main() -> Result<()> {
             let mut total_poly_updates: u64 = 0;
             let mut with_both = 0usize;
             // Track best arbitrage opportunity:
-            // (total_cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no, max_contracts)
+            // (total_cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no, yes_size, no_size)
             #[allow(clippy::type_complexity)]
-            let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, bool, i64)> = None;
+            let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, bool, u16, u16)> = None;
 
             for market in heartbeat_state.markets.iter().take(market_count) {
                 let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
@@ -1186,16 +1186,14 @@ async fn main() -> Result<()> {
 
                     let fee1 = kalshi_fee_cents(k_no);
                     let cost1 = p_yes + k_no + fee1;
-                    let max1 = (p_yes_size.min(k_no_size) / 100) as i64;
 
                     let fee2 = kalshi_fee_cents(k_yes);
                     let cost2 = k_yes + fee2 + p_no;
-                    let max2 = (k_yes_size.min(p_no_size) / 100) as i64;
 
-                    let (best_cost, best_fee, is_poly_yes, best_max) = if cost1 <= cost2 {
-                        (cost1, fee1, true, max1)
+                    let (best_cost, best_fee, is_poly_yes, yes_size, no_size) = if cost1 <= cost2 {
+                        (cost1, fee1, true, p_yes_size, k_no_size)
                     } else {
-                        (cost2, fee2, false, max2)
+                        (cost2, fee2, false, k_yes_size, p_no_size)
                     };
 
                     if best_arb.is_none() || best_cost < best_arb.as_ref().unwrap().0 {
@@ -1208,7 +1206,8 @@ async fn main() -> Result<()> {
                             p_no,
                             best_fee,
                             is_poly_yes,
-                            best_max,
+                            yes_size,
+                            no_size,
                         ));
                     }
                 }
@@ -1331,7 +1330,7 @@ async fn main() -> Result<()> {
             }
 
             // Log best opportunity
-            if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes, max_contracts)) = best_arb {
+            if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes, yes_size, no_size)) = best_arb {
                 let gap = cost as i16 - heartbeat_threshold as i16;
                 let pair = heartbeat_state.get_by_id(market_id)
                     .and_then(|m| m.pair());
@@ -1352,12 +1351,15 @@ async fn main() -> Result<()> {
                 };
                 if gap < 0 {
                     println!();  // Move to new line before logging opportunity
-                    info!(
-                        "📊 Best opportunity: {} | {} | gap={:+}¢ | max={}x | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
+                    // Use println! for ANSI color support (tracing escapes control chars)
+                    println!(
+                        "[{}]  \x1b[32mINFO\x1b[0m controller: 📊 Best opportunity: {} | {} | gap=\x1b[32m{:+}¢\x1b[0m | size={}¢/{}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
+                        chrono::Local::now().format("%H:%M:%S"),
                         desc,
                         leg_breakdown,
                         gap,
-                        max_contracts,
+                        yes_size,
+                        no_size,
                         p_yes,
                         k_no,
                         k_yes,
