@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -545,7 +545,12 @@ async fn process_book(
             ask_size
         );
         let market = &state.markets[market_id as usize];
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         market.poly.update_yes(best_ask, ask_size);
+        market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
 
         // Check arbs
@@ -566,7 +571,12 @@ async fn process_book(
             ask_size
         );
         let market = &state.markets[market_id as usize];
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         market.poly.update_no(best_ask, ask_size);
+        market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
 
         // Check arbs
@@ -616,9 +626,14 @@ async fn process_price_change(
     if let Some(market_id) = yes_market_id {
         let market = &state.markets[market_id as usize];
         let (current_yes, _, current_yes_size, _) = market.poly.load();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
 
         // Always update cached price to reflect current market state
         market.poly.update_yes(price, current_yes_size);
+        market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
 
         // Only check arbs when price improves (lower = better for buying)
@@ -635,9 +650,14 @@ async fn process_price_change(
     if let Some(market_id) = no_market_id {
         let market = &state.markets[market_id as usize];
         let (_, current_no, _, current_no_size) = market.poly.load();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
 
         // Always update cached price to reflect current market state
         market.poly.update_no(price, current_no_size);
+        market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
 
         // Only check arbs when price improves (lower = better for buying)

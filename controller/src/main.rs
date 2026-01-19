@@ -118,6 +118,41 @@ fn cli_has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn fmt_age(now_ms: u64, then_ms: u64) -> String {
+    if then_ms == 0 || then_ms > now_ms {
+        return "--".to_string();
+    }
+    let delta_ms = now_ms - then_ms;
+    if delta_ms < 1_000 {
+        format!("{}ms", delta_ms)
+    } else if delta_ms < 60_000 {
+        format!("{:.1}s", (delta_ms as f64) / 1000.0)
+    } else if delta_ms < 3_600_000 {
+        format!("{:.1}m", (delta_ms as f64) / 60_000.0)
+    } else {
+        format!("{:.1}h", (delta_ms as f64) / 3_600_000.0)
+    }
+}
+
+fn fmt_unix_ms_hhmmss(unix_ms: u64) -> String {
+    if unix_ms == 0 {
+        return "--:--:--".to_string();
+    }
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_millis_opt(unix_ms as i64)
+        .single()
+        .map(|dt| dt.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "--:--:--".to_string())
+}
+
 /// Print a summary table of discovery results
 fn print_discovery_summary(result: &types::DiscoveryResult) {
     use std::collections::BTreeSet;
@@ -552,6 +587,12 @@ async fn main() -> Result<()> {
     }
     if let Some(v) = cli_arg_value(&args, "--pairing-debug-limit") {
         std::env::set_var("PAIRING_DEBUG_LIMIT", v);
+    }
+    if cli_has_flag(&args, "--verbose-heartbeat") {
+        std::env::set_var("VERBOSE_HEARTBEAT", "1");
+    }
+    if let Some(v) = cli_arg_value(&args, "--heartbeat-interval") {
+        std::env::set_var("HEARTBEAT_INTERVAL_SECS", v);
     }
 
     // Build league list for discovery from CLI/env.
@@ -1053,11 +1094,11 @@ async fn main() -> Result<()> {
 
         // Track previous stats for delta calculation
         let mut prev_league_type_stats: HashMap<(String, MarketType), (u32, u32)> = HashMap::new();
-
         loop {
             interval.tick().await;
             let market_count = heartbeat_state.market_count();
             let verbose = config::verbose_heartbeat_enabled();
+            let now_ms = now_unix_ms();
 
             // Aggregate stats by (league, market_type)
             // Value: (market_count, kalshi_updates, poly_updates)
@@ -1075,6 +1116,8 @@ async fn main() -> Result<()> {
                 gap: i16,
                 k_updates: u32,
                 p_updates: u32,
+                k_last_ms: u64,
+                p_last_ms: u64,
             }
             let mut market_details: Vec<MarketDetail> = Vec::new();
 
@@ -1082,7 +1125,6 @@ async fn main() -> Result<()> {
             let mut total_kalshi_updates: u64 = 0;
             let mut total_poly_updates: u64 = 0;
             let mut with_both = 0usize;
-
             // Track best arbitrage opportunity:
             // (total_cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no, max_contracts)
             #[allow(clippy::type_complexity)]
@@ -1092,6 +1134,7 @@ async fn main() -> Result<()> {
                 let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
                 let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.load();
                 let (k_upd, p_upd) = market.load_update_counts();
+                let (k_last_ms, p_last_ms) = market.last_updates_unix_ms();
 
                 total_kalshi_updates += k_upd as u64;
                 total_poly_updates += p_upd as u64;
@@ -1132,6 +1175,8 @@ async fn main() -> Result<()> {
                             gap,
                             k_updates: k_upd,
                             p_updates: p_upd,
+                            k_last_ms,
+                            p_last_ms,
                         });
                     }
                 }
@@ -1258,10 +1303,18 @@ async fn main() -> Result<()> {
                                     format!("{:+}¢", m.gap)
                                 };
 
-                                println!("{}  {}── {:30} K:{} P:{} gap:{} upd:K{}/P{}",
+                                let k_time = fmt_unix_ms_hhmmss(m.k_last_ms);
+                                let p_time = fmt_unix_ms_hhmmss(m.p_last_ms);
+                                let k_age = fmt_age(now_ms, m.k_last_ms);
+                                let p_age = fmt_age(now_ms, m.p_last_ms);
+
+                                println!(
+                                    "{}  {}── {:30} K:{} P:{} gap:{} upd:K{}/P{} last:K{}({}) P{}({})",
                                          prefix, item_branch, desc,
                                          k_str, p_str,
-                                         gap_str, m.k_updates, m.p_updates);
+                                         gap_str, m.k_updates, m.p_updates,
+                                         k_time, k_age, p_time, p_age
+                                );
                             }
                         }
                     }
