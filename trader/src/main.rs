@@ -38,8 +38,16 @@ fn usage_manual_trade() -> String {
     [
         "Manual trade mode (simulates controller messages):",
         "",
-        "  cargo run -p remote-trader --release -- manual-trade \\",
+        "Polymarket order:",
+        "  TRADER_PLATFORM=polymarket cargo run -p remote-trader --release -- manual-trade \\",
         "    --poly-token <CLOB_TOKEN_ID> \\",
+        "    --side <yes|no> \\",
+        "    --limit-price-cents <0-100> \\",
+        "    --contracts <INT>",
+        "",
+        "Kalshi order:",
+        "  TRADER_PLATFORM=kalshi cargo run -p remote-trader --release -- manual-trade \\",
+        "    --kalshi-ticker <TICKER> \\",
         "    --side <yes|no> \\",
         "    --limit-price-cents <0-100> \\",
         "    --contracts <INT>",
@@ -53,8 +61,11 @@ fn usage_manual_trade() -> String {
         "    --spend-usd <FLOAT>",
         "",
         "Notes:",
-        "  - Live trading requires DRY_RUN=0 and Polymarket creds in env.",
-        "  - `--side` is for logging; the token determines the outcome you trade.",
+        "  - Live trading requires DRY_RUN=0 and platform creds in env.",
+        "  - TRADER_PLATFORM must match the market identifier you provide:",
+        "    - --poly-token requires TRADER_PLATFORM=polymarket",
+        "    - --kalshi-ticker requires TRADER_PLATFORM=kalshi",
+        "  - `--side` is for logging; the token/ticker determines the outcome you trade.",
     ]
     .join("\n")
 }
@@ -74,16 +85,37 @@ async fn maybe_run_manual_trade(config: Arc<Config>) -> Result<Option<()>> {
         return Ok(Some(()));
     }
 
-    // This is intended for validating the Polymarket executor path.
-    if config.platform != crate::protocol::Platform::Polymarket {
+    // Parse market identifier (either --poly-token or --kalshi-ticker)
+    let poly_token = arg_value(&args, "--poly-token");
+    let kalshi_ticker = arg_value(&args, "--kalshi-ticker");
+
+    // Determine platform based on which identifier was provided
+    let (platform, market_identifier) = match (&poly_token, &kalshi_ticker) {
+        (Some(token), None) => (crate::protocol::Platform::Polymarket, token.clone()),
+        (None, Some(ticker)) => (crate::protocol::Platform::Kalshi, ticker.clone()),
+        (Some(_), Some(_)) => {
+            anyhow::bail!(
+                "Cannot specify both --poly-token and --kalshi-ticker\n\n{}",
+                usage_manual_trade()
+            );
+        }
+        (None, None) => {
+            anyhow::bail!(
+                "Missing --poly-token or --kalshi-ticker\n\n{}",
+                usage_manual_trade()
+            );
+        }
+    };
+
+    // Validate that TRADER_PLATFORM matches the provided market identifier
+    if config.platform != platform {
         anyhow::bail!(
-            "manual-trade requires TRADER_PLATFORM=polymarket (current={:?})",
+            "TRADER_PLATFORM={:?} does not match the provided market identifier.\n\
+             Use --poly-token with TRADER_PLATFORM=polymarket, or\n\
+             use --kalshi-ticker with TRADER_PLATFORM=kalshi",
             config.platform
         );
     }
-
-    let poly_token = arg_value(&args, "--poly-token")
-        .ok_or_else(|| anyhow::anyhow!("Missing --poly-token\n\n{}", usage_manual_trade()))?;
 
     let side_str = arg_value(&args, "--side")
         .ok_or_else(|| anyhow::anyhow!("Missing --side\n\n{}", usage_manual_trade()))?;
@@ -123,8 +155,8 @@ async fn maybe_run_manual_trade(config: Arc<Config>) -> Result<Option<()>> {
     }
 
     info!(
-        "[MANUAL] Starting manual-trade: poly_token={} side={:?} limit={}c contracts={} dry_run={}",
-        poly_token, side, limit_price_cents, contracts, config.dry_run
+        "[MANUAL] Starting manual-trade: platform={:?} market={} side={:?} limit={}c contracts={} dry_run={}",
+        platform, market_identifier, side, limit_price_cents, contracts, config.dry_run
     );
 
     // Simulate controller Init + ExecuteLeg messages (same trader codepath).
@@ -132,7 +164,7 @@ async fn maybe_run_manual_trade(config: Arc<Config>) -> Result<Option<()>> {
 
     let init_ack = trader
         .handle_message(IncomingMessage::Init {
-            platforms: vec![crate::protocol::Platform::Polymarket],
+            platforms: vec![platform],
             dry_run: config.dry_run,
         })
         .await;
@@ -147,13 +179,13 @@ async fn maybe_run_manual_trade(config: Arc<Config>) -> Result<Option<()>> {
         .handle_message(IncomingMessage::ExecuteLeg {
             market_id: 0,
             leg_id,
-            platform: crate::protocol::Platform::Polymarket,
+            platform,
             action: crate::protocol::OrderAction::Buy,
             side,
             price: limit_price_cents,
             contracts,
-            kalshi_market_ticker: None,
-            poly_token: Some(poly_token),
+            kalshi_market_ticker: kalshi_ticker,
+            poly_token,
             pair_id: Some("MANUAL_TRADE".to_string()),
             description: Some("manual-trade".to_string()),
         })

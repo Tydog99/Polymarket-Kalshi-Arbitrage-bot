@@ -57,12 +57,17 @@ DRY_RUN=1 ONE_SHOT=1 WEBSOCKET_URL=ws://127.0.0.1:9001 RUST_LOG=info cargo run -
 
 ## Manual trade mode (no controller)
 
-This mode is for validating that the **Polymarket execution path works end-to-end** by simulating the same message handling path the controller uses (`Init` → `ExecuteLeg`).
+This mode is for validating that the **execution path works end-to-end** by simulating the same message handling path the controller uses (`Init` → `ExecuteLeg`). Both Polymarket and Kalshi are supported.
 
 **Requirements (Polymarket):**
 - `TRADER_PLATFORM=polymarket`
 - `POLY_PRIVATE_KEY`
 - `POLYMARKET_FUNDER` (or `POLY_FUNDER`)
+
+**Requirements (Kalshi):**
+- `TRADER_PLATFORM=kalshi`
+- `KALSHI_API_KEY`
+- `KALSHI_PRIVATE_KEY` (PEM contents, not a path)
 
 If your **funder** address (from the Polymarket UI) is **different** from the address derived from your private key (the signer), set `POLY_SIGNATURE_TYPE` to match your account type:
 - `0` = EOA (signer == funder)
@@ -126,6 +131,46 @@ cargo run -p remote-trader --release -- manual-trade \
   --side yes \
   --limit-price-cents 60 \
   --spend-usd 5
+```
+
+### Kalshi manual trade examples
+
+**Example (dry run):**
+
+```bash
+TRADER_PLATFORM=kalshi DRY_RUN=1 RUST_LOG=info \
+cargo run -p remote-trader --release -- manual-trade \
+  --kalshi-ticker KXNBASPREAD-26JAN17WASDEN-DEN12 \
+  --side yes \
+  --limit-price-cents 60 \
+  --contracts 10
+```
+
+**Example (live):**
+
+```bash
+TRADER_PLATFORM=kalshi DRY_RUN=0 RUST_LOG=info \
+cargo run -p remote-trader --release -- manual-trade \
+  --kalshi-ticker KXNBASPREAD-26JAN17WASDEN-DEN12 \
+  --side yes \
+  --limit-price-cents 60 \
+  --spend-usd 5
+```
+
+### How to get a Kalshi market ticker
+
+The Kalshi market ticker follows the format `{SERIES}-{DATE}{TEAM1}{TEAM2}-{SUFFIX}`.
+
+**Method A: Kalshi website**
+
+1. Open the market on Kalshi.
+2. The ticker is visible in the URL or on the market page (e.g., `KXNBASPREAD-26JAN17WASDEN-DEN12`).
+
+**Method B: Kalshi API**
+
+```bash
+# List markets for a series
+curl "https://api.kalshi.co/trade-api/v2/markets?series_ticker=KXNBASPREAD&status=open"
 ```
 
 ### How to get the Polymarket CLOB token id (`clobTokenIds`)
