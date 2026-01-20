@@ -523,3 +523,251 @@ async fn test_network_timeout_simulation() {
 
     assert_eq!(resp.status(), 503);
 }
+
+// ============================================================================
+// REAL KALSHI API FIXTURE TESTS
+// ============================================================================
+//
+// These tests use real API responses captured from live Kalshi trading.
+// They verify that our test harness correctly replays actual API behavior.
+
+/// Test with real Kalshi full fill response from live API.
+///
+/// Captured scenario:
+/// - Ticker: KXNBA-26-SAS (NBA Championship)
+/// - Requested: 1 contract at 9c YES
+/// - Result: Full fill (1/1 contracts executed)
+/// - Cost: 9c + 1c fee = 10c total
+#[tokio::test]
+async fn test_real_kalshi_full_fill() {
+    let server = setup_mock_server().await;
+
+    // Mount real captured fixture
+    let exchange = mount_fixture_file(&server, fixture_path("kalshi_full_fill_real.json")).await;
+
+    // Verify fixture loaded correctly
+    assert_eq!(exchange.response.status, 201, "Real API returns 201 Created");
+    let body = exchange.response.body_parsed.as_ref().unwrap();
+    assert_eq!(body["order"]["status"], "executed");
+    assert_eq!(body["order"]["fill_count"], 1);
+    assert_eq!(body["order"]["initial_count"], 1);
+    assert_eq!(body["order"]["remaining_count"], 0);
+    assert_eq!(body["order"]["taker_fill_cost"], 9);
+    assert_eq!(body["order"]["taker_fees"], 1);
+
+    // Make request to mock server
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/trade-api/v2/portfolio/orders", server.uri()))
+        .json(&json!({
+            "ticker": "KXNBA-26-SAS",
+            "action": "buy",
+            "side": "yes",
+            "count": 1,
+            "yes_price": 9,
+            "type": "limit",
+            "time_in_force": "immediate_or_cancel"
+        }))
+        .send()
+        .await
+        .expect("Request should succeed");
+
+    assert_eq!(resp.status(), 201);
+    let result: serde_json::Value = resp.json().await.unwrap();
+
+    // Verify response matches real API format
+    assert_eq!(result["order"]["status"], "executed");
+    assert_eq!(result["order"]["fill_count"], 1);
+    assert_eq!(result["order"]["initial_count"], 1);
+    assert_eq!(result["order"]["ticker"], "KXNBA-26-SAS");
+}
+
+/// Test with real Kalshi partial fill response from live API.
+///
+/// Captured scenario:
+/// - Ticker: KXNEWPOPE-70-PPAR (Next Pope prediction)
+/// - Requested: 200 contracts at 9c YES
+/// - Result: Partial fill (114/200 contracts executed)
+/// - Status: "canceled" (IOC order canceled after partial fill)
+/// - Cost: 1026c (114 * 9c) + 66c fees
+#[tokio::test]
+async fn test_real_kalshi_partial_fill() {
+    let server = setup_mock_server().await;
+
+    // Mount real captured fixture
+    let exchange = mount_fixture_file(&server, fixture_path("kalshi_partial_fill_real.json")).await;
+
+    // Verify fixture loaded correctly - real API format
+    assert_eq!(exchange.response.status, 201, "Real API returns 201 even for partial");
+    let body = exchange.response.body_parsed.as_ref().unwrap();
+    assert_eq!(body["order"]["status"], "canceled", "IOC order canceled after partial fill");
+    assert_eq!(body["order"]["fill_count"], 114);
+    assert_eq!(body["order"]["initial_count"], 200);
+    assert_eq!(body["order"]["remaining_count"], 0, "IOC sets remaining to 0 on cancel");
+    assert_eq!(body["order"]["taker_fill_cost"], 1026);
+    assert_eq!(body["order"]["taker_fees"], 66);
+
+    // Make request to mock server
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/trade-api/v2/portfolio/orders", server.uri()))
+        .json(&json!({
+            "ticker": "KXNEWPOPE-70-PPAR",
+            "action": "buy",
+            "side": "yes",
+            "count": 200,
+            "yes_price": 9,
+            "type": "limit",
+            "time_in_force": "immediate_or_cancel"
+        }))
+        .send()
+        .await
+        .expect("Request should succeed");
+
+    assert_eq!(resp.status(), 201);
+    let result: serde_json::Value = resp.json().await.unwrap();
+
+    // Verify partial fill response
+    assert_eq!(result["order"]["status"], "canceled");
+    let filled = result["order"]["fill_count"].as_i64().unwrap();
+    let requested = result["order"]["initial_count"].as_i64().unwrap();
+    assert_eq!(filled, 114);
+    assert_eq!(requested, 200);
+
+    // Verify fill rate
+    let fill_rate = filled as f64 / requested as f64;
+    assert!(fill_rate > 0.5 && fill_rate < 0.6, "Should fill ~57%");
+}
+
+/// Test with real Kalshi no fill response from live API.
+///
+/// Captured scenario:
+/// - Ticker: KXNBA-26-SAS (NBA Championship)
+/// - Requested: 1 contract at 5c YES (below market)
+/// - Result: No fill (0/1 contracts executed)
+/// - Status: "canceled" (IOC order canceled with no fill)
+#[tokio::test]
+async fn test_real_kalshi_no_fill() {
+    let server = setup_mock_server().await;
+
+    // Mount real captured fixture
+    let exchange = mount_fixture_file(&server, fixture_path("kalshi_no_fill.json")).await;
+
+    // Verify fixture loaded correctly
+    assert_eq!(exchange.response.status, 201, "Real API returns 201 even for no fill");
+    let body = exchange.response.body_parsed.as_ref().unwrap();
+    assert_eq!(body["order"]["status"], "canceled");
+    assert_eq!(body["order"]["fill_count"], 0);
+    assert_eq!(body["order"]["initial_count"], 1);
+    assert_eq!(body["order"]["remaining_count"], 0);
+    assert_eq!(body["order"]["taker_fill_cost"], 0);
+    assert_eq!(body["order"]["taker_fees"], 0);
+
+    // Make request to mock server
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/trade-api/v2/portfolio/orders", server.uri()))
+        .json(&json!({
+            "ticker": "KXNBA-26-SAS",
+            "action": "buy",
+            "side": "yes",
+            "count": 1,
+            "yes_price": 5,
+            "type": "limit",
+            "time_in_force": "immediate_or_cancel"
+        }))
+        .send()
+        .await
+        .expect("Request should succeed");
+
+    assert_eq!(resp.status(), 201);
+    let result: serde_json::Value = resp.json().await.unwrap();
+
+    // Verify no fill response
+    assert_eq!(result["order"]["status"], "canceled");
+    assert_eq!(result["order"]["fill_count"], 0);
+    assert_eq!(result["order"]["initial_count"], 1);
+
+    // Verify this is genuinely a no-fill scenario (not an error)
+    assert!(result["error"].is_null(), "No error field for successful order submission");
+}
+
+/// Test with real Kalshi market not found error from live API.
+///
+/// Captured scenario:
+/// - Ticker: KXNFLAFCCHAMP-25 (invalid/expired market)
+/// - Result: 404 Not Found
+/// - Error code: "market_not_found"
+#[tokio::test]
+async fn test_real_kalshi_market_not_found() {
+    let server = setup_mock_server().await;
+
+    // Mount real captured fixture
+    let exchange = mount_fixture_file(&server, fixture_path("kalshi_market_not_found.json")).await;
+
+    // Verify fixture loaded correctly
+    assert_eq!(exchange.response.status, 404);
+    let body = exchange.response.body_parsed.as_ref().unwrap();
+    assert_eq!(body["error"]["code"], "market_not_found");
+    assert_eq!(body["error"]["message"], "market not found");
+    assert_eq!(body["error"]["service"], "exchange");
+
+    // Make request to mock server
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/trade-api/v2/portfolio/orders", server.uri()))
+        .json(&json!({
+            "ticker": "KXNFLAFCCHAMP-25",
+            "action": "buy",
+            "side": "yes",
+            "count": 1,
+            "yes_price": 71,
+            "type": "limit",
+            "time_in_force": "immediate_or_cancel"
+        }))
+        .send()
+        .await
+        .expect("Request should complete");
+
+    assert_eq!(resp.status(), 404);
+    let result: serde_json::Value = resp.json().await.unwrap();
+
+    // Verify error response format
+    assert_eq!(result["error"]["code"], "market_not_found");
+    assert!(result["order"].is_null(), "No order field on error");
+}
+
+/// Test loading real fixtures maintains integrity with capture format.
+#[tokio::test]
+async fn test_real_fixture_loading_integrity() {
+    use super::replay_harness::load_fixture;
+
+    // Test real full fill fixture
+    let full_fill = load_fixture(fixture_path("kalshi_full_fill_real.json")).unwrap();
+    assert_eq!(full_fill.request.method, "POST");
+    assert_eq!(full_fill.response.status, 201);
+    assert!(full_fill.latency_ms > 0, "Should have real latency");
+    let body = full_fill.response.body_parsed.unwrap();
+    assert_eq!(body["order"]["fill_count"], 1);
+    assert_eq!(body["order"]["initial_count"], 1);
+
+    // Test real partial fill fixture
+    let partial_fill = load_fixture(fixture_path("kalshi_partial_fill_real.json")).unwrap();
+    assert_eq!(partial_fill.response.status, 201);
+    let body = partial_fill.response.body_parsed.unwrap();
+    assert_eq!(body["order"]["fill_count"], 114);
+    assert_eq!(body["order"]["initial_count"], 200);
+
+    // Test real no fill fixture
+    let no_fill = load_fixture(fixture_path("kalshi_no_fill.json")).unwrap();
+    assert_eq!(no_fill.response.status, 201);
+    let body = no_fill.response.body_parsed.unwrap();
+    assert_eq!(body["order"]["fill_count"], 0);
+    assert_eq!(body["order"]["status"], "canceled");
+
+    // Test real market not found fixture
+    let not_found = load_fixture(fixture_path("kalshi_market_not_found.json")).unwrap();
+    assert_eq!(not_found.response.status, 404);
+    let body = not_found.response.body_parsed.unwrap();
+    assert_eq!(body["error"]["code"], "market_not_found");
+}
