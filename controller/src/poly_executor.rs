@@ -63,12 +63,23 @@ pub mod mock {
         Error(String),
     }
 
+    /// Record of a call to the mock client.
+    #[derive(Clone, Debug)]
+    pub struct MockCall {
+        pub method: String,
+        pub token_id: String,
+        pub price: f64,
+        pub size: f64,
+    }
+
     /// Mock Polymarket client for testing.
     ///
     /// Allows configuring canned responses for specific token IDs.
     /// If no response is configured for a token, returns an error.
+    /// Also tracks all calls for verification in tests.
     pub struct MockPolyClient {
         responses: RwLock<HashMap<String, MockResponse>>,
+        calls: RwLock<Vec<MockCall>>,
     }
 
     impl MockPolyClient {
@@ -76,7 +87,33 @@ pub mod mock {
         pub fn new() -> Self {
             Self {
                 responses: RwLock::new(HashMap::new()),
+                calls: RwLock::new(Vec::new()),
             }
+        }
+
+        /// Get all calls made to this mock.
+        pub fn get_calls(&self) -> Vec<MockCall> {
+            self.calls.read().unwrap().clone()
+        }
+
+        /// Get all sell calls made to this mock.
+        pub fn get_sell_calls(&self) -> Vec<MockCall> {
+            self.calls.read().unwrap()
+                .iter()
+                .filter(|c| c.method == "sell_fak")
+                .cloned()
+                .collect()
+        }
+
+        /// Record a call to the mock.
+        fn record_call(&self, method: &str, token_id: &str, price: f64, size: f64) {
+            let mut calls = self.calls.write().unwrap();
+            calls.push(MockCall {
+                method: method.to_string(),
+                token_id: token_id.to_string(),
+                price,
+                size,
+            });
         }
 
         /// Configure a full fill response for a token.
@@ -112,7 +149,8 @@ pub mod mock {
 
     #[async_trait]
     impl PolyExecutor for MockPolyClient {
-        async fn buy_fak(&self, token_id: &str, _price: f64, _size: f64) -> Result<PolyFillAsync> {
+        async fn buy_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
+            self.record_call("buy_fak", token_id, price, size);
             match self.get_response(token_id) {
                 Some(MockResponse::FullFill { size, price }) => Ok(PolyFillAsync {
                     order_id: format!("mock-buy-{}", token_id),
@@ -129,7 +167,8 @@ pub mod mock {
             }
         }
 
-        async fn sell_fak(&self, token_id: &str, _price: f64, _size: f64) -> Result<PolyFillAsync> {
+        async fn sell_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
+            self.record_call("sell_fak", token_id, price, size);
             match self.get_response(token_id) {
                 Some(MockResponse::FullFill { size, price }) => Ok(PolyFillAsync {
                     order_id: format!("mock-sell-{}", token_id),
