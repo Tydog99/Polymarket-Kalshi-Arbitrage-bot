@@ -1,37 +1,52 @@
 {
-  "captured_at": "2026-01-19T15:31:00.400Z",
-  "sequence": 4,
-  "latency_ms": 70,
+  "captured_at": "2026-01-20T21:55:15.620045100+00:00",
+  "sequence": 2,
+  "latency_ms": 61,
   "request": {
     "method": "GET",
-    "url": "https://clob.polymarket.com/data/order/poly-order-002",
+    "url": "https://clob.polymarket.com/data/order/0x8b416d01048aea99086ea6c1e4510cad2d0bb881a0def312b9b81b7ac732ad8e",
     "headers": {
+      "user-agent": "py_clob_client",
       "content-type": "application/json",
-      "user-agent": "py_clob_client"
+      "accept": "*/*",
+      "connection": "keep-alive"
     },
     "body": null
   },
   "response": {
     "status": 200,
     "headers": {
-      "content-type": "application/json"
+      "set-cookie": "__cf_bm=ZFLYDCi6cyIjdmAQvWCBneAY3DcDuh2eDPbe8YK0HeA-1768946115-1.0.1.1-DCmjpSOXNNUGvUXgSjNA81AgSu1idlyOgUL6oIz7dpTlgjYIv5PsB.0Oy6vAchpTJyHotHhe8Hhr5FbP.9WRMXCFI8TaqjE.9QLEW0wjF4Q; path=/; expires=Tue, 20-Jan-26 22:25:15 GMT; domain=.polymarket.com; HttpOnly; Secure; SameSite=None",
+      "content-length": "575",
+      "connection": "keep-alive",
+      "date": "Tue, 20 Jan 2026 21:55:15 GMT",
+      "vary": "Origin",
+      "cf-cache-status": "DYNAMIC",
+      "server": "cloudflare",
+      "alt-svc": "h3=\":443\"; ma=86400",
+      "content-type": "application/json",
+      "strict-transport-security": "max-age=7776000; includeSubDomains",
+      "cf-ray": "9c11d0a52af56dc0-MAD"
     },
-    "body_raw": "{\"id\":\"poly-order-002\",\"status\":\"MATCHED\",\"market\":\"nba-lal-nyk-2026-01-19\",\"outcome\":\"Yes\",\"price\":\"0.55\",\"side\":\"BUY\",\"size_matched\":\"7\",\"original_size\":\"10\",\"maker_address\":\"0x1234567890abcdef1234567890abcdef12345678\",\"asset_id\":\"48340483024983498234892834\",\"associate_trades\":[],\"created_at\":\"2026-01-19T15:31:00.123Z\",\"type\":\"FAK\",\"owner\":\"api-key-12345\"}",
+    "body_raw": "{\"id\":\"0x8b416d01048aea99086ea6c1e4510cad2d0bb881a0def312b9b81b7ac732ad8e\",\"status\":\"MATCHED\",\"owner\":\"f8f7370d-52b6-b764-0776-48aa65b6ec0a\",\"maker_address\":\"0xE49d13C6addd6900bDAF5d1bE19C7deb72A4e76f\",\"market\":\"0x1fad72fae204143ff1c3035e99e7c0f65ea8d5cd9bd1070987bd1a3316f772be\",\"asset_id\":\"53831553061883006530739877284105938919721408776239639687877978808906551086026\",\"side\":\"BUY\",\"original_size\":\"10\",\"size_matched\":\"5\",\"price\":\"0.47\",\"outcome\":\"No\",\"expiration\":\"0\",\"order_type\":\"FAK\",\"associate_trades\":[\"31f73244-fcb1-4977-9cbc-bbdaf793be7e\"],\"created_at\":1768946115}\n",
     "body_parsed": {
-      "id": "poly-order-002",
-      "status": "MATCHED",
-      "market": "nba-lal-nyk-2026-01-19",
-      "outcome": "Yes",
-      "price": "0.55",
-      "side": "BUY",
-      "size_matched": "7",
+      "asset_id": "53831553061883006530739877284105938919721408776239639687877978808906551086026",
+      "associate_trades": [
+        "31f73244-fcb1-4977-9cbc-bbdaf793be7e"
+      ],
+      "created_at": 1768946115,
+      "expiration": "0",
+      "id": "0x8b416d01048aea99086ea6c1e4510cad2d0bb881a0def312b9b81b7ac732ad8e",
+      "maker_address": "0xE49d13C6addd6900bDAF5d1bE19C7deb72A4e76f",
+      "market": "0x1fad72fae204143ff1c3035e99e7c0f65ea8d5cd9bd1070987bd1a3316f772be",
+      "order_type": "FAK",
       "original_size": "10",
-      "maker_address": "0x1234567890abcdef1234567890abcdef12345678",
-      "asset_id": "48340483024983498234892834",
-      "associate_trades": [],
-      "created_at": "2026-01-19T15:31:00.123Z",
-      "type": "FAK",
-      "owner": "api-key-12345"
+      "outcome": "No",
+      "owner": "f8f7370d-52b6-b764-0776-48aa65b6ec0a",
+      "price": "0.47",
+      "side": "BUY",
+      "size_matched": "5",
+      "status": "MATCHED"
     }
   }
 }

@@ -1,44 +1,62 @@
 {
-  "captured_at": "2026-01-19T15:30:00.250Z",
+  "captured_at": "2026-01-20T21:22:59.897527200+00:00",
   "sequence": 1,
-  "latency_ms": 120,
+  "latency_ms": 82,
   "request": {
     "method": "POST",
     "url": "https://clob.polymarket.com/order",
     "headers": {
+      "connection": "keep-alive",
+      "accept": "*/*",
       "content-type": "application/json",
       "user-agent": "py_clob_client"
     },
     "body": {
       "order": {
-        "salt": 12345678901234567890,
-        "maker": "0x1234567890abcdef1234567890abcdef12345678",
-        "signer": "0xabcdef1234567890abcdef1234567890abcdef12",
-        "taker": "0x0000000000000000000000000000000000000000",
-        "tokenId": "48340483024983498234892834",
-        "makerAmount": "5500000",
-        "takerAmount": "10000000",
         "expiration": "0",
-        "nonce": "0",
         "feeRateBps": "0",
+        "maker": "0xE49d13C6addd6900bDAF5d1bE19C7deb72A4e76f",
+        "makerAmount": "2650000",
+        "nonce": "0",
+        "salt": 300282660,
         "side": "BUY",
-        "signatureType": 1,
-        "signature": "0xsig..."
+        "signature": "0x2cd1d011112c7357f550ccd771f98c26f83df7f8cf4cc955367d9fc891f9562e492ba5b7d4b1629e2997a9766d4519d327bdbebb4b0f733915e86698d4983aae1b",
+        "signatureType": 2,
+        "signer": "0xa92a49198b257592083f8c20ef4081f18fc78c13",
+        "taker": "0x0000000000000000000000000000000000000000",
+        "takerAmount": "5000000",
+        "tokenId": "26310511444966676152901239545213464869875480698266972830365142324057733576025"
       },
-      "owner": "api-key-12345",
-      "orderType": "FAK"
+      "orderType": "FAK",
+      "owner": "f8f7370d-52b6-b764-0776-48aa65b6ec0a"
     }
   },
   "response": {
     "status": 200,
     "headers": {
+      "server": "cloudflare",
+      "cf-cache-status": "DYNAMIC",
+      "vary": "Origin",
+      "content-length": "262",
+      "date": "Tue, 20 Jan 2026 21:22:59 GMT",
+      "set-cookie": "__cf_bm=mssvlyx96xHYY6FGcmhJZ2QWxRKlKXXT_nRKToeLecU-1768944179-1.0.1.1-fcRvJK97qpN9OnFhZzoYN3nPBuN1KU8e_Kh1ar86YY3cnryHn6QcetePPRmen4ZIyj9KmQS0NPFX3o_1LRpMLFRcjNVecmdVpP.27HRz97A; path=/; expires=Tue, 20-Jan-26 21:52:59 GMT; domain=.polymarket.com; HttpOnly; Secure; SameSite=None",
+      "alt-svc": "h3=\":443\"; ma=86400",
+      "cf-ray": "9c11a1621e95b177-MAD",
+      "connection": "keep-alive",
+      "strict-transport-security": "max-age=7776000; includeSubDomains",
       "content-type": "application/json"
     },
-    "body_raw": "{\"success\":true,\"orderID\":\"poly-order-001\",\"transactionsHashes\":[\"0xtxhash1\"]}",
+    "body_raw": "{\"errorMsg\":\"\",\"orderID\":\"0x300b6f4a853408b38846aee01695d25ff0da109a1072fea577f067fbb67bb80f\",\"takingAmount\":\"5\",\"makingAmount\":\"2.65\",\"status\":\"matched\",\"transactionsHashes\":[\"0x6bcdbe4482749edcac63222e6e458e92e45f0c77d513a36932a4a9f2b17cc7a5\"],\"success\":true}\n",
     "body_parsed": {
+      "errorMsg": "",
+      "makingAmount": "2.65",
+      "orderID": "0x300b6f4a853408b38846aee01695d25ff0da109a1072fea577f067fbb67bb80f",
+      "status": "matched",
       "success": true,
-      "orderID": "poly-order-001",
-      "transactionsHashes": ["0xtxhash1"]
+      "takingAmount": "5",
+      "transactionsHashes": [
+        "0x6bcdbe4482749edcac63222e6e458e92e45f0c77d513a36932a4a9f2b17cc7a5"
+      ]
     }
   }
 }
