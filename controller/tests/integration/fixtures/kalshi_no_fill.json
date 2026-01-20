@@ -1,0 +1,69 @@
+{
+  "captured_at": "2026-01-20T06:11:14.253852+00:00",
+  "sequence": 1,
+  "latency_ms": 225,
+  "request": {
+    "method": "POST",
+    "url": "https://api.elections.kalshi.com/trade-api/v2/portfolio/orders",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "action": "buy",
+      "client_order_id": "a17688894740",
+      "count": 1,
+      "side": "yes",
+      "ticker": "KXNBA-26-SAS",
+      "time_in_force": "immediate_or_cancel",
+      "type": "limit",
+      "yes_price": 5
+    }
+  },
+  "response": {
+    "status": 201,
+    "headers": {
+      "x-amz-cf-pop": "SFO5-P2",
+      "content-security-policy": "default-src 'none';",
+      "connection": "keep-alive",
+      "x-cache": "Miss from cloudfront",
+      "x-amz-cf-id": "JDs_yReaAAb9rg3O5Qyvaigld2xf-hmzRERYNJA_ly2S_LaEq2TwMA==",
+      "content-type": "application/json; charset=utf-8",
+      "content-length": "652",
+      "via": "1.1 332ef4544bd8b531e8f11abaa4197c08.cloudfront.net (CloudFront)",
+      "date": "Tue, 20 Jan 2026 06:11:14 GMT",
+      "strict-transport-security": "max-age=31536000; includeSubDomains",
+      "x-content-type-options": "nosniff"
+    },
+    "body_raw": "{\"order\":{\"action\":\"buy\",\"client_order_id\":\"a17688894740\",\"created_time\":\"2026-01-20T06:11:14.26349Z\",\"expiration_time\":null,\"fill_count\":0,\"initial_count\":1,\"last_update_time\":\"2026-01-20T06:11:14.26349Z\",\"maker_fees\":0,\"maker_fill_cost\":0,\"maker_fill_cost_dollars\":\"\",\"no_price\":95,\"no_price_dollars\":\"0.9500\",\"order_group_id\":null,\"order_id\":\"d7daf7e3-288a-4b78-93a0-dd3bf6651f6a\",\"queue_position\":0,\"remaining_count\":0,\"side\":\"yes\",\"status\":\"canceled\",\"taker_fees\":0,\"taker_fill_cost\":0,\"taker_fill_cost_dollars\":\"\",\"ticker\":\"KXNBA-26-SAS\",\"type\":\"limit\",\"user_id\":\"391eceab-4486-4252-8753-49c6c2642d5f\",\"yes_price\":5,\"yes_price_dollars\":\"0.0500\"}}",
+    "body_parsed": {
+      "order": {
+        "action": "buy",
+        "client_order_id": "a17688894740",
+        "created_time": "2026-01-20T06:11:14.26349Z",
+        "expiration_time": null,
+        "fill_count": 0,
+        "initial_count": 1,
+        "last_update_time": "2026-01-20T06:11:14.26349Z",
+        "maker_fees": 0,
+        "maker_fill_cost": 0,
+        "maker_fill_cost_dollars": "",
+        "no_price": 95,
+        "no_price_dollars": "0.9500",
+        "order_group_id": null,
+        "order_id": "d7daf7e3-288a-4b78-93a0-dd3bf6651f6a",
+        "queue_position": 0,
+        "remaining_count": 0,
+        "side": "yes",
+        "status": "canceled",
+        "taker_fees": 0,
+        "taker_fill_cost": 0,
+        "taker_fill_cost_dollars": "",
+        "ticker": "KXNBA-26-SAS",
+        "type": "limit",
+        "user_id": "391eceab-4486-4252-8753-49c6c2642d5f",
+        "yes_price": 5,
+        "yes_price_dollars": "0.0500"
+      }
+    }
+  }
+}

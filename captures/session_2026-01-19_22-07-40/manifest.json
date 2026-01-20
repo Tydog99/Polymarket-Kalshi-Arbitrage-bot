@@ -1,0 +1,7 @@
+{
+  "started_at": "2026-01-20T06:07:40.349342+00:00",
+  "capture_filter": "orders",
+  "files": [
+    "001_POST_kalshi_orders.json"
+  ]
+}
