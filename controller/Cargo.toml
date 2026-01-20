@@ -53,6 +53,7 @@ wide = "0.7"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 hex = "0.4"
+regex = "1"
 remote-trader = { path = "../trader" }
 wiremock = "0.6"
 
