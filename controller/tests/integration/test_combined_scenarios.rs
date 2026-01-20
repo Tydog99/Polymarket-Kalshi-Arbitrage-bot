@@ -651,7 +651,7 @@ async fn test_real_kalshi_no_fill() {
     let server = setup_mock_server().await;
 
     // Mount real captured fixture
-    let exchange = mount_fixture_file(&server, fixture_path("kalshi_no_fill.json")).await;
+    let exchange = mount_fixture_file(&server, fixture_path("kalshi_no_fill_real.json")).await;
 
     // Verify fixture loaded correctly
     assert_eq!(exchange.response.status, 201, "Real API returns 201 even for no fill");
@@ -759,7 +759,7 @@ async fn test_real_fixture_loading_integrity() {
     assert_eq!(body["order"]["initial_count"], 200);
 
     // Test real no fill fixture
-    let no_fill = load_fixture(fixture_path("kalshi_no_fill.json")).unwrap();
+    let no_fill = load_fixture(fixture_path("kalshi_no_fill_real.json")).unwrap();
     assert_eq!(no_fill.response.status, 201);
     let body = no_fill.response.body_parsed.unwrap();
     assert_eq!(body["order"]["fill_count"], 0);

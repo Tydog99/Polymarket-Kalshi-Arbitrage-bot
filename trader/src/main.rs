@@ -16,6 +16,11 @@ use protocol::IncomingMessage;
 use trader::Trader;
 use websocket::WebSocketClient;
 
+// For positions command
+use rsa::pkcs1::DecodeRsaPrivateKey;
+use rsa::RsaPrivateKey;
+use trading::kalshi::{KalshiApiClient, KalshiConfig};
+
 fn parse_bool_env(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v == "1" || v == "true" || v == "yes")
@@ -52,6 +57,14 @@ fn usage_manual_trade() -> String {
         "    --limit-price-cents <0-100> \\",
         "    --contracts <INT>",
         "",
+        "Sell order (requires existing position):",
+        "  TRADER_PLATFORM=kalshi cargo run -p remote-trader --release -- manual-trade \\",
+        "    --kalshi-ticker <TICKER> \\",
+        "    --action sell \\",
+        "    --side <yes|no> \\",
+        "    --limit-price-cents <0-100> \\",
+        "    --contracts <INT>",
+        "",
         "Or specify a USD spend amount (requires limit price):",
         "",
         "  cargo run -p remote-trader --release -- manual-trade \\",
@@ -66,6 +79,7 @@ fn usage_manual_trade() -> String {
         "    - --poly-token requires TRADER_PLATFORM=polymarket",
         "    - --kalshi-ticker requires TRADER_PLATFORM=kalshi",
         "  - `--side` is for logging; the token/ticker determines the outcome you trade.",
+        "  - `--action` defaults to 'buy' if not specified.",
     ]
     .join("\n")
 }
@@ -117,6 +131,14 @@ async fn maybe_run_manual_trade(config: Arc<Config>) -> Result<Option<()>> {
         );
     }
 
+    // Parse action (buy or sell), default to buy
+    let action_str = arg_value(&args, "--action").unwrap_or_else(|| "buy".to_string());
+    let action = match action_str.as_str() {
+        "buy" | "BUY" | "Buy" => crate::protocol::OrderAction::Buy,
+        "sell" | "SELL" | "Sell" => crate::protocol::OrderAction::Sell,
+        other => anyhow::bail!("Invalid --action: {} (expected buy|sell)", other),
+    };
+
     let side_str = arg_value(&args, "--side")
         .ok_or_else(|| anyhow::anyhow!("Missing --side\n\n{}", usage_manual_trade()))?;
     let side = match side_str.as_str() {
@@ -155,8 +177,8 @@ async fn maybe_run_manual_trade(config: Arc<Config>) -> Result<Option<()>> {
     }
 
     info!(
-        "[MANUAL] Starting manual-trade: platform={:?} market={} side={:?} limit={}c contracts={} dry_run={}",
-        platform, market_identifier, side, limit_price_cents, contracts, config.dry_run
+        "[MANUAL] Starting manual-trade: platform={:?} market={} action={:?} side={:?} limit={}c contracts={} dry_run={}",
+        platform, market_identifier, action, side, limit_price_cents, contracts, config.dry_run
     );
 
     // Simulate controller Init + ExecuteLeg messages (same trader codepath).
@@ -180,7 +202,7 @@ async fn maybe_run_manual_trade(config: Arc<Config>) -> Result<Option<()>> {
             market_id: 0,
             leg_id,
             platform,
-            action: crate::protocol::OrderAction::Buy,
+            action,
             side,
             price: limit_price_cents,
             contracts,
@@ -192,6 +214,71 @@ async fn maybe_run_manual_trade(config: Arc<Config>) -> Result<Option<()>> {
         .await;
 
     info!("[MANUAL] execute_leg_result={:?}", res);
+    Ok(Some(()))
+}
+
+/// Show Kalshi portfolio positions
+async fn maybe_run_positions(config: &Config) -> Result<Option<()>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Check for positions subcommand
+    if args.first().map(|a| a.as_str()) != Some("positions") {
+        return Ok(None);
+    }
+
+    // Require Kalshi credentials
+    let api_key = config
+        .kalshi_api_key
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("KALSHI_API_KEY_ID required for positions command"))?;
+    let private_key_pem = config
+        .kalshi_private_key
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("KALSHI_PRIVATE_KEY_PATH required for positions command"))?;
+
+    let private_key = RsaPrivateKey::from_pkcs1_pem(private_key_pem.trim())
+        .map_err(|e| anyhow::anyhow!("Failed to parse Kalshi private key: {}", e))?;
+
+    let kalshi_cfg = KalshiConfig {
+        api_key_id: api_key,
+        private_key,
+    };
+    let client = KalshiApiClient::new(kalshi_cfg);
+
+    println!("Fetching Kalshi positions...\n");
+
+    let positions = client.get_positions().await?;
+
+    if positions.market_positions.is_empty() {
+        println!("No open positions found.");
+        return Ok(Some(()));
+    }
+
+    println!("{:<35} {:>10} {:>12} {:>12}", "TICKER", "POSITION", "EXPOSURE", "P&L");
+    println!("{}", "-".repeat(75));
+
+    for pos in &positions.market_positions {
+        let side = if pos.position > 0 { "YES" } else { "NO" };
+        let qty = pos.position.abs();
+        println!(
+            "{:<35} {:>6} {:>3} {:>10.2}¢ {:>10.2}¢",
+            pos.ticker,
+            qty,
+            side,
+            pos.market_exposure as f64 / 100.0,
+            pos.realized_pnl as f64 / 100.0,
+        );
+    }
+
+    println!("\n{} position(s) found.", positions.market_positions.len());
+    println!("\nTo sell a position, use:");
+    println!("  cargo run -p remote-trader --release -- manual-trade \\");
+    println!("    --kalshi-ticker <TICKER> \\");
+    println!("    --action sell \\");
+    println!("    --side <yes|no> \\");
+    println!("    --limit-price-cents <PRICE> \\");
+    println!("    --contracts <COUNT>");
+
     Ok(Some(()))
 }
 
@@ -301,6 +388,11 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = Arc::new(Config::from_env().context("Failed to load configuration")?);
     info!("[MAIN] Configuration loaded (dry_run={})", config.dry_run);
+
+    // Optional "positions" command to query Kalshi portfolio
+    if let Some(()) = maybe_run_positions(&config).await? {
+        return Ok(());
+    }
 
     // Optional "manual trade" mode for validating live execution without a controller.
     if let Some(()) = maybe_run_manual_trade(config.clone()).await? {

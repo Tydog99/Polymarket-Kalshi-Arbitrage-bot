@@ -119,3 +119,47 @@ impl KalshiOrderDetails {
         self.filled_count() > 0 && !self.is_filled()
     }
 }
+
+// ============================================================================
+// Portfolio Positions Types
+// ============================================================================
+
+/// Response from GET /portfolio/positions
+#[derive(Debug, Clone, Deserialize)]
+pub struct KalshiPositionsResponse {
+    pub market_positions: Vec<KalshiMarketPosition>,
+    #[serde(default)]
+    pub event_positions: Vec<KalshiEventPosition>,
+    pub cursor: Option<String>,
+}
+
+/// A single market position
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct KalshiMarketPosition {
+    pub ticker: String,
+    /// Net position: positive = long YES, negative = long NO
+    pub position: i64,
+    /// Total contracts traded in this market
+    pub total_traded: i64,
+    /// Current market exposure in cents
+    pub market_exposure: i64,
+    /// Realized P&L in cents
+    pub realized_pnl: i64,
+    /// Fees paid in cents
+    pub fees_paid: i64,
+    /// Number of resting orders
+    #[serde(default)]
+    pub resting_orders_count: i64,
+}
+
+/// A single event position (aggregate across markets in an event)
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct KalshiEventPosition {
+    pub event_ticker: String,
+    pub total_cost: i64,
+    pub event_exposure: i64,
+    pub realized_pnl: i64,
+    pub fees_paid: i64,
+}

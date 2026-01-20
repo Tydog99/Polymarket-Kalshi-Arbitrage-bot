@@ -194,7 +194,7 @@ async fn test_execute_leg_kalshi_no_fill() {
     let server = setup_mock_server().await;
 
     // Mount the real captured fixture
-    mount_kalshi_order_fixture(&server, "kalshi_no_fill.json").await;
+    mount_kalshi_order_fixture(&server, "kalshi_no_fill_real.json").await;
 
     // Create test client and execution clients
     let kalshi_client = create_test_kalshi_client(&server);
@@ -412,6 +412,190 @@ async fn test_execute_leg_kalshi_sell() {
     // Verify success
     assert!(result.success, "Sell order should succeed");
     assert!(result.error.is_none(), "Sell should have no error");
+}
+
+// ============================================================================
+// TEST: SELL ORDER - REAL FULL FILL
+// ============================================================================
+
+/// Test execute_leg with a real Kalshi sell full fill response.
+///
+/// Scenario:
+/// - Ticker: KXNBA-26-SAS
+/// - Requested: Sell 1 YES contract at 1c
+/// - Result: Full fill (1/1 contracts sold)
+/// - Expected: LegResult::success = true
+#[tokio::test]
+async fn test_execute_leg_kalshi_sell_full_fill_real() {
+    let server = setup_mock_server().await;
+
+    // Mount the real captured sell fixture
+    mount_kalshi_order_fixture(&server, "kalshi_sell_full_fill_real.json").await;
+
+    // Create test client and execution clients
+    let kalshi_client = create_test_kalshi_client(&server);
+    let clients = create_test_execution_clients(kalshi_client);
+
+    // Create the SELL leg request matching the fixture
+    let req = LegRequest {
+        leg_id: "test-leg-sell-full-fill",
+        platform: Platform::Kalshi,
+        action: OrderAction::Sell,
+        side: OutcomeSide::Yes,
+        price_cents: 1,
+        contracts: 1,
+        kalshi_ticker: Some("KXNBA-26-SAS"),
+        poly_token: None,
+    };
+
+    // Execute the leg (not a dry run)
+    let result = execute_leg(&req, &clients, false).await;
+
+    // Verify success
+    assert!(
+        result.success,
+        "Sell full fill should succeed, but got error: {:?}",
+        result.error
+    );
+    assert!(result.error.is_none(), "Sell full fill should have no error");
+    assert!(result.latency_ns > 0, "Should record latency");
+}
+
+// ============================================================================
+// TEST: SELL ORDER - NO FILL
+// ============================================================================
+
+/// Test execute_leg with a real Kalshi sell no fill response.
+///
+/// Scenario:
+/// - Ticker: KXNBA-26-SAS
+/// - Requested: Sell 1 YES contract at 95c (way above market)
+/// - Result: No fill (0/1 contracts sold, status=canceled)
+/// - Expected: LegResult::success = true (order placed successfully, just no takers)
+#[tokio::test]
+async fn test_execute_leg_kalshi_sell_no_fill_real() {
+    let server = setup_mock_server().await;
+
+    // Mount the real captured no fill fixture
+    mount_kalshi_order_fixture(&server, "kalshi_sell_no_fill_real.json").await;
+
+    // Create test client and execution clients
+    let kalshi_client = create_test_kalshi_client(&server);
+    let clients = create_test_execution_clients(kalshi_client);
+
+    // Create the SELL leg request matching the fixture
+    let req = LegRequest {
+        leg_id: "test-leg-sell-no-fill",
+        platform: Platform::Kalshi,
+        action: OrderAction::Sell,
+        side: OutcomeSide::Yes,
+        price_cents: 95,
+        contracts: 1,
+        kalshi_ticker: Some("KXNBA-26-SAS"),
+        poly_token: None,
+    };
+
+    // Execute the leg (not a dry run)
+    let result = execute_leg(&req, &clients, false).await;
+
+    // Verify success - no fill is not an error, the order was placed
+    // but the price was too high for any buyers
+    assert!(result.success, "Sell no fill should succeed (order placed)");
+    assert!(result.error.is_none(), "Sell no fill should have no error");
+    assert!(result.latency_ns > 0, "Should record latency");
+}
+
+// ============================================================================
+// TEST: SELL ORDER - INSUFFICIENT POSITION
+// ============================================================================
+
+/// Test execute_leg with a real Kalshi insufficient position error.
+///
+/// Scenario:
+/// - Ticker: KXNBA-26-SAS
+/// - Requested: Sell 500 YES contracts (more than owned)
+/// - Result: 400 Bad Request with insufficient_balance error
+/// - Expected: LegResult::success = false with error message
+#[tokio::test]
+async fn test_execute_leg_kalshi_sell_insufficient_position_real() {
+    let server = setup_mock_server().await;
+
+    // Mount the real captured insufficient position fixture
+    mount_kalshi_order_fixture(&server, "kalshi_sell_insufficient_position_real.json").await;
+
+    // Create test client and execution clients
+    let kalshi_client = create_test_kalshi_client(&server);
+    let clients = create_test_execution_clients(kalshi_client);
+
+    // Create the SELL leg request matching the fixture
+    let req = LegRequest {
+        leg_id: "test-leg-sell-insufficient",
+        platform: Platform::Kalshi,
+        action: OrderAction::Sell,
+        side: OutcomeSide::Yes,
+        price_cents: 1,
+        contracts: 500,
+        kalshi_ticker: Some("KXNBA-26-SAS"),
+        poly_token: None,
+    };
+
+    // Execute the leg (not a dry run)
+    let result = execute_leg(&req, &clients, false).await;
+
+    // Verify failure
+    assert!(!result.success, "Insufficient position should fail");
+    assert!(result.error.is_some(), "Should have error message");
+
+    let error_msg = result.error.unwrap();
+    assert!(
+        error_msg.contains("400") || error_msg.contains("insufficient"),
+        "Error should indicate insufficient balance: {}",
+        error_msg
+    );
+    assert!(result.latency_ns > 0, "Should record latency even on failure");
+}
+
+// ============================================================================
+// TEST: SELL ORDER - PARTIAL FILL (REAL)
+// ============================================================================
+
+/// Test execute_leg with a real Kalshi sell partial fill response.
+///
+/// Scenario:
+/// - Ticker: KXBUSHBY-30 (Karl Bushby world walk market)
+/// - Requested: Sell 20 YES contracts at 84c
+/// - Result: Partial fill (7/20 contracts sold, status=canceled)
+/// - Expected: LegResult::success = true (partial fills are successful)
+#[tokio::test]
+async fn test_execute_leg_kalshi_sell_partial_fill_real() {
+    let server = setup_mock_server().await;
+
+    // Mount the real partial fill fixture
+    mount_kalshi_order_fixture(&server, "kalshi_sell_partial_fill_real.json").await;
+
+    // Create test client and execution clients
+    let kalshi_client = create_test_kalshi_client(&server);
+    let clients = create_test_execution_clients(kalshi_client);
+
+    // Create the SELL leg request matching the fixture
+    let req = LegRequest {
+        leg_id: "test-leg-sell-partial",
+        platform: Platform::Kalshi,
+        action: OrderAction::Sell,
+        side: OutcomeSide::Yes,
+        price_cents: 84,
+        contracts: 20,
+        kalshi_ticker: Some("KXBUSHBY-30"),
+        poly_token: None,
+    };
+
+    // Execute the leg (not a dry run)
+    let result = execute_leg(&req, &clients, false).await;
+
+    // Verify success - partial fills are considered successful
+    assert!(result.success, "Sell partial fill should succeed");
+    assert!(result.error.is_none(), "Sell partial fill should have no error");
+    assert!(result.latency_ns > 0, "Should record latency");
 }
 
 // ============================================================================

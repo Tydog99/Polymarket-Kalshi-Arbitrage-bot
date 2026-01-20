@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
 use super::config::{KalshiConfig, KALSHI_API_BASE, KALSHI_API_DELAY_MS};
-use super::types::{KalshiOrderRequest, KalshiOrderResponse};
+use super::types::{KalshiOrderRequest, KalshiOrderResponse, KalshiPositionsResponse};
 use crate::capture::build_client_with_capture;
 
 /// Timeout for order requests (shorter than general API timeout)
@@ -82,7 +82,9 @@ impl KalshiApiClient {
                 .unwrap()
                 .as_millis() as u64;
             // Kalshi signature uses FULL path including /trade-api/v2 prefix
-            let full_path = format!("/trade-api/v2{}", path);
+            // but WITHOUT query parameters
+            let path_without_query = path.split('?').next().unwrap_or(path);
+            let full_path = format!("/trade-api/v2{}", path_without_query);
             let signature = self
                 .config
                 .sign(&format!("{}GET{}", timestamp_ms, full_path))?;
@@ -245,6 +247,13 @@ impl KalshiApiClient {
             resp.order.filled_count()
         );
         Ok(resp)
+    }
+
+    /// Get all portfolio positions with non-zero holdings.
+    pub async fn get_positions(&self) -> Result<KalshiPositionsResponse> {
+        // Only return positions where we have contracts (count_filter=position)
+        let path = "/portfolio/positions?count_filter=position&limit=100";
+        self.get(path).await
     }
 }
 

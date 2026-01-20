@@ -298,7 +298,7 @@ async fn test_engine_kalshi_fills_poly_fails() {
     }
 
     // Load and mount Kalshi SELL fixture for auto-close
-    let sell_exchange = load_fixture(fixture_path("kalshi_sell_full_fill.json"))
+    let sell_exchange = load_fixture(fixture_path("kalshi_sell_full_fill_real.json"))
         .expect("Failed to load sell fixture");
 
     let mut sell_response = ResponseTemplate::new(sell_exchange.response.status)
@@ -377,7 +377,7 @@ async fn test_engine_no_fills() {
     let kalshi_server = MockServer::start().await;
 
     // Load and mount Kalshi no fill fixture
-    let exchange = load_fixture(fixture_path("kalshi_no_fill.json"))
+    let exchange = load_fixture(fixture_path("kalshi_no_fill_real.json"))
         .expect("Failed to load fixture");
 
     let mut response = ResponseTemplate::new(exchange.response.status)
@@ -453,7 +453,7 @@ async fn test_auto_close_kalshi_excess_sells_on_kalshi() {
     }
 
     // Mount Kalshi SELL response for the auto-close order
-    let sell_exchange = load_fixture(fixture_path("kalshi_sell_full_fill.json"))
+    let sell_exchange = load_fixture(fixture_path("kalshi_sell_full_fill_real.json"))
         .expect("Failed to load sell fixture");
 
     let mut sell_response = ResponseTemplate::new(sell_exchange.response.status)
@@ -539,7 +539,7 @@ async fn test_auto_close_poly_excess_sells_on_poly() {
     let kalshi_server = MockServer::start().await;
 
     // Mount Kalshi with NO fill (0 contracts)
-    let exchange = load_fixture(fixture_path("kalshi_no_fill.json"))
+    let exchange = load_fixture(fixture_path("kalshi_no_fill_real.json"))
         .expect("Failed to load fixture");
 
     let mut response = ResponseTemplate::new(exchange.response.status)
