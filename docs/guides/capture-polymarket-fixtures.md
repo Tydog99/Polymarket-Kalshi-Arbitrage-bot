@@ -53,7 +53,7 @@ Before placing orders, check available liquidity to avoid unexpected fills:
 ### Base Command Format
 
 ```bash
-CAPTURE_DIR=./captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
+CAPTURE_DIR=./.captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
   dotenvx run -- cargo run -p remote-trader --release -- manual-trade \
   --poly-token <TOKEN_ID> \
   --side <yes|no> \
@@ -66,7 +66,7 @@ CAPTURE_DIR=./captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
 Always test with `DRY_RUN=1` first to verify the command works:
 
 ```bash
-CAPTURE_DIR=./captures TRADER_PLATFORM=polymarket DRY_RUN=1 \
+CAPTURE_DIR=./.captures TRADER_PLATFORM=polymarket DRY_RUN=1 \
   dotenvx run -- cargo run -p remote-trader --release -- manual-trade \
   --poly-token 12345678901234567890 \
   --side yes \
@@ -103,7 +103,7 @@ Pick a market with reasonable liquidity but not too deep (so partial fills are p
 Place a small order at market price:
 
 ```bash
-CAPTURE_DIR=./captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
+CAPTURE_DIR=./.captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
   dotenvx run -- cargo run -p remote-trader --release -- manual-trade \
   --poly-token <YOUR_TOKEN_ID> \
   --side yes \
@@ -116,7 +116,7 @@ CAPTURE_DIR=./captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
 Place an order at a price that won't match:
 
 ```bash
-CAPTURE_DIR=./captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
+CAPTURE_DIR=./.captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
   dotenvx run -- cargo run -p remote-trader --release -- manual-trade \
   --poly-token <YOUR_TOKEN_ID> \
   --side yes \
@@ -129,7 +129,7 @@ CAPTURE_DIR=./captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
 Find a market with limited liquidity at a price level, then order more than available:
 
 ```bash
-CAPTURE_DIR=./captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
+CAPTURE_DIR=./.captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
   dotenvx run -- cargo run -p remote-trader --release -- manual-trade \
   --poly-token <YOUR_TOKEN_ID> \
   --side yes \
@@ -141,7 +141,7 @@ CAPTURE_DIR=./captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
 
 **Invalid token:**
 ```bash
-CAPTURE_DIR=./captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
+CAPTURE_DIR=./.captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
   dotenvx run -- cargo run -p remote-trader --release -- manual-trade \
   --poly-token 99999999999999999999 \
   --side yes \
@@ -151,7 +151,7 @@ CAPTURE_DIR=./captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
 
 **Insufficient balance** (order more than your wallet holds):
 ```bash
-CAPTURE_DIR=./captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
+CAPTURE_DIR=./.captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
   dotenvx run -- cargo run -p remote-trader --release -- manual-trade \
   --poly-token <YOUR_TOKEN_ID> \
   --side yes \
@@ -165,13 +165,13 @@ CAPTURE_DIR=./captures TRADER_PLATFORM=polymarket DRY_RUN=0 \
 
 ```bash
 # List all capture sessions
-ls -la ./captures/
+ls -la ./.captures/
 
 # Check a session's manifest
-cat ./captures/session_YYYY-MM-DD_HH-MM-SS/manifest.json
+cat ./.captures/session_YYYY-MM-DD_HH-MM-SS/manifest.json
 
 # View a captured exchange
-cat ./captures/session_YYYY-MM-DD_HH-MM-SS/001_POST_poly_order.json | jq .
+cat ./.captures/session_YYYY-MM-DD_HH-MM-SS/001_POST_poly_order.json | jq .
 ```
 
 ### 2. Identify Each Capture
@@ -180,7 +180,7 @@ Review each session and note what scenario it represents:
 
 ```bash
 # Quick check of response status/outcome
-for dir in ./captures/session_*; do
+for dir in ./.captures/session_*; do
   echo "=== $dir ==="
   cat "$dir"/*.json 2>/dev/null | jq -r '.response.status, .response.body_parsed.status // .response.body_parsed.error // "unknown"' | head -2
 done
@@ -192,19 +192,19 @@ Copy the captures to the test fixtures directory with descriptive names:
 
 ```bash
 # Full fill
-cp ./captures/session_XXXX/001_POST_poly_order.json \
+cp ./.captures/session_XXXX/001_POST_poly_order.json \
    ./controller/tests/integration/fixtures/poly_full_fill_real.json
 
 # No fill
-cp ./captures/session_YYYY/001_POST_poly_order.json \
+cp ./.captures/session_YYYY/001_POST_poly_order.json \
    ./controller/tests/integration/fixtures/poly_no_fill_real.json
 
 # Partial fill
-cp ./captures/session_ZZZZ/001_POST_poly_order.json \
+cp ./.captures/session_ZZZZ/001_POST_poly_order.json \
    ./controller/tests/integration/fixtures/poly_partial_fill_real.json
 
 # Error responses
-cp ./captures/session_AAAA/001_POST_poly_order.json \
+cp ./.captures/session_AAAA/001_POST_poly_order.json \
    ./controller/tests/integration/fixtures/poly_invalid_token.json
 ```
 

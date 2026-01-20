@@ -113,11 +113,11 @@ dotenvx run -- cargo run --release
 - `CAPTURE_FILTER` - What to capture: `orders` (default), `all`, or comma-separated path patterns
 
 ```bash
-# Enable HTTP capture to ./captures/ with default filter (order endpoints only)
-CAPTURE_DIR=./captures dotenvx run -- cargo run --release
+# Enable HTTP capture to ./.captures/ with default filter (order endpoints only)
+CAPTURE_DIR=./.captures dotenvx run -- cargo run --release
 
 # Capture all HTTP traffic
-CAPTURE_DIR=./captures CAPTURE_FILTER=all dotenvx run -- cargo run --release
+CAPTURE_DIR=./.captures CAPTURE_FILTER=all dotenvx run -- cargo run --release
 ```
 
 When capture is enabled:
