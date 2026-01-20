@@ -6,6 +6,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
+use async_trait::async_trait;
+
+use crate::poly_executor::PolyExecutor;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE;
 use ethers::signers::{LocalWallet, Signer};
@@ -721,4 +724,19 @@ pub struct PolyFillAsync {
     pub order_id: String,
     pub filled_size: f64,
     pub fill_cost: f64,
+}
+
+// =============================================================================
+// POLY EXECUTOR TRAIT IMPLEMENTATION
+// =============================================================================
+
+#[async_trait]
+impl PolyExecutor for SharedAsyncClient {
+    async fn buy_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
+        SharedAsyncClient::buy_fak(self, token_id, price, size).await
+    }
+
+    async fn sell_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
+        SharedAsyncClient::sell_fak(self, token_id, price, size).await
+    }
 }

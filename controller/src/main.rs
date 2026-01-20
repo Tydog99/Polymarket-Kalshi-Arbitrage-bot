@@ -29,6 +29,7 @@ mod discovery;
 mod execution;
 mod kalshi;
 mod paths;
+mod poly_executor;
 mod polymarket;
 mod polymarket_clob;
 mod position_tracker;

@@ -20,6 +20,7 @@ path = "src/bin/generate_team_cache.rs"
 [dependencies]
 anyhow = "1.0"
 arrayvec = "0.7"
+async-trait = "0.1"
 base64 = "0.22"
 chrono = "0.4"
 dotenvy = "0.15"

@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn, error};
 
 use crate::kalshi::KalshiApiClient;
-use crate::polymarket_clob::SharedAsyncClient;
+use crate::poly_executor::PolyExecutor;
 use crate::types::{
     ArbType, MarketPair,
     FastExecutionRequest, GlobalState,
@@ -92,7 +92,7 @@ impl Default for NanoClock {
 /// Core execution engine for processing arbitrage opportunities
 pub struct ExecutionEngine {
     kalshi: Arc<KalshiApiClient>,
-    poly_async: Arc<SharedAsyncClient>,
+    poly_async: Arc<dyn PolyExecutor>,
     state: Arc<GlobalState>,
     circuit_breaker: Arc<CircuitBreaker>,
     position_channel: PositionChannel,
@@ -105,7 +105,7 @@ pub struct ExecutionEngine {
 impl ExecutionEngine {
     pub fn new(
         kalshi: Arc<KalshiApiClient>,
-        poly_async: Arc<SharedAsyncClient>,
+        poly_async: Arc<dyn PolyExecutor>,
         state: Arc<GlobalState>,
         circuit_breaker: Arc<CircuitBreaker>,
         position_channel: PositionChannel,
@@ -593,7 +593,7 @@ impl ExecutionEngine {
     #[allow(clippy::too_many_arguments)]
     async fn auto_close_background(
         kalshi: Arc<KalshiApiClient>,
-        poly_async: Arc<SharedAsyncClient>,
+        poly_async: Arc<dyn PolyExecutor>,
         arb_type: ArbType,
         yes_filled: i64,
         no_filled: i64,
