@@ -94,6 +94,26 @@ async fn main() -> Result<()> {
     // Load environment variables from `.env` (supports workspace-root `.env`)
     paths::load_dotenv();
 
+    // Initialize HTTP capture session if CAPTURE_DIR is set
+    // Must be done early, before any HTTP clients are created
+    match trading::capture::init_capture_session() {
+        Ok(Some(session)) => {
+            info!(
+                "[MAIN] Capture mode active: {} (filter: {})",
+                session.session_dir.display(),
+                session.filter
+            );
+        }
+        Ok(None) => {
+            // Capture disabled - nothing to log
+        }
+        Err(e) => {
+            error!("[MAIN] Failed to initialize capture session: {}", e);
+            error!("[MAIN] Check that CAPTURE_DIR points to a writable directory");
+            return Err(e.into());
+        }
+    }
+
     info!("[MAIN] Starting remote trader...");
     let one_shot = std::env::var("ONE_SHOT")
         .map(|v| v == "1" || v == "true" || v == "yes")

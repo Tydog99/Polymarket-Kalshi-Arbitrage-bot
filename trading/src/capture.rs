@@ -17,9 +17,16 @@
 //! - `latency_ms`: Request duration in milliseconds
 //! - `request`: Method, URL, headers (sensitive excluded), body
 //! - `response`: Status, headers, raw body, parsed body
+//!
+//! # Initialization
+//!
+//! Call [`init_capture_session`] early in `main()` to set up capture with session subdirectories.
+//! This creates a timestamped session directory (e.g., `session_2026-01-19_20-15-30/`) and
+//! updates `CAPTURE_DIR` to point to it, so all subsequent HTTP clients will capture to
+//! the same session.
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{Local, Utc};
 use reqwest::{Request, Response};
 use reqwest_middleware::{Middleware, Next, Result as MiddlewareResult};
 use serde::{Deserialize, Serialize};
@@ -28,6 +35,101 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
+
+// ============================================================================
+// SESSION INITIALIZATION
+// ============================================================================
+
+/// Capture session configuration returned by [`init_capture_session`].
+#[derive(Debug, Clone)]
+pub struct CaptureSession {
+    /// Absolute path to the session directory where captures will be written
+    pub session_dir: PathBuf,
+    /// The capture filter description (e.g., "orders", "all")
+    pub filter: String,
+}
+
+/// Initialize HTTP capture session with timestamped subdirectory.
+///
+/// Call this early in `main()` before creating any HTTP clients. This function:
+///
+/// 1. Checks if `CAPTURE_DIR` environment variable is set
+/// 2. Validates/creates the base directory
+/// 3. Creates a timestamped session subdirectory (e.g., `session_2026-01-19_20-15-30/`)
+/// 4. Updates `CAPTURE_DIR` to point to the session subdirectory
+///
+/// # Returns
+///
+/// - `Some(CaptureSession)` if capture is enabled and session was created successfully
+/// - `None` if `CAPTURE_DIR` is not set (capture disabled)
+///
+/// # Errors
+///
+/// Returns an error if the directory cannot be created or is not writable.
+///
+/// # Example
+///
+/// ```ignore
+/// if let Some(session) = init_capture_session()? {
+///     info!("Capture mode active: {}", session.session_dir.display());
+/// }
+/// ```
+pub fn init_capture_session() -> Result<Option<CaptureSession>, std::io::Error> {
+    let base_dir = match std::env::var("CAPTURE_DIR") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => return Ok(None), // Capture disabled
+    };
+
+    // Validate/create base directory
+    std::fs::create_dir_all(&base_dir)?;
+
+    // Generate timestamped session directory name
+    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+    let session_name = format!("session_{}", timestamp);
+    let session_dir = base_dir.join(&session_name);
+
+    // Create session directory
+    std::fs::create_dir_all(&session_dir)?;
+
+    // Verify directory is writable by creating a test file
+    let test_file = session_dir.join(".write_test");
+    std::fs::write(&test_file, b"test")?;
+    std::fs::remove_file(&test_file)?;
+
+    // Get absolute path for cleaner logging
+    let session_dir = session_dir.canonicalize().unwrap_or(session_dir);
+
+    // Update CAPTURE_DIR to point to session subdirectory
+    // This ensures all subsequent CaptureMiddleware instances use the same session
+    std::env::set_var("CAPTURE_DIR", &session_dir);
+
+    // Get filter description
+    let filter = CaptureFilter::from_env().description();
+
+    info!(
+        "[CAPTURE] Session initialized: {}",
+        session_dir.display()
+    );
+    info!("[CAPTURE] Filter: {}", filter);
+
+    Ok(Some(CaptureSession {
+        session_dir,
+        filter,
+    }))
+}
+
+/// Check if capture mode is enabled (CAPTURE_DIR is set).
+///
+/// This is a quick check that doesn't create any directories.
+pub fn is_capture_enabled() -> bool {
+    std::env::var("CAPTURE_DIR")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
 
 /// Captured HTTP exchange (request + response pair)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -845,5 +947,100 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // =========================================================================
+    // Session Initialization Tests
+    // =========================================================================
+
+    #[test]
+    fn test_is_capture_enabled_when_not_set() {
+        // Ensure CAPTURE_DIR is not set for this test
+        std::env::remove_var("CAPTURE_DIR");
+        assert!(!is_capture_enabled());
+    }
+
+    #[test]
+    fn test_is_capture_enabled_when_empty() {
+        std::env::set_var("CAPTURE_DIR", "");
+        assert!(!is_capture_enabled());
+        std::env::remove_var("CAPTURE_DIR");
+    }
+
+    #[test]
+    fn test_init_capture_session_disabled() {
+        // Ensure CAPTURE_DIR is not set
+        std::env::remove_var("CAPTURE_DIR");
+
+        let result = init_capture_session();
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_init_capture_session_creates_session_dir() {
+        let temp_dir = std::env::temp_dir().join("capture_session_test");
+        let _ = std::fs::remove_dir_all(&temp_dir); // Clean first
+
+        // Set CAPTURE_DIR and reset CAPTURE_FILTER to default
+        std::env::set_var("CAPTURE_DIR", temp_dir.to_str().unwrap());
+        std::env::remove_var("CAPTURE_FILTER");
+
+        let result = init_capture_session();
+        assert!(result.is_ok());
+
+        let session = result.unwrap();
+        assert!(session.is_some());
+
+        let session = session.unwrap();
+        // Session directory should exist
+        assert!(session.session_dir.exists());
+        // Session directory name should contain "session_"
+        let session_name = session.session_dir.file_name().unwrap().to_str().unwrap();
+        assert!(session_name.starts_with("session_"), "session dir should start with 'session_': {}", session_name);
+        // Session directory should contain a timestamp pattern (YYYY-MM-DD_HH-MM-SS)
+        assert!(session_name.len() > 8, "session name should include timestamp");
+        // Filter should be default (orders)
+        assert_eq!(session.filter, "orders");
+
+        // CAPTURE_DIR should now point to the session directory
+        let updated_capture_dir = std::env::var("CAPTURE_DIR").unwrap();
+        assert_eq!(PathBuf::from(updated_capture_dir), session.session_dir);
+
+        // Clean up
+        std::env::remove_var("CAPTURE_DIR");
+        // Use the canonicalized path for cleanup to handle macOS /var -> /private/var symlinks
+        let _ = std::fs::remove_dir_all(&session.session_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn test_init_capture_session_with_custom_filter() {
+        let temp_dir = std::env::temp_dir().join("capture_session_filter_test");
+        let _ = std::fs::remove_dir_all(&temp_dir); // Clean first
+
+        // Set CAPTURE_DIR and CAPTURE_FILTER
+        std::env::set_var("CAPTURE_DIR", temp_dir.to_str().unwrap());
+        std::env::set_var("CAPTURE_FILTER", "all");
+
+        let result = init_capture_session();
+        assert!(result.is_ok());
+
+        let session = result.unwrap().unwrap();
+        assert_eq!(session.filter, "all");
+
+        // Clean up
+        std::env::remove_var("CAPTURE_DIR");
+        std::env::remove_var("CAPTURE_FILTER");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_capture_session_struct() {
+        let session = CaptureSession {
+            session_dir: PathBuf::from("/tmp/test/session_2026-01-19_20-15-30"),
+            filter: "orders".to_string(),
+        };
+        assert_eq!(session.filter, "orders");
+        assert!(session.session_dir.to_string_lossy().contains("session_"));
     }
 }
