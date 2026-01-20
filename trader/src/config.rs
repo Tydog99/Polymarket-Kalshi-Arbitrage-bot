@@ -15,6 +15,8 @@ pub struct Config {
     pub polymarket_api_secret: Option<String>,
     pub polymarket_api_passphrase: Option<String>,
     pub polymarket_funder: Option<String>,
+    /// Polymarket CLOB signature type (0=EOA, 1/2=proxy modes).
+    pub polymarket_signature_type: i32,
     pub dry_run: bool,
     /// Which platform this trader is allowed to execute on.
     pub platform: Platform,
@@ -28,13 +30,19 @@ impl Config {
         crate::paths::load_dotenv();
         let kalshi_api_key = env::var("KALSHI_API_KEY").ok();
         let kalshi_private_key = env::var("KALSHI_PRIVATE_KEY").ok();
-        let polymarket_private_key = env::var("POLYMARKET_PRIVATE_KEY").ok();
+        // Match controller `.env` naming.
+        let polymarket_private_key = env::var("POLY_PRIVATE_KEY").ok();
         let polymarket_api_key = env::var("POLYMARKET_API_KEY").ok();
         let polymarket_api_secret = env::var("POLYMARKET_API_SECRET").ok();
         let polymarket_api_passphrase = env::var("POLYMARKET_API_PASSPHRASE").ok();
         let polymarket_funder = env::var("POLYMARKET_FUNDER")
             .or_else(|_| env::var("POLY_FUNDER"))
             .ok();
+        let polymarket_signature_type: i32 = env::var("POLY_SIGNATURE_TYPE")
+            .or_else(|_| env::var("POLYMARKET_SIGNATURE_TYPE"))
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
 
         let dry_run = env::var("DRY_RUN")
             .map(|v| v == "1" || v == "true" || v == "yes")
@@ -71,6 +79,7 @@ impl Config {
             polymarket_api_secret,
             polymarket_api_passphrase,
             polymarket_funder,
+            polymarket_signature_type,
             dry_run,
             platform,
             websocket_url,
