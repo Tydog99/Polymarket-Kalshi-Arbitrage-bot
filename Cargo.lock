@@ -3167,6 +3167,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "reqwest-middleware"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57f17d28a6e6acfe1733fe24bcd30774d13bffa4b8a22535b4c8c98423088d4e"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "http 1.4.0",
+ "reqwest 0.12.28",
+ "serde",
+ "thiserror 1.0.69",
+ "tower-service",
+]
+
+[[package]]
 name = "rfc6979"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4372,13 +4387,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrayvec",
+ "async-trait",
  "base64 0.22.1",
+ "chrono",
  "dirs",
  "ethers",
  "hmac",
+ "http 1.4.0",
  "pkcs1",
  "rand 0.8.5",
  "reqwest 0.12.28",
+ "reqwest-middleware",
  "rsa",
  "serde",
  "serde_json",
