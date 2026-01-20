@@ -1,0 +1,44 @@
+{
+  "description": "Test fixtures for combined arbitrage scenario testing",
+  "created_at": "2026-01-19T15:00:00.000Z",
+  "fixtures": {
+    "kalshi": {
+      "full_fill": "kalshi_full_fill.json",
+      "partial_fill": "kalshi_partial_fill.json",
+      "insufficient_balance": "kalshi_insufficient_balance.json"
+    },
+    "polymarket": {
+      "full_fill": {
+        "order": "poly_full_fill.json",
+        "status": "poly_order_status_full.json"
+      },
+      "partial_fill": {
+        "order": "poly_partial_fill.json",
+        "status": "poly_order_status_partial.json"
+      },
+      "insufficient_balance": "poly_insufficient_balance.json"
+    }
+  },
+  "scenarios": {
+    "both_sides_fill": {
+      "description": "Happy path - both Kalshi and Polymarket orders fill completely",
+      "kalshi_fixture": "kalshi_full_fill.json",
+      "poly_fixtures": ["poly_full_fill.json", "poly_order_status_full.json"]
+    },
+    "kalshi_fills_poly_fails": {
+      "description": "Kalshi fills but Polymarket fails - unmatched exposure",
+      "kalshi_fixture": "kalshi_full_fill.json",
+      "poly_fixtures": ["poly_insufficient_balance.json"]
+    },
+    "both_partial": {
+      "description": "Both sides partially fill - imbalanced position",
+      "kalshi_fixture": "kalshi_partial_fill.json",
+      "poly_fixtures": ["poly_partial_fill.json", "poly_order_status_partial.json"]
+    },
+    "kalshi_fails_poly_fills": {
+      "description": "Kalshi fails but Polymarket fills - reverse exposure",
+      "kalshi_fixture": "kalshi_insufficient_balance.json",
+      "poly_fixtures": ["poly_full_fill.json", "poly_order_status_full.json"]
+    }
+  }
+}

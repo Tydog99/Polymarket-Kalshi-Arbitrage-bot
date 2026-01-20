@@ -1,0 +1,35 @@
+{
+  "captured_at": "2026-01-19T15:32:00.789Z",
+  "sequence": 3,
+  "latency_ms": 45,
+  "request": {
+    "method": "POST",
+    "url": "https://trading-api.kalshi.com/trade-api/v2/portfolio/orders",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "ticker": "KXNBAML-26JAN19LALNYK-NYK",
+      "action": "buy",
+      "side": "no",
+      "type": "limit",
+      "count": 10,
+      "no_price": 45,
+      "client_order_id": "a17371234562",
+      "time_in_force": "immediate_or_cancel"
+    }
+  },
+  "response": {
+    "status": 400,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body_raw": "{\"error\":{\"code\":\"insufficient_balance\",\"message\":\"Insufficient balance to place order. Required: $4.50, Available: $2.00\"}}",
+    "body_parsed": {
+      "error": {
+        "code": "insufficient_balance",
+        "message": "Insufficient balance to place order. Required: $4.50, Available: $2.00"
+      }
+    }
+  }
+}
