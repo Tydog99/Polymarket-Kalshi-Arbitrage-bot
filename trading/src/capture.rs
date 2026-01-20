@@ -29,9 +29,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 
-/// Sequence counter for ordering captured files (monotonically increasing)
-static CAPTURE_SEQUENCE: AtomicU32 = AtomicU32::new(1);
-
 /// Captured HTTP exchange (request + response pair)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapturedExchange {
@@ -169,12 +166,17 @@ pub struct CaptureMiddleware {
     output_dir: PathBuf,
     filter: CaptureFilter,
     manifest: Arc<Mutex<CaptureManifest>>,
+    /// Per-instance sequence counter (starts at 1 for each middleware instance)
+    sequence: Arc<AtomicU32>,
 }
 
 impl CaptureMiddleware {
     /// Create a new capture middleware with the given output directory and filter
+    ///
+    /// Note: Directory creation and initial manifest write use blocking I/O
+    /// since this runs once at startup. All subsequent captures use async I/O.
     pub fn new(output_dir: PathBuf, filter: CaptureFilter) -> Self {
-        // Create output directory if it doesn't exist
+        // Create output directory if it doesn't exist (blocking, but only at startup)
         if let Err(e) = std::fs::create_dir_all(&output_dir) {
             error!(
                 "[CAPTURE] Failed to create output directory {:?}: {}",
@@ -188,13 +190,17 @@ impl CaptureMiddleware {
         let manifest = CaptureManifest::new(filter.description());
         let manifest = Arc::new(Mutex::new(manifest));
 
-        // Write initial manifest
-        Self::write_manifest_to_disk(&output_dir, &manifest);
+        // Write initial manifest (blocking, but only at startup)
+        Self::write_manifest_to_disk_sync(&output_dir, &manifest);
+
+        // Per-instance sequence counter starting at 1
+        let sequence = Arc::new(AtomicU32::new(1));
 
         Self {
             output_dir,
             filter,
             manifest,
+            sequence,
         }
     }
 
@@ -256,7 +262,7 @@ impl CaptureMiddleware {
 
         match serde_json::to_string_pretty(exchange) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&filepath, json) {
+                if let Err(e) = tokio::fs::write(&filepath, json).await {
                     error!("[CAPTURE] Failed to write {:?}: {}", filepath, e);
                 } else {
                     debug!("[CAPTURE] Saved {}", filename);
@@ -265,15 +271,37 @@ impl CaptureMiddleware {
                     if let Ok(mut manifest) = self.manifest.lock() {
                         manifest.add_file(filename);
                     }
-                    Self::write_manifest_to_disk(&self.output_dir, &self.manifest);
+                    self.write_manifest_to_disk_async().await;
                 }
             }
             Err(e) => error!("[CAPTURE] Failed to serialize capture: {}", e),
         }
     }
 
-    /// Write the manifest to disk
-    fn write_manifest_to_disk(output_dir: &PathBuf, manifest: &Arc<Mutex<CaptureManifest>>) {
+    /// Write the manifest to disk (async version for hot path)
+    async fn write_manifest_to_disk_async(&self) {
+        let manifest_path = self.output_dir.join("manifest.json");
+        // Serialize while holding the lock, then drop the guard before async I/O
+        let json_result = match self.manifest.lock() {
+            Ok(manifest) => serde_json::to_string_pretty(&*manifest),
+            Err(e) => {
+                warn!("[CAPTURE] Failed to lock manifest for writing: {}", e);
+                return;
+            }
+        };
+        // Lock is now dropped, safe to await
+        match json_result {
+            Ok(json) => {
+                if let Err(e) = tokio::fs::write(&manifest_path, json).await {
+                    warn!("[CAPTURE] Failed to write manifest: {}", e);
+                }
+            }
+            Err(e) => warn!("[CAPTURE] Failed to serialize manifest: {}", e),
+        }
+    }
+
+    /// Write the manifest to disk (sync version for startup)
+    fn write_manifest_to_disk_sync(output_dir: &PathBuf, manifest: &Arc<Mutex<CaptureManifest>>) {
         let manifest_path = output_dir.join("manifest.json");
         match manifest.lock() {
             Ok(manifest) => match serde_json::to_string_pretty(&*manifest) {
@@ -346,7 +374,7 @@ impl Middleware for CaptureMiddleware {
             body_bytes.as_ref().and_then(|b| serde_json::from_slice(b).ok());
 
         let start = std::time::Instant::now();
-        let sequence = CAPTURE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
 
         // Execute the actual request
         let response = next.run(req, extensions).await?;
@@ -618,19 +646,51 @@ mod tests {
 
     #[test]
     fn test_sequence_counter_increments() {
-        // Get initial value
-        let initial = CAPTURE_SEQUENCE.load(Ordering::SeqCst);
+        let temp_dir = std::env::temp_dir().join("capture_test_sequence");
+        let _ = std::fs::remove_dir_all(&temp_dir); // Clean first
+        let middleware = CaptureMiddleware::new(temp_dir.clone(), CaptureFilter::default());
 
-        // Simulate what middleware would do
-        let seq1 = CAPTURE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-        let seq2 = CAPTURE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-        let seq3 = CAPTURE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        // Per-instance counter starts at 1
+        let seq1 = middleware.sequence.fetch_add(1, Ordering::SeqCst);
+        let seq2 = middleware.sequence.fetch_add(1, Ordering::SeqCst);
+        let seq3 = middleware.sequence.fetch_add(1, Ordering::SeqCst);
 
-        assert_eq!(seq2, seq1 + 1);
-        assert_eq!(seq3, seq2 + 1);
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2);
+        assert_eq!(seq3, 3);
 
-        // Reset for other tests (best effort - tests may run in parallel)
-        CAPTURE_SEQUENCE.store(initial, Ordering::SeqCst);
+        // Clean up
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sequence_counter_per_instance() {
+        // Each middleware instance should have its own counter starting at 1
+        let temp_dir1 = std::env::temp_dir().join("capture_test_seq_instance1");
+        let temp_dir2 = std::env::temp_dir().join("capture_test_seq_instance2");
+        let _ = std::fs::remove_dir_all(&temp_dir1);
+        let _ = std::fs::remove_dir_all(&temp_dir2);
+
+        let middleware1 = CaptureMiddleware::new(temp_dir1.clone(), CaptureFilter::default());
+        let middleware2 = CaptureMiddleware::new(temp_dir2.clone(), CaptureFilter::default());
+
+        // Both should start at 1
+        let m1_seq1 = middleware1.sequence.fetch_add(1, Ordering::SeqCst);
+        let m2_seq1 = middleware2.sequence.fetch_add(1, Ordering::SeqCst);
+
+        assert_eq!(m1_seq1, 1);
+        assert_eq!(m2_seq1, 1);
+
+        // And increment independently
+        let m1_seq2 = middleware1.sequence.fetch_add(1, Ordering::SeqCst);
+        let m2_seq2 = middleware2.sequence.fetch_add(1, Ordering::SeqCst);
+
+        assert_eq!(m1_seq2, 2);
+        assert_eq!(m2_seq2, 2);
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&temp_dir1);
+        let _ = std::fs::remove_dir_all(&temp_dir2);
     }
 
     #[test]
