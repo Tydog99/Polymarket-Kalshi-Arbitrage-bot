@@ -29,6 +29,7 @@ mod discovery;
 mod execution;
 mod kalshi;
 mod paths;
+mod poly_executor;
 mod polymarket;
 mod polymarket_clob;
 mod position_tracker;
@@ -499,6 +500,26 @@ async fn main() -> Result<()> {
 
     // Load environment variables from `.env` (supports workspace-root `.env`)
     paths::load_dotenv();
+
+    // Initialize HTTP capture session if CAPTURE_DIR is set
+    // Must be done early, before any HTTP clients are created
+    match trading::capture::init_capture_session() {
+        Ok(Some(session)) => {
+            info!(
+                "📼 Capture mode active: {} (filter: {})",
+                session.session_dir.display(),
+                session.filter
+            );
+        }
+        Ok(None) => {
+            // Capture disabled - nothing to log
+        }
+        Err(e) => {
+            error!("Failed to initialize capture session: {}", e);
+            error!("Check that CAPTURE_DIR points to a writable directory");
+            return Err(e.into());
+        }
+    }
 
     // === Remote smoke test mode ===
     // Runs only the controller-hosted WS server, waits for a trader to connect,

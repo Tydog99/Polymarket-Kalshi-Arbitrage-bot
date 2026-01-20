@@ -1,0 +1,43 @@
+{
+  "captured_at": "2026-01-19T20:15:00.123Z",
+  "sequence": 1,
+  "latency_ms": 142,
+  "request": {
+    "method": "POST",
+    "url": "https://trading-api.kalshi.com/trade-api/v2/portfolio/orders",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "ticker": "TEST-MARKET-123",
+      "side": "no",
+      "action": "buy",
+      "count": 5,
+      "no_price": 45,
+      "type": "limit",
+      "time_in_force": "immediate_or_cancel"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body_raw": "{\"order\":{\"order_id\":\"test-order-001\",\"ticker\":\"TEST-MARKET-123\",\"side\":\"no\",\"action\":\"buy\",\"type\":\"limit\",\"no_price\":45,\"status\":\"executed\",\"taker_fill_count\":5,\"maker_fill_count\":0,\"taker_fill_cost\":225,\"maker_fill_cost\":0}}",
+    "body_parsed": {
+      "order": {
+        "order_id": "test-order-001",
+        "ticker": "TEST-MARKET-123",
+        "side": "no",
+        "action": "buy",
+        "type": "limit",
+        "no_price": 45,
+        "status": "executed",
+        "taker_fill_count": 5,
+        "maker_fill_count": 0,
+        "taker_fill_cost": 225,
+        "maker_fill_cost": 0
+      }
+    }
+  }
+}

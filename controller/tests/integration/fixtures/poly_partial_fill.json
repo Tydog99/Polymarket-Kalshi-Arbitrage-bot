@@ -1,0 +1,44 @@
+{
+  "captured_at": "2026-01-19T15:31:00.250Z",
+  "sequence": 3,
+  "latency_ms": 115,
+  "request": {
+    "method": "POST",
+    "url": "https://clob.polymarket.com/order",
+    "headers": {
+      "content-type": "application/json",
+      "user-agent": "py_clob_client"
+    },
+    "body": {
+      "order": {
+        "salt": 12345678901234567891,
+        "maker": "0x1234567890abcdef1234567890abcdef12345678",
+        "signer": "0xabcdef1234567890abcdef1234567890abcdef12",
+        "taker": "0x0000000000000000000000000000000000000000",
+        "tokenId": "48340483024983498234892834",
+        "makerAmount": "5500000",
+        "takerAmount": "10000000",
+        "expiration": "0",
+        "nonce": "0",
+        "feeRateBps": "0",
+        "side": "BUY",
+        "signatureType": 1,
+        "signature": "0xsig..."
+      },
+      "owner": "api-key-12345",
+      "orderType": "FAK"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body_raw": "{\"success\":true,\"orderID\":\"poly-order-002\",\"transactionsHashes\":[\"0xtxhash2\"]}",
+    "body_parsed": {
+      "success": true,
+      "orderID": "poly-order-002",
+      "transactionsHashes": ["0xtxhash2"]
+    }
+  }
+}

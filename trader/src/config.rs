@@ -28,8 +28,15 @@ impl Config {
     /// Load configuration from environment variables
     pub fn from_env() -> Result<Self> {
         crate::paths::load_dotenv();
-        let kalshi_api_key = env::var("KALSHI_API_KEY").ok();
-        let kalshi_private_key = env::var("KALSHI_PRIVATE_KEY").ok();
+        let kalshi_api_key = env::var("KALSHI_API_KEY")
+            .or_else(|_| env::var("KALSHI_API_KEY_ID"))
+            .ok();
+        // Support both direct key content and path to key file
+        let kalshi_private_key = env::var("KALSHI_PRIVATE_KEY").ok().or_else(|| {
+            env::var("KALSHI_PRIVATE_KEY_PATH")
+                .ok()
+                .and_then(|path| std::fs::read_to_string(&path).ok())
+        });
         // Match controller `.env` naming.
         let polymarket_private_key = env::var("POLY_PRIVATE_KEY").ok();
         let polymarket_api_key = env::var("POLYMARKET_API_KEY").ok();

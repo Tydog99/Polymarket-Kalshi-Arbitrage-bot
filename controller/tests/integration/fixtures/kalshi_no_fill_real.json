@@ -1,0 +1,69 @@
+{
+  "captured_at": "2026-01-20T18:56:41.213454+00:00",
+  "sequence": 1,
+  "latency_ms": 281,
+  "request": {
+    "method": "POST",
+    "url": "https://api.elections.kalshi.com/trade-api/v2/portfolio/orders",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "action": "buy",
+      "client_order_id": "a17689354000",
+      "count": 1,
+      "side": "yes",
+      "ticker": "KXBUSHBY-30",
+      "time_in_force": "immediate_or_cancel",
+      "type": "limit",
+      "yes_price": 1
+    }
+  },
+  "response": {
+    "status": 201,
+    "headers": {
+      "connection": "keep-alive",
+      "x-content-type-options": "nosniff",
+      "via": "1.1 c8c3180933886633be93f042334d6e12.cloudfront.net (CloudFront)",
+      "x-amz-cf-pop": "SFO53-P1",
+      "content-type": "application/json; charset=utf-8",
+      "strict-transport-security": "max-age=31536000; includeSubDomains",
+      "content-security-policy": "default-src 'none';",
+      "x-cache": "Miss from cloudfront",
+      "date": "Tue, 20 Jan 2026 18:56:41 GMT",
+      "x-amz-cf-id": "oGcAelVwAvuF5-vwSC5HJPJAtMjtOez15-YYVqbhQMtBf3cRPMWXcQ==",
+      "content-length": "653"
+    },
+    "body_raw": "{\"order\":{\"action\":\"buy\",\"client_order_id\":\"a17689354000\",\"created_time\":\"2026-01-20T18:56:41.182648Z\",\"expiration_time\":null,\"fill_count\":0,\"initial_count\":1,\"last_update_time\":\"2026-01-20T18:56:41.182648Z\",\"maker_fees\":0,\"maker_fill_cost\":0,\"maker_fill_cost_dollars\":\"\",\"no_price\":99,\"no_price_dollars\":\"0.9900\",\"order_group_id\":null,\"order_id\":\"ea407db5-a9f1-4907-8dd1-758f859e5156\",\"queue_position\":0,\"remaining_count\":0,\"side\":\"yes\",\"status\":\"canceled\",\"taker_fees\":0,\"taker_fill_cost\":0,\"taker_fill_cost_dollars\":\"\",\"ticker\":\"KXBUSHBY-30\",\"type\":\"limit\",\"user_id\":\"391eceab-4486-4252-8753-49c6c2642d5f\",\"yes_price\":1,\"yes_price_dollars\":\"0.0100\"}}",
+    "body_parsed": {
+      "order": {
+        "action": "buy",
+        "client_order_id": "a17689354000",
+        "created_time": "2026-01-20T18:56:41.182648Z",
+        "expiration_time": null,
+        "fill_count": 0,
+        "initial_count": 1,
+        "last_update_time": "2026-01-20T18:56:41.182648Z",
+        "maker_fees": 0,
+        "maker_fill_cost": 0,
+        "maker_fill_cost_dollars": "",
+        "no_price": 99,
+        "no_price_dollars": "0.9900",
+        "order_group_id": null,
+        "order_id": "ea407db5-a9f1-4907-8dd1-758f859e5156",
+        "queue_position": 0,
+        "remaining_count": 0,
+        "side": "yes",
+        "status": "canceled",
+        "taker_fees": 0,
+        "taker_fill_cost": 0,
+        "taker_fill_cost_dollars": "",
+        "ticker": "KXBUSHBY-30",
+        "type": "limit",
+        "user_id": "391eceab-4486-4252-8753-49c6c2642d5f",
+        "yes_price": 1,
+        "yes_price_dollars": "0.0100"
+      }
+    }
+  }
+}

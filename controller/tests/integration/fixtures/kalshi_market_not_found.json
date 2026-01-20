@@ -1,0 +1,46 @@
+{
+  "captured_at": "2026-01-20T06:07:40.588374+00:00",
+  "sequence": 1,
+  "latency_ms": 237,
+  "request": {
+    "method": "POST",
+    "url": "https://api.elections.kalshi.com/trade-api/v2/portfolio/orders",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "action": "buy",
+      "client_order_id": "a17688892600",
+      "count": 1,
+      "side": "yes",
+      "ticker": "KXNFLAFCCHAMP-25",
+      "time_in_force": "immediate_or_cancel",
+      "type": "limit",
+      "yes_price": 71
+    }
+  },
+  "response": {
+    "status": 404,
+    "headers": {
+      "strict-transport-security": "max-age=31536000; includeSubDomains",
+      "date": "Tue, 20 Jan 2026 06:07:40 GMT",
+      "content-type": "application/json; charset=utf-8",
+      "via": "1.1 e4c1621d1a01ac203cab18901cb7540a.cloudfront.net (CloudFront)",
+      "content-security-policy": "default-src 'none';",
+      "x-content-type-options": "nosniff",
+      "x-cache": "Error from cloudfront",
+      "connection": "keep-alive",
+      "x-amz-cf-pop": "SFO53-P1",
+      "content-length": "87",
+      "x-amz-cf-id": "SYYWfEAARlsVUoLgCjfciAXIvc0UEv8v464GRa7Tlb9T1OXMLU95LQ=="
+    },
+    "body_raw": "{\"error\":{\"code\":\"market_not_found\",\"message\":\"market not found\",\"service\":\"exchange\"}}",
+    "body_parsed": {
+      "error": {
+        "code": "market_not_found",
+        "message": "market not found",
+        "service": "exchange"
+      }
+    }
+  }
+}

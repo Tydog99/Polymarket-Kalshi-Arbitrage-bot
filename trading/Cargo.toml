@@ -19,3 +19,10 @@ pkcs1 = "0.7"
 arrayvec = "0.7"
 rand = "0.8"
 dirs = "5"
+reqwest-middleware = "0.4"
+async-trait = "0.1"
+chrono = "0.4"
+http = "1"
+
+[dev-dependencies]
+serial_test = "3"

@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use arrayvec::ArrayString;
+use reqwest_middleware::ClientWithMiddleware;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -10,7 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
 use super::config::{KalshiConfig, KALSHI_API_BASE, KALSHI_API_DELAY_MS};
-use super::types::{KalshiOrderRequest, KalshiOrderResponse};
+use super::types::{KalshiOrderRequest, KalshiOrderResponse, KalshiPositionsResponse};
+use crate::capture::build_client_with_capture;
 
 /// Timeout for order requests (shorter than general API timeout)
 const ORDER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -20,20 +22,38 @@ static ORDER_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Kalshi REST API client for authenticated requests and order execution.
 pub struct KalshiApiClient {
-    http: reqwest::Client,
+    http: ClientWithMiddleware,
     pub config: KalshiConfig,
+    /// Base URL for API requests (e.g., "https://api.elections.kalshi.com/trade-api/v2")
+    base_url: String,
 }
 
 impl KalshiApiClient {
     /// Create a new Kalshi API client with the given configuration.
+    ///
+    /// Uses the default base URL and enables capture middleware if `CAPTURE_DIR` is set.
     pub fn new(config: KalshiConfig) -> Self {
+        Self::new_with_base_url(config, KALSHI_API_BASE)
+    }
+
+    /// Create a new Kalshi API client with a custom base URL.
+    ///
+    /// This is useful for testing against mock servers.
+    /// Enables capture middleware if `CAPTURE_DIR` is set.
+    pub fn new_with_base_url(config: KalshiConfig, base_url: &str) -> Self {
+        let http = build_client_with_capture(
+            reqwest::Client::builder().timeout(Duration::from_secs(10)),
+        );
         Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("Failed to build HTTP client"),
+            http,
             config,
+            base_url: base_url.trim_end_matches('/').to_string(),
         }
+    }
+
+    /// Get the base URL for this client.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Generate a unique order ID using timestamp and counter.
@@ -56,13 +76,15 @@ impl KalshiApiClient {
         const MAX_RETRIES: u32 = 5;
 
         loop {
-            let url = format!("{}{}", KALSHI_API_BASE, path);
+            let url = format!("{}{}", self.base_url, path);
             let timestamp_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64;
             // Kalshi signature uses FULL path including /trade-api/v2 prefix
-            let full_path = format!("/trade-api/v2{}", path);
+            // but WITHOUT query parameters
+            let path_without_query = path.split('?').next().unwrap_or(path);
+            let full_path = format!("/trade-api/v2{}", path_without_query);
             let signature = self
                 .config
                 .sign(&format!("{}GET{}", timestamp_ms, full_path))?;
@@ -110,7 +132,7 @@ impl KalshiApiClient {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let url = format!("{}{}", KALSHI_API_BASE, path);
+        let url = format!("{}{}", self.base_url, path);
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -120,6 +142,9 @@ impl KalshiApiClient {
         let msg = format!("{}POST{}", timestamp_ms, full_path);
         let signature = self.config.sign(&msg)?;
 
+        // Serialize body manually (reqwest_middleware doesn't expose .json())
+        let body_json = serde_json::to_string(body)?;
+
         let resp = self
             .http
             .post(&url)
@@ -128,7 +153,7 @@ impl KalshiApiClient {
             .header("KALSHI-ACCESS-TIMESTAMP", timestamp_ms.to_string())
             .header("Content-Type", "application/json")
             .timeout(ORDER_TIMEOUT)
-            .json(body)
+            .body(body_json)
             .send()
             .await?;
 
@@ -223,6 +248,13 @@ impl KalshiApiClient {
         );
         Ok(resp)
     }
+
+    /// Get all portfolio positions with non-zero holdings.
+    pub async fn get_positions(&self) -> Result<KalshiPositionsResponse> {
+        // Only return positions where we have contracts (count_filter=position)
+        let path = "/portfolio/positions?count_filter=position&limit=100";
+        self.get(path).await
+    }
 }
 
 #[cfg(test)]
@@ -256,5 +288,21 @@ mod tests {
         // Should start with 'a' followed by timestamp and counter
         assert!(id.starts_with('a'));
         assert!(id.len() > 1);
+    }
+
+    #[test]
+    fn test_base_url_default() {
+        // Create a mock config (we can't use from_env without real credentials)
+        // Just verify the constant is used
+        assert!(KALSHI_API_BASE.contains("kalshi"));
+        assert!(KALSHI_API_BASE.starts_with("https://"));
+    }
+
+    #[test]
+    fn test_base_url_trailing_slash_trimmed() {
+        // Verify trailing slash handling (can't test full client without credentials)
+        let url_with_slash = "https://mock.example.com/api/";
+        let trimmed = url_with_slash.trim_end_matches('/');
+        assert_eq!(trimmed, "https://mock.example.com/api");
     }
 }

@@ -9,3 +9,6 @@ positions.json
 *.pem
 .worktrees/
 .logs/
+
+# HTTP capture sessions (use fixtures/ for test data)
+.captures/

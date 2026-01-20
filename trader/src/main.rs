@@ -16,6 +16,11 @@ use protocol::IncomingMessage;
 use trader::Trader;
 use websocket::WebSocketClient;
 
+// For positions command
+use rsa::pkcs1::DecodeRsaPrivateKey;
+use rsa::RsaPrivateKey;
+use trading::kalshi::{KalshiApiClient, KalshiConfig};
+
 fn parse_bool_env(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v == "1" || v == "true" || v == "yes")
@@ -38,8 +43,24 @@ fn usage_manual_trade() -> String {
     [
         "Manual trade mode (simulates controller messages):",
         "",
-        "  cargo run -p remote-trader --release -- manual-trade \\",
+        "Polymarket order:",
+        "  TRADER_PLATFORM=polymarket cargo run -p remote-trader --release -- manual-trade \\",
         "    --poly-token <CLOB_TOKEN_ID> \\",
+        "    --side <yes|no> \\",
+        "    --limit-price-cents <0-100> \\",
+        "    --contracts <INT>",
+        "",
+        "Kalshi order:",
+        "  TRADER_PLATFORM=kalshi cargo run -p remote-trader --release -- manual-trade \\",
+        "    --kalshi-ticker <TICKER> \\",
+        "    --side <yes|no> \\",
+        "    --limit-price-cents <0-100> \\",
+        "    --contracts <INT>",
+        "",
+        "Sell order (requires existing position):",
+        "  TRADER_PLATFORM=kalshi cargo run -p remote-trader --release -- manual-trade \\",
+        "    --kalshi-ticker <TICKER> \\",
+        "    --action sell \\",
         "    --side <yes|no> \\",
         "    --limit-price-cents <0-100> \\",
         "    --contracts <INT>",
@@ -53,8 +74,12 @@ fn usage_manual_trade() -> String {
         "    --spend-usd <FLOAT>",
         "",
         "Notes:",
-        "  - Live trading requires DRY_RUN=0 and Polymarket creds in env.",
-        "  - `--side` is for logging; the token determines the outcome you trade.",
+        "  - Live trading requires DRY_RUN=0 and platform creds in env.",
+        "  - TRADER_PLATFORM must match the market identifier you provide:",
+        "    - --poly-token requires TRADER_PLATFORM=polymarket",
+        "    - --kalshi-ticker requires TRADER_PLATFORM=kalshi",
+        "  - `--side` is for logging; the token/ticker determines the outcome you trade.",
+        "  - `--action` defaults to 'buy' if not specified.",
     ]
     .join("\n")
 }
@@ -74,16 +99,45 @@ async fn maybe_run_manual_trade(config: Arc<Config>) -> Result<Option<()>> {
         return Ok(Some(()));
     }
 
-    // This is intended for validating the Polymarket executor path.
-    if config.platform != crate::protocol::Platform::Polymarket {
+    // Parse market identifier (either --poly-token or --kalshi-ticker)
+    let poly_token = arg_value(&args, "--poly-token");
+    let kalshi_ticker = arg_value(&args, "--kalshi-ticker");
+
+    // Determine platform based on which identifier was provided
+    let (platform, market_identifier) = match (&poly_token, &kalshi_ticker) {
+        (Some(token), None) => (crate::protocol::Platform::Polymarket, token.clone()),
+        (None, Some(ticker)) => (crate::protocol::Platform::Kalshi, ticker.clone()),
+        (Some(_), Some(_)) => {
+            anyhow::bail!(
+                "Cannot specify both --poly-token and --kalshi-ticker\n\n{}",
+                usage_manual_trade()
+            );
+        }
+        (None, None) => {
+            anyhow::bail!(
+                "Missing --poly-token or --kalshi-ticker\n\n{}",
+                usage_manual_trade()
+            );
+        }
+    };
+
+    // Validate that TRADER_PLATFORM matches the provided market identifier
+    if config.platform != platform {
         anyhow::bail!(
-            "manual-trade requires TRADER_PLATFORM=polymarket (current={:?})",
+            "TRADER_PLATFORM={:?} does not match the provided market identifier.\n\
+             Use --poly-token with TRADER_PLATFORM=polymarket, or\n\
+             use --kalshi-ticker with TRADER_PLATFORM=kalshi",
             config.platform
         );
     }
 
-    let poly_token = arg_value(&args, "--poly-token")
-        .ok_or_else(|| anyhow::anyhow!("Missing --poly-token\n\n{}", usage_manual_trade()))?;
+    // Parse action (buy or sell), default to buy
+    let action_str = arg_value(&args, "--action").unwrap_or_else(|| "buy".to_string());
+    let action = match action_str.as_str() {
+        "buy" | "BUY" | "Buy" => crate::protocol::OrderAction::Buy,
+        "sell" | "SELL" | "Sell" => crate::protocol::OrderAction::Sell,
+        other => anyhow::bail!("Invalid --action: {} (expected buy|sell)", other),
+    };
 
     let side_str = arg_value(&args, "--side")
         .ok_or_else(|| anyhow::anyhow!("Missing --side\n\n{}", usage_manual_trade()))?;
@@ -123,8 +177,8 @@ async fn maybe_run_manual_trade(config: Arc<Config>) -> Result<Option<()>> {
     }
 
     info!(
-        "[MANUAL] Starting manual-trade: poly_token={} side={:?} limit={}c contracts={} dry_run={}",
-        poly_token, side, limit_price_cents, contracts, config.dry_run
+        "[MANUAL] Starting manual-trade: platform={:?} market={} action={:?} side={:?} limit={}c contracts={} dry_run={}",
+        platform, market_identifier, action, side, limit_price_cents, contracts, config.dry_run
     );
 
     // Simulate controller Init + ExecuteLeg messages (same trader codepath).
@@ -132,7 +186,7 @@ async fn maybe_run_manual_trade(config: Arc<Config>) -> Result<Option<()>> {
 
     let init_ack = trader
         .handle_message(IncomingMessage::Init {
-            platforms: vec![crate::protocol::Platform::Polymarket],
+            platforms: vec![platform],
             dry_run: config.dry_run,
         })
         .await;
@@ -147,19 +201,84 @@ async fn maybe_run_manual_trade(config: Arc<Config>) -> Result<Option<()>> {
         .handle_message(IncomingMessage::ExecuteLeg {
             market_id: 0,
             leg_id,
-            platform: crate::protocol::Platform::Polymarket,
-            action: crate::protocol::OrderAction::Buy,
+            platform,
+            action,
             side,
             price: limit_price_cents,
             contracts,
-            kalshi_market_ticker: None,
-            poly_token: Some(poly_token),
+            kalshi_market_ticker: kalshi_ticker,
+            poly_token,
             pair_id: Some("MANUAL_TRADE".to_string()),
             description: Some("manual-trade".to_string()),
         })
         .await;
 
     info!("[MANUAL] execute_leg_result={:?}", res);
+    Ok(Some(()))
+}
+
+/// Show Kalshi portfolio positions
+async fn maybe_run_positions(config: &Config) -> Result<Option<()>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Check for positions subcommand
+    if args.first().map(|a| a.as_str()) != Some("positions") {
+        return Ok(None);
+    }
+
+    // Require Kalshi credentials
+    let api_key = config
+        .kalshi_api_key
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("KALSHI_API_KEY_ID required for positions command"))?;
+    let private_key_pem = config
+        .kalshi_private_key
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("KALSHI_PRIVATE_KEY_PATH required for positions command"))?;
+
+    let private_key = RsaPrivateKey::from_pkcs1_pem(private_key_pem.trim())
+        .map_err(|e| anyhow::anyhow!("Failed to parse Kalshi private key: {}", e))?;
+
+    let kalshi_cfg = KalshiConfig {
+        api_key_id: api_key,
+        private_key,
+    };
+    let client = KalshiApiClient::new(kalshi_cfg);
+
+    println!("Fetching Kalshi positions...\n");
+
+    let positions = client.get_positions().await?;
+
+    if positions.market_positions.is_empty() {
+        println!("No open positions found.");
+        return Ok(Some(()));
+    }
+
+    println!("{:<35} {:>10} {:>12} {:>12}", "TICKER", "POSITION", "EXPOSURE", "P&L");
+    println!("{}", "-".repeat(75));
+
+    for pos in &positions.market_positions {
+        let side = if pos.position > 0 { "YES" } else { "NO" };
+        let qty = pos.position.abs();
+        println!(
+            "{:<35} {:>6} {:>3} {:>10.2}¢ {:>10.2}¢",
+            pos.ticker,
+            qty,
+            side,
+            pos.market_exposure as f64 / 100.0,
+            pos.realized_pnl as f64 / 100.0,
+        );
+    }
+
+    println!("\n{} position(s) found.", positions.market_positions.len());
+    println!("\nTo sell a position, use:");
+    println!("  cargo run -p remote-trader --release -- manual-trade \\");
+    println!("    --kalshi-ticker <TICKER> \\");
+    println!("    --action sell \\");
+    println!("    --side <yes|no> \\");
+    println!("    --limit-price-cents <PRICE> \\");
+    println!("    --contracts <COUNT>");
+
     Ok(Some(()))
 }
 
@@ -241,6 +360,26 @@ async fn main() -> Result<()> {
     // Load environment variables from `.env` (supports workspace-root `.env`)
     paths::load_dotenv();
 
+    // Initialize HTTP capture session if CAPTURE_DIR is set
+    // Must be done early, before any HTTP clients are created
+    match trading::capture::init_capture_session() {
+        Ok(Some(session)) => {
+            info!(
+                "[MAIN] Capture mode active: {} (filter: {})",
+                session.session_dir.display(),
+                session.filter
+            );
+        }
+        Ok(None) => {
+            // Capture disabled - nothing to log
+        }
+        Err(e) => {
+            error!("[MAIN] Failed to initialize capture session: {}", e);
+            error!("[MAIN] Check that CAPTURE_DIR points to a writable directory");
+            return Err(e.into());
+        }
+    }
+
     info!("[MAIN] Starting remote trader...");
     let one_shot = std::env::var("ONE_SHOT")
         .map(|v| v == "1" || v == "true" || v == "yes")
@@ -249,6 +388,11 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = Arc::new(Config::from_env().context("Failed to load configuration")?);
     info!("[MAIN] Configuration loaded (dry_run={})", config.dry_run);
+
+    // Optional "positions" command to query Kalshi portfolio
+    if let Some(()) = maybe_run_positions(&config).await? {
+        return Ok(());
+    }
 
     // Optional "manual trade" mode for validating live execution without a controller.
     if let Some(()) = maybe_run_manual_trade(config.clone()).await? {

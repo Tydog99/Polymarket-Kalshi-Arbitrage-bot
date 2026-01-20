@@ -116,6 +116,9 @@ pub struct KalshiOrderDetails {
     pub queue_position: Option<i64>,
     pub action: String,
     pub side: String,
+    /// Total filled count (primary field from API)
+    #[serde(default)]
+    pub fill_count: Option<i64>,
     #[serde(rename = "type")]
     pub order_type: String,
     pub yes_price: Option<i64>,
@@ -137,7 +140,10 @@ pub struct KalshiOrderDetails {
 impl KalshiOrderDetails {
     /// Total filled contracts
     pub fn filled_count(&self) -> i64 {
-        self.taker_fill_count.unwrap_or(0) + self.maker_fill_count.unwrap_or(0)
+        // Use fill_count if available (primary field), otherwise sum taker+maker
+        self.fill_count.unwrap_or_else(|| {
+            self.taker_fill_count.unwrap_or(0) + self.maker_fill_count.unwrap_or(0)
+        })
     }
 
     /// Check if order was fully filled
@@ -205,16 +211,23 @@ static ORDER_COUNTER: AtomicU32 = AtomicU32::new(0);
 pub struct KalshiApiClient {
     http: reqwest::Client,
     pub config: KalshiConfig,
+    base_url: String,
 }
 
 impl KalshiApiClient {
     pub fn new(config: KalshiConfig) -> Self {
+        Self::new_with_base_url(config, KALSHI_API_BASE)
+    }
+
+    /// Create a new client with a custom base URL (for testing with mock servers).
+    pub fn new_with_base_url(config: KalshiConfig, base_url: &str) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("Failed to build HTTP client"),
             config,
+            base_url: base_url.trim_end_matches('/').to_string(),
         }
     }
 
@@ -233,7 +246,7 @@ impl KalshiApiClient {
         const MAX_RETRIES: u32 = 5;
 
         loop {
-            let url = format!("{}{}", KALSHI_API_BASE, path);
+            let url = format!("{}{}", self.base_url, path);
             let timestamp_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -300,7 +313,7 @@ impl KalshiApiClient {
     
     /// Generic authenticated POST request
     async fn post<T: serde::de::DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
-        let url = format!("{}{}", KALSHI_API_BASE, path);
+        let url = format!("{}{}", self.base_url, path);
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

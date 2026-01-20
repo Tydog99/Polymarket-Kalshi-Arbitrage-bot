@@ -108,6 +108,24 @@ dotenvx run -- cargo run --release
 
 **Circuit breaker:** `CB_ENABLED`, `CB_MAX_POSITION_PER_MARKET`, `CB_MAX_TOTAL_POSITION`, `CB_MAX_DAILY_LOSS`, `CB_MAX_CONSECUTIVE_ERRORS`, `CB_COOLDOWN_SECS`, `CB_MIN_CONTRACTS` (minimum contracts to execute, trades are capped to remaining capacity)
 
+**HTTP Capture (for debugging/replay):**
+- `CAPTURE_DIR` - Base directory for HTTP capture (unset = disabled)
+- `CAPTURE_FILTER` - What to capture: `orders` (default), `all`, or comma-separated path patterns
+
+```bash
+# Enable HTTP capture to ./.captures/ with default filter (order endpoints only)
+CAPTURE_DIR=./.captures dotenvx run -- cargo run --release
+
+# Capture all HTTP traffic
+CAPTURE_DIR=./.captures CAPTURE_FILTER=all dotenvx run -- cargo run --release
+```
+
+When capture is enabled:
+- A timestamped session subdirectory is created (e.g., `session_2026-01-19_20-15-30/`)
+- Each HTTP exchange is saved as a JSON file with request/response details
+- A `manifest.json` tracks all captured files in order
+- Sensitive headers (Authorization, API keys, etc.) are automatically excluded
+
 ## Tailscale Setup (Remote Trading)
 
 For running controller and trader on separate machines:

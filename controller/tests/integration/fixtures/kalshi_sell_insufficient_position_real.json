@@ -1,0 +1,46 @@
+{
+  "captured_at": "2026-01-20T18:19:19.303795+00:00",
+  "sequence": 1,
+  "latency_ms": 196,
+  "request": {
+    "method": "POST",
+    "url": "https://api.elections.kalshi.com/trade-api/v2/portfolio/orders",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "action": "sell",
+      "client_order_id": "a17689331590",
+      "count": 500,
+      "side": "yes",
+      "ticker": "KXNBA-26-SAS",
+      "time_in_force": "immediate_or_cancel",
+      "type": "limit",
+      "yes_price": 1
+    }
+  },
+  "response": {
+    "status": 400,
+    "headers": {
+      "content-type": "application/json; charset=utf-8",
+      "x-content-type-options": "nosniff",
+      "content-security-policy": "default-src 'none';",
+      "strict-transport-security": "max-age=31536000; includeSubDomains",
+      "connection": "keep-alive",
+      "x-amz-cf-id": "oZ9Yir54KCP_0mp3GeE7sWmAu4xp_nPpVwaHVKluY6X8i65nyppmeQ==",
+      "via": "1.1 ae36c784d97e7ce679dceb12ec90e722.cloudfront.net (CloudFront)",
+      "x-amz-cf-pop": "SFO53-P1",
+      "date": "Tue, 20 Jan 2026 18:19:19 GMT",
+      "x-cache": "Error from cloudfront",
+      "content-length": "95"
+    },
+    "body_raw": "{\"error\":{\"code\":\"insufficient_balance\",\"message\":\"insufficient balance\",\"service\":\"exchange\"}}",
+    "body_parsed": {
+      "error": {
+        "code": "insufficient_balance",
+        "message": "insufficient balance",
+        "service": "exchange"
+      }
+    }
+  }
+}

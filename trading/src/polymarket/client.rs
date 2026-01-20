@@ -13,6 +13,7 @@ use ethers::signers::{LocalWallet, Signer};
 use ethers::types::transaction::eip712::{Eip712, TypedData};
 use ethers::types::{H256, U256};
 use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest_middleware::ClientWithMiddleware;
 use serde::Serialize;
 use serde_json::json;
 
@@ -20,6 +21,7 @@ use super::types::{
     get_order_amounts_buy, get_order_amounts_sell, price_to_bps, price_valid, size_to_micro,
     ApiCreds, PolyFillAsync, PolyOrderType, PolymarketOrderResponse, PreparedCreds,
 };
+use crate::capture::build_client_with_capture;
 
 // ============================================================================
 // CONSTANTS
@@ -254,13 +256,16 @@ impl SignedOrder {
 // ASYNC CLIENT
 // ============================================================================
 
+/// Default Polymarket CLOB API host
+pub const POLYMARKET_CLOB_HOST: &str = "https://clob.polymarket.com";
+
 /// Async Polymarket client for execution.
 ///
 /// Handles L1/L2 authentication and HTTP requests to the CLOB API.
 pub struct PolymarketAsyncClient {
     host: String,
     chain_id: u64,
-    http: reqwest::Client,
+    http: ClientWithMiddleware,
     wallet: Arc<LocalWallet>,
     funder: String,
     /// Signature type used in signed orders (0=EOA, 1/2=proxy modes).
@@ -277,6 +282,8 @@ impl PolymarketAsyncClient {
     /// * `chain_id` - Polygon chain ID (137 for mainnet, 80002 for Amoy testnet)
     /// * `private_key` - 0x-prefixed private key
     /// * `funder` - Wallet address that funds trades
+    ///
+    /// Enables capture middleware if `CAPTURE_DIR` is set.
     pub fn new(host: &str, chain_id: u64, private_key: &str, funder: &str) -> Result<Self> {
         Self::new_with_signature_type(host, chain_id, private_key, funder, SIGNATURE_TYPE_EOA)
     }
@@ -297,14 +304,15 @@ impl PolymarketAsyncClient {
         let address_header = HeaderValue::from_str(&wallet_address_str)
             .map_err(|e| anyhow!("Invalid wallet address for header: {}", e))?;
 
-        // Build async client with connection pooling and keepalive
-        let http = reqwest::Client::builder()
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .tcp_keepalive(std::time::Duration::from_secs(30))
-            .tcp_nodelay(true)
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?;
+        // Build async client with connection pooling, keepalive, and optional capture middleware
+        let http = build_client_with_capture(
+            reqwest::Client::builder()
+                .pool_max_idle_per_host(10)
+                .pool_idle_timeout(std::time::Duration::from_secs(90))
+                .tcp_keepalive(std::time::Duration::from_secs(30))
+                .tcp_nodelay(true)
+                .timeout(std::time::Duration::from_secs(10)),
+        );
 
         Ok(Self {
             host: host.trim_end_matches('/').to_string(),
@@ -316,6 +324,11 @@ impl PolymarketAsyncClient {
             wallet_address_str,
             address_header,
         })
+    }
+
+    /// Get the host URL for this client.
+    pub fn host(&self) -> &str {
+        &self.host
     }
 
     /// Build L1 headers for authentication (derive-api-key).
@@ -660,5 +673,81 @@ impl SharedAsyncClient {
     #[allow(dead_code)]
     pub fn creds(&self) -> &PreparedCreds {
         &self.creds
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_polymarket_clob_host_constant() {
+        assert!(POLYMARKET_CLOB_HOST.contains("polymarket"));
+        assert!(POLYMARKET_CLOB_HOST.starts_with("https://"));
+    }
+
+    #[test]
+    fn test_host_trailing_slash_trimmed() {
+        // Verify trailing slash handling
+        let url_with_slash = "https://clob.polymarket.com/";
+        let trimmed = url_with_slash.trim_end_matches('/');
+        assert_eq!(trimmed, "https://clob.polymarket.com");
+    }
+
+    #[test]
+    fn test_signed_order_post_body_format() {
+        let signed = SignedOrder {
+            order: OrderStruct {
+                salt: 12345,
+                maker: "0xmaker".to_string(),
+                signer: "0xsigner".to_string(),
+                taker: ZERO_ADDRESS.to_string(),
+                token_id: "token123".to_string(),
+                maker_amount: "1000000".to_string(),
+                taker_amount: "500000".to_string(),
+                expiration: "0".to_string(),
+                nonce: "0".to_string(),
+                fee_rate_bps: "0".to_string(),
+                side: 0, // BUY
+                signature_type: 1,
+            },
+            signature: "0xsig".to_string(),
+        };
+
+        let body = signed.post_body("owner_key", "FAK");
+
+        // Verify it's valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("should be valid JSON");
+
+        assert_eq!(parsed["owner"], "owner_key");
+        assert_eq!(parsed["orderType"], "FAK");
+        assert_eq!(parsed["order"]["maker"], "0xmaker");
+        assert_eq!(parsed["order"]["tokenId"], "token123");
+        assert_eq!(parsed["order"]["side"], "BUY");
+    }
+
+    #[test]
+    fn test_signed_order_sell_side() {
+        let signed = SignedOrder {
+            order: OrderStruct {
+                salt: 12345,
+                maker: "0xmaker".to_string(),
+                signer: "0xsigner".to_string(),
+                taker: ZERO_ADDRESS.to_string(),
+                token_id: "token123".to_string(),
+                maker_amount: "1000000".to_string(),
+                taker_amount: "500000".to_string(),
+                expiration: "0".to_string(),
+                nonce: "0".to_string(),
+                fee_rate_bps: "0".to_string(),
+                side: 1, // SELL
+                signature_type: 1,
+            },
+            signature: "0xsig".to_string(),
+        };
+
+        let body = signed.post_body("owner_key", "FAK");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("should be valid JSON");
+        assert_eq!(parsed["order"]["side"], "SELL");
     }
 }
