@@ -26,7 +26,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tracing::{debug, error, info};
+use std::sync::{Arc, Mutex};
+use tracing::{debug, error, info, warn};
 
 /// Sequence counter for ordering captured files (monotonically increasing)
 static CAPTURE_SEQUENCE: AtomicU32 = AtomicU32::new(1);
@@ -70,6 +71,33 @@ pub struct CapturedResponse {
     pub body_raw: String,
     /// Response body parsed as JSON (if applicable)
     pub body_parsed: Option<serde_json::Value>,
+}
+
+/// Manifest tracking capture session metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureManifest {
+    /// ISO 8601 timestamp when capture session started
+    pub started_at: String,
+    /// The capture filter setting used for this session
+    pub capture_filter: String,
+    /// List of captured filenames in order
+    pub files: Vec<String>,
+}
+
+impl CaptureManifest {
+    /// Create a new manifest with the given filter description
+    pub fn new(capture_filter: String) -> Self {
+        Self {
+            started_at: Utc::now().to_rfc3339(),
+            capture_filter,
+            files: Vec::new(),
+        }
+    }
+
+    /// Add a filename to the manifest
+    pub fn add_file(&mut self, filename: String) {
+        self.files.push(filename);
+    }
 }
 
 /// Filter for which requests to capture
@@ -119,12 +147,28 @@ impl CaptureFilter {
             ),
         }
     }
+
+    /// Get a description string for the manifest
+    pub fn description(&self) -> String {
+        match self {
+            CaptureFilter::All => "all".to_string(),
+            CaptureFilter::PathContains(patterns) => {
+                if patterns == &["/orders".to_string(), "/order".to_string(), "/fills".to_string()]
+                {
+                    "orders".to_string()
+                } else {
+                    patterns.join(",")
+                }
+            }
+        }
+    }
 }
 
 /// Middleware that captures HTTP traffic to JSON files
 pub struct CaptureMiddleware {
     output_dir: PathBuf,
     filter: CaptureFilter,
+    manifest: Arc<Mutex<CaptureManifest>>,
 }
 
 impl CaptureMiddleware {
@@ -139,7 +183,19 @@ impl CaptureMiddleware {
         } else {
             info!("[CAPTURE] Capturing HTTP traffic to {:?}", output_dir);
         }
-        Self { output_dir, filter }
+
+        // Initialize manifest
+        let manifest = CaptureManifest::new(filter.description());
+        let manifest = Arc::new(Mutex::new(manifest));
+
+        // Write initial manifest
+        Self::write_manifest_to_disk(&output_dir, &manifest);
+
+        Self {
+            output_dir,
+            filter,
+            manifest,
+        }
     }
 
     /// Create from CAPTURE_DIR environment variable, returns None if not set
@@ -193,7 +249,7 @@ impl CaptureMiddleware {
         )
     }
 
-    /// Save a captured exchange to disk
+    /// Save a captured exchange to disk and update the manifest
     async fn save_capture(&self, exchange: &CapturedExchange) {
         let filename = self.generate_filename(exchange);
         let filepath = self.output_dir.join(&filename);
@@ -204,9 +260,31 @@ impl CaptureMiddleware {
                     error!("[CAPTURE] Failed to write {:?}: {}", filepath, e);
                 } else {
                     debug!("[CAPTURE] Saved {}", filename);
+
+                    // Update manifest with new file
+                    if let Ok(mut manifest) = self.manifest.lock() {
+                        manifest.add_file(filename);
+                    }
+                    Self::write_manifest_to_disk(&self.output_dir, &self.manifest);
                 }
             }
             Err(e) => error!("[CAPTURE] Failed to serialize capture: {}", e),
+        }
+    }
+
+    /// Write the manifest to disk
+    fn write_manifest_to_disk(output_dir: &PathBuf, manifest: &Arc<Mutex<CaptureManifest>>) {
+        let manifest_path = output_dir.join("manifest.json");
+        match manifest.lock() {
+            Ok(manifest) => match serde_json::to_string_pretty(&*manifest) {
+                Ok(json) => {
+                    if let Err(e) = std::fs::write(&manifest_path, json) {
+                        warn!("[CAPTURE] Failed to write manifest: {}", e);
+                    }
+                }
+                Err(e) => warn!("[CAPTURE] Failed to serialize manifest: {}", e),
+            },
+            Err(e) => warn!("[CAPTURE] Failed to lock manifest for writing: {}", e),
         }
     }
 
@@ -607,6 +685,105 @@ mod tests {
         assert!(temp_dir.exists());
 
         // Clean up
-        let _ = std::fs::remove_dir(&temp_dir);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_manifest_creation() {
+        let manifest = CaptureManifest::new("orders".to_string());
+        assert_eq!(manifest.capture_filter, "orders");
+        assert!(manifest.files.is_empty());
+        // started_at should be a valid ISO 8601 timestamp
+        assert!(manifest.started_at.contains("T"));
+    }
+
+    #[test]
+    fn test_manifest_add_file() {
+        let mut manifest = CaptureManifest::new("all".to_string());
+        manifest.add_file("001_POST_kalshi_orders.json".to_string());
+        manifest.add_file("002_POST_poly_order.json".to_string());
+
+        assert_eq!(manifest.files.len(), 2);
+        assert_eq!(manifest.files[0], "001_POST_kalshi_orders.json");
+        assert_eq!(manifest.files[1], "002_POST_poly_order.json");
+    }
+
+    #[test]
+    fn test_manifest_serialization() {
+        let mut manifest = CaptureManifest::new("orders".to_string());
+        manifest.started_at = "2026-01-19T20:15:00.123Z".to_string();
+        manifest.add_file("001_POST_kalshi_orders.json".to_string());
+        manifest.add_file("002_POST_poly_order.json".to_string());
+
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        assert!(json.contains("started_at"));
+        assert!(json.contains("2026-01-19T20:15:00.123Z"));
+        assert!(json.contains("capture_filter"));
+        assert!(json.contains("orders"));
+        assert!(json.contains("files"));
+        assert!(json.contains("001_POST_kalshi_orders.json"));
+        assert!(json.contains("002_POST_poly_order.json"));
+
+        // Verify roundtrip
+        let parsed: CaptureManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.started_at, "2026-01-19T20:15:00.123Z");
+        assert_eq!(parsed.capture_filter, "orders");
+        assert_eq!(parsed.files.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_description_all() {
+        let filter = CaptureFilter::All;
+        assert_eq!(filter.description(), "all");
+    }
+
+    #[test]
+    fn test_filter_description_default_orders() {
+        let filter = CaptureFilter::default();
+        assert_eq!(filter.description(), "orders");
+    }
+
+    #[test]
+    fn test_filter_description_custom() {
+        let filter = CaptureFilter::PathContains(vec!["/custom".to_string(), "/special".to_string()]);
+        assert_eq!(filter.description(), "/custom,/special");
+    }
+
+    #[test]
+    fn test_middleware_creates_manifest_file() {
+        let temp_dir = std::env::temp_dir().join("capture_test_manifest");
+        let _ = std::fs::remove_dir_all(&temp_dir); // Clean first
+
+        let _middleware = CaptureMiddleware::new(temp_dir.clone(), CaptureFilter::All);
+
+        // manifest.json should be created
+        let manifest_path = temp_dir.join("manifest.json");
+        assert!(manifest_path.exists(), "manifest.json should exist");
+
+        // Read and verify contents
+        let contents = std::fs::read_to_string(&manifest_path).unwrap();
+        let manifest: CaptureManifest = serde_json::from_str(&contents).unwrap();
+        assert_eq!(manifest.capture_filter, "all");
+        assert!(manifest.files.is_empty());
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_middleware_manifest_with_orders_filter() {
+        let temp_dir = std::env::temp_dir().join("capture_test_manifest_orders");
+        let _ = std::fs::remove_dir_all(&temp_dir); // Clean first
+
+        let _middleware = CaptureMiddleware::new(temp_dir.clone(), CaptureFilter::default());
+
+        // Read manifest
+        let manifest_path = temp_dir.join("manifest.json");
+        let contents = std::fs::read_to_string(&manifest_path).unwrap();
+        let manifest: CaptureManifest = serde_json::from_str(&contents).unwrap();
+        assert_eq!(manifest.capture_filter, "orders");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
