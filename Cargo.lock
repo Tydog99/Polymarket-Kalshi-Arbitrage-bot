@@ -545,6 +545,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tailscale",
+ "tempfile",
  "terminal_size",
  "tiny-keccak",
  "tokio",

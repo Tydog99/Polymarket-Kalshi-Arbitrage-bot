@@ -55,5 +55,6 @@ criterion = { version = "0.5", features = ["html_reports"] }
 hex = "0.4"
 regex = "1"
 remote-trader = { path = "../trader" }
+tempfile = "3"
 wiremock = "0.6"
 
