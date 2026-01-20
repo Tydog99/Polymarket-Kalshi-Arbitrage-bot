@@ -154,7 +154,7 @@ impl Trader {
 
         let effective_dry_run = dry_run || self.config.dry_run;
 
-        let init_res = self.init_clients(platform, effective_dry_run);
+        let init_res = self.init_clients(platform, effective_dry_run).await;
 
         match init_res {
             Ok(clients) => {
@@ -185,7 +185,7 @@ impl Trader {
     }
 
     /// Initialize execution clients based on platform
-    fn init_clients(
+    async fn init_clients(
         &self,
         platform: Platform,
         dry_run: bool,
@@ -235,7 +235,7 @@ impl Trader {
                     .config
                     .polymarket_private_key
                     .clone()
-                    .ok_or_else(|| anyhow::anyhow!("Missing POLYMARKET_PRIVATE_KEY"))?;
+                    .ok_or_else(|| anyhow::anyhow!("Missing POLY_PRIVATE_KEY"))?;
                 let funder = self
                     .config
                     .polymarket_funder
@@ -243,33 +243,39 @@ impl Trader {
                     .ok_or_else(|| {
                         anyhow::anyhow!("Missing POLYMARKET_FUNDER (or POLY_FUNDER)")
                     })?;
-                let api_key = self
-                    .config
-                    .polymarket_api_key
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("Missing POLYMARKET_API_KEY"))?;
-                let api_secret = self
-                    .config
-                    .polymarket_api_secret
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("Missing POLYMARKET_API_SECRET"))?;
-                let api_passphrase = self
-                    .config
-                    .polymarket_api_passphrase
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("Missing POLYMARKET_API_PASSPHRASE"))?;
 
-                let poly_async = PolymarketAsyncClient::new(
+                let poly_async = PolymarketAsyncClient::new_with_signature_type(
                     POLY_CLOB_HOST,
                     POLYGON_CHAIN_ID,
                     &private_key,
                     &funder,
+                    self.config.polymarket_signature_type,
                 )?;
 
-                let api_creds = ApiCreds {
-                    api_key,
-                    api_secret,
-                    api_passphrase,
+                // Prefer explicit API creds if provided, otherwise derive them from the wallet.
+                // This matches the "it should figure it out" expectation and avoids extra setup.
+                let api_creds = match (
+                    self.config.polymarket_api_key.clone(),
+                    self.config.polymarket_api_secret.clone(),
+                    self.config.polymarket_api_passphrase.clone(),
+                ) {
+                    (Some(api_key), Some(api_secret), Some(api_passphrase)) => ApiCreds {
+                        api_key,
+                        api_secret,
+                        api_passphrase,
+                    },
+                    _ => {
+                        // Polymarket's derive-api-key flow is sensitive; use the canonical nonce of 0.
+                        // (Using a changing nonce can trigger "Could not derive api key!" on some accounts.)
+                        let nonce = 0_u64;
+                        info!(
+                            "[TRADER] Deriving Polymarket API credentials via /auth/derive-api-key (address={}, funder={}, nonce={})...",
+                            poly_async.wallet_address(),
+                            funder,
+                            nonce
+                        );
+                        poly_async.derive_api_key(nonce).await?
+                    }
                 };
                 let creds = PreparedCreds::from_api_creds(&api_creds)?;
                 let shared = Arc::new(SharedAsyncClient::new(poly_async, creds, POLYGON_CHAIN_ID));

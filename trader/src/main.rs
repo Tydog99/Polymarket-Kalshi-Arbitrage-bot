@@ -16,6 +16,153 @@ use protocol::IncomingMessage;
 use trader::Trader;
 use websocket::WebSocketClient;
 
+fn parse_bool_env(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v == "true" || v == "yes")
+        .unwrap_or(false)
+}
+
+/// Minimal CLI parser: expects `--key value` pairs.
+fn arg_value(args: &[String], key: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == key)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|a| a == flag)
+}
+
+fn usage_manual_trade() -> String {
+    [
+        "Manual trade mode (simulates controller messages):",
+        "",
+        "  cargo run -p remote-trader --release -- manual-trade \\",
+        "    --poly-token <CLOB_TOKEN_ID> \\",
+        "    --side <yes|no> \\",
+        "    --limit-price-cents <0-100> \\",
+        "    --contracts <INT>",
+        "",
+        "Or specify a USD spend amount (requires limit price):",
+        "",
+        "  cargo run -p remote-trader --release -- manual-trade \\",
+        "    --poly-token <CLOB_TOKEN_ID> \\",
+        "    --side <yes|no> \\",
+        "    --limit-price-cents <0-100> \\",
+        "    --spend-usd <FLOAT>",
+        "",
+        "Notes:",
+        "  - Live trading requires DRY_RUN=0 and Polymarket creds in env.",
+        "  - `--side` is for logging; the token determines the outcome you trade.",
+    ]
+    .join("\n")
+}
+
+async fn maybe_run_manual_trade(config: Arc<Config>) -> Result<Option<()>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Enable via either: `manual-trade` subcommand OR env var.
+    let is_manual = args.first().is_some_and(|a| a == "manual-trade")
+        || parse_bool_env("MANUAL_TRADE");
+    if !is_manual {
+        return Ok(None);
+    }
+
+    if has_flag(&args, "--help") || has_flag(&args, "-h") {
+        println!("{}", usage_manual_trade());
+        return Ok(Some(()));
+    }
+
+    // This is intended for validating the Polymarket executor path.
+    if config.platform != crate::protocol::Platform::Polymarket {
+        anyhow::bail!(
+            "manual-trade requires TRADER_PLATFORM=polymarket (current={:?})",
+            config.platform
+        );
+    }
+
+    let poly_token = arg_value(&args, "--poly-token")
+        .ok_or_else(|| anyhow::anyhow!("Missing --poly-token\n\n{}", usage_manual_trade()))?;
+
+    let side_str = arg_value(&args, "--side")
+        .ok_or_else(|| anyhow::anyhow!("Missing --side\n\n{}", usage_manual_trade()))?;
+    let side = match side_str.as_str() {
+        "yes" | "YES" | "Yes" => crate::protocol::OutcomeSide::Yes,
+        "no" | "NO" | "No" => crate::protocol::OutcomeSide::No,
+        other => anyhow::bail!("Invalid --side: {} (expected yes|no)", other),
+    };
+
+    let limit_price_cents: u16 = arg_value(&args, "--limit-price-cents")
+        .ok_or_else(|| anyhow::anyhow!("Missing --limit-price-cents\n\n{}", usage_manual_trade()))?
+        .parse()
+        .context("Failed to parse --limit-price-cents as integer")?;
+    if limit_price_cents > 100 {
+        anyhow::bail!("--limit-price-cents must be 0..=100");
+    }
+
+    let contracts: i64 = if let Some(c) = arg_value(&args, "--contracts") {
+        c.parse().context("Failed to parse --contracts as integer")?
+    } else if let Some(spend) = arg_value(&args, "--spend-usd") {
+        let spend_usd: f64 = spend.parse().context("Failed to parse --spend-usd as float")?;
+        let px = (limit_price_cents as f64) / 100.0;
+        if px <= 0.0 {
+            anyhow::bail!("--limit-price-cents must be > 0 when using --spend-usd");
+        }
+        let c = (spend_usd / px).floor() as i64;
+        c
+    } else {
+        return Err(anyhow::anyhow!(
+            "Missing --contracts or --spend-usd\n\n{}",
+            usage_manual_trade()
+        ));
+    };
+
+    if contracts < 1 {
+        anyhow::bail!("Computed contracts < 1; increase --contracts or --spend-usd");
+    }
+
+    info!(
+        "[MANUAL] Starting manual-trade: poly_token={} side={:?} limit={}c contracts={} dry_run={}",
+        poly_token, side, limit_price_cents, contracts, config.dry_run
+    );
+
+    // Simulate controller Init + ExecuteLeg messages (same trader codepath).
+    let mut trader = Trader::new(config.clone());
+
+    let init_ack = trader
+        .handle_message(IncomingMessage::Init {
+            platforms: vec![crate::protocol::Platform::Polymarket],
+            dry_run: config.dry_run,
+        })
+        .await;
+    info!("[MANUAL] init_ack={:?}", init_ack);
+
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let leg_id = format!("manual-{}", ms);
+    let res = trader
+        .handle_message(IncomingMessage::ExecuteLeg {
+            market_id: 0,
+            leg_id,
+            platform: crate::protocol::Platform::Polymarket,
+            action: crate::protocol::OrderAction::Buy,
+            side,
+            price: limit_price_cents,
+            contracts,
+            kalshi_market_ticker: None,
+            poly_token: Some(poly_token),
+            pair_id: Some("MANUAL_TRADE".to_string()),
+            description: Some("manual-trade".to_string()),
+        })
+        .await;
+
+    info!("[MANUAL] execute_leg_result={:?}", res);
+    Ok(Some(()))
+}
+
 /// Discover controller via Tailscale beacon or use configured URL
 async fn resolve_websocket_url(config: &Config) -> Result<String> {
     // If WEBSOCKET_URL is set, use it directly
@@ -122,6 +269,11 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = Arc::new(Config::from_env().context("Failed to load configuration")?);
     info!("[MAIN] Configuration loaded (dry_run={})", config.dry_run);
+
+    // Optional "manual trade" mode for validating live execution without a controller.
+    if let Some(()) = maybe_run_manual_trade(config.clone()).await? {
+        return Ok(());
+    }
 
     // Create trader
     let mut trader = Trader::new(config.clone());

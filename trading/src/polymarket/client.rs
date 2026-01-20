@@ -30,6 +30,10 @@ use crate::capture::build_client_with_capture;
 const USER_AGENT: &str = "py_clob_client";
 const MSG_TO_SIGN: &str = "This message attests that I control the given wallet";
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
+// Signature type meanings (per Polymarket CLOB / py-clob-client conventions):
+// - 0: EOA (standard private-key wallet like MetaMask)
+// - 1/2: proxy / delegated signing modes
+const SIGNATURE_TYPE_EOA: i32 = 0;
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -264,6 +268,8 @@ pub struct PolymarketAsyncClient {
     http: ClientWithMiddleware,
     wallet: Arc<LocalWallet>,
     funder: String,
+    /// Signature type used in signed orders (0=EOA, 1/2=proxy modes).
+    signature_type: i32,
     wallet_address_str: String,
     address_header: HeaderValue,
 }
@@ -279,6 +285,20 @@ impl PolymarketAsyncClient {
     ///
     /// Enables capture middleware if `CAPTURE_DIR` is set.
     pub fn new(host: &str, chain_id: u64, private_key: &str, funder: &str) -> Result<Self> {
+        Self::new_with_signature_type(host, chain_id, private_key, funder, SIGNATURE_TYPE_EOA)
+    }
+
+    /// Create a new async client with an explicit `signature_type`.
+    ///
+    /// Use this when your **signer address** (private key) differs from the **funder/maker**
+    /// address shown in the Polymarket UI (proxy/delegated accounts).
+    pub fn new_with_signature_type(
+        host: &str,
+        chain_id: u64,
+        private_key: &str,
+        funder: &str,
+        signature_type: i32,
+    ) -> Result<Self> {
         let wallet = private_key.parse::<LocalWallet>()?.with_chain_id(chain_id);
         let wallet_address_str = format!("{:?}", wallet.address());
         let address_header = HeaderValue::from_str(&wallet_address_str)
@@ -300,6 +320,7 @@ impl PolymarketAsyncClient {
             http,
             wallet: Arc::new(wallet),
             funder: funder.to_string(),
+            signature_type,
             wallet_address_str,
             address_header,
         })
@@ -434,6 +455,12 @@ impl PolymarketAsyncClient {
     #[allow(dead_code)]
     pub fn funder(&self) -> &str {
         &self.funder
+    }
+
+    /// Get signature type (0=EOA, 1/2=proxy modes).
+    #[allow(dead_code)]
+    pub fn signature_type(&self) -> i32 {
+        self.signature_type
     }
 
     /// Get reference to wallet.
@@ -607,7 +634,7 @@ impl SharedAsyncClient {
             nonce: "0",
             signer: &self.inner.wallet_address_str,
             expiration: "0",
-            signature_type: 1,
+            signature_type: self.inner.signature_type,
             salt,
         };
         let exchange = get_exchange_address(self.chain_id, neg_risk)?;
@@ -630,7 +657,7 @@ impl SharedAsyncClient {
                 nonce: "0".to_string(),
                 fee_rate_bps: "0".to_string(),
                 side: side_code,
-                signature_type: 1,
+                signature_type: self.inner.signature_type,
             },
             signature: format!("0x{}", sig),
         })
