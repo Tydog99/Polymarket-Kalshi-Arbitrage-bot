@@ -553,6 +553,7 @@ pub fn build_client_with_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_filter_default_matches_orders() {
@@ -954,6 +955,7 @@ mod tests {
     // =========================================================================
 
     #[test]
+    #[serial]
     fn test_is_capture_enabled_when_not_set() {
         // Ensure CAPTURE_DIR is not set for this test
         std::env::remove_var("CAPTURE_DIR");
@@ -961,6 +963,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_is_capture_enabled_when_empty() {
         std::env::set_var("CAPTURE_DIR", "");
         assert!(!is_capture_enabled());
@@ -968,6 +971,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_init_capture_session_disabled() {
         // Ensure CAPTURE_DIR is not set
         std::env::remove_var("CAPTURE_DIR");
@@ -978,6 +982,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_init_capture_session_creates_session_dir() {
         let temp_dir = std::env::temp_dir().join("capture_session_test");
         let _ = std::fs::remove_dir_all(&temp_dir); // Clean first
@@ -1014,6 +1019,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_init_capture_session_with_custom_filter() {
         let temp_dir = std::env::temp_dir().join("capture_session_filter_test");
         let _ = std::fs::remove_dir_all(&temp_dir); // Clean first
