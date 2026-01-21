@@ -1,0 +1,62 @@
+{
+  "captured_at": "2026-01-20T21:55:15.557423200+00:00",
+  "sequence": 1,
+  "latency_ms": 85,
+  "request": {
+    "method": "POST",
+    "url": "https://clob.polymarket.com/order",
+    "headers": {
+      "accept": "*/*",
+      "user-agent": "py_clob_client",
+      "connection": "keep-alive",
+      "content-type": "application/json"
+    },
+    "body": {
+      "order": {
+        "expiration": "0",
+        "feeRateBps": "0",
+        "maker": "0xE49d13C6addd6900bDAF5d1bE19C7deb72A4e76f",
+        "makerAmount": "4700000",
+        "nonce": "0",
+        "salt": 3222149810,
+        "side": "BUY",
+        "signature": "0xd40a4a9f428513f749dce6f1d985f3ea2be9d47956311937a865e3f95c9b3edd7a45b5b46c5ac86e90950a6ede1ffa329865f559ec94b3dd320de5a1ed3420741b",
+        "signatureType": 2,
+        "signer": "0xa92a49198b257592083f8c20ef4081f18fc78c13",
+        "taker": "0x0000000000000000000000000000000000000000",
+        "takerAmount": "10000000",
+        "tokenId": "53831553061883006530739877284105938919721408776239639687877978808906551086026"
+      },
+      "orderType": "FAK",
+      "owner": "f8f7370d-52b6-b764-0776-48aa65b6ec0a"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "date": "Tue, 20 Jan 2026 21:55:15 GMT",
+      "set-cookie": "__cf_bm=shLKq2Ihom0o_PeAyhxoG5BaRYHozlM6AFtX5bACicM-1768946115-1.0.1.1-FBTiKOJp2TMZO5j_MoCSCybGLAmTQbPneZ.12m8TaxCKttSHo9OyOYZOiYb3tbAlGiJcprgatFYnoCk17c5lMIlSJYUjzMdEnwlHXraA4ss; path=/; expires=Tue, 20-Jan-26 22:25:15 GMT; domain=.polymarket.com; HttpOnly; Secure; SameSite=None",
+      "alt-svc": "h3=\":443\"; ma=86400",
+      "strict-transport-security": "max-age=7776000; includeSubDomains",
+      "content-length": "262",
+      "cf-cache-status": "DYNAMIC",
+      "vary": "Origin",
+      "server": "cloudflare",
+      "content-type": "application/json",
+      "connection": "keep-alive",
+      "cf-ray": "9c11d0a49a6c6dc0-MAD"
+    },
+    "body_raw": "{\"errorMsg\":\"\",\"orderID\":\"0x8b416d01048aea99086ea6c1e4510cad2d0bb881a0def312b9b81b7ac732ad8e\",\"takingAmount\":\"5\",\"makingAmount\":\"2.35\",\"status\":\"matched\",\"transactionsHashes\":[\"0xfa6dc3d89588e8024a8c729a3380f7a4ec1be0ba6788894fd8c9a2fb5329b706\"],\"success\":true}\n",
+    "body_parsed": {
+      "errorMsg": "",
+      "makingAmount": "2.35",
+      "orderID": "0x8b416d01048aea99086ea6c1e4510cad2d0bb881a0def312b9b81b7ac732ad8e",
+      "status": "matched",
+      "success": true,
+      "takingAmount": "5",
+      "transactionsHashes": [
+        "0xfa6dc3d89588e8024a8c729a3380f7a4ec1be0ba6788894fd8c9a2fb5329b706"
+      ]
+    }
+  }
+}

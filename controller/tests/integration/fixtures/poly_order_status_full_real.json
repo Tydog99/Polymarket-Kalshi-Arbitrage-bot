@@ -1,0 +1,52 @@
+{
+  "captured_at": "2026-01-20T21:22:59.967626600+00:00",
+  "sequence": 2,
+  "latency_ms": 69,
+  "request": {
+    "method": "GET",
+    "url": "https://clob.polymarket.com/data/order/0x300b6f4a853408b38846aee01695d25ff0da109a1072fea577f067fbb67bb80f",
+    "headers": {
+      "accept": "*/*",
+      "user-agent": "py_clob_client",
+      "connection": "keep-alive",
+      "content-type": "application/json"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "server": "cloudflare",
+      "connection": "keep-alive",
+      "content-length": "576",
+      "cf-ray": "9c11a162a882b177-MAD",
+      "cf-cache-status": "DYNAMIC",
+      "date": "Tue, 20 Jan 2026 21:22:59 GMT",
+      "vary": "Origin",
+      "strict-transport-security": "max-age=7776000; includeSubDomains",
+      "content-type": "application/json",
+      "alt-svc": "h3=\":443\"; ma=86400",
+      "set-cookie": "__cf_bm=mv81egtctIXoKnQOuF6be5DItNMUd17E0qWAT_xjqgA-1768944179-1.0.1.1-58zY6I8plWAwVDNGr4RRDQRgJooubEpe_73f8CVaRyyACHvZ2noIJGk6_dBVu473eAPGQkIvD0WQXt.fN04jjxwNwxP3AgpQEqkf7x1D8uk; path=/; expires=Tue, 20-Jan-26 21:52:59 GMT; domain=.polymarket.com; HttpOnly; Secure; SameSite=None"
+    },
+    "body_raw": "{\"id\":\"0x300b6f4a853408b38846aee01695d25ff0da109a1072fea577f067fbb67bb80f\",\"status\":\"MATCHED\",\"owner\":\"f8f7370d-52b6-b764-0776-48aa65b6ec0a\",\"maker_address\":\"0xE49d13C6addd6900bDAF5d1bE19C7deb72A4e76f\",\"market\":\"0x85c21822935272188a7e4120b41e22c3e9c8a7a83748775927b2fffb50579189\",\"asset_id\":\"26310511444966676152901239545213464869875480698266972830365142324057733576025\",\"side\":\"BUY\",\"original_size\":\"5\",\"size_matched\":\"5\",\"price\":\"0.53\",\"outcome\":\"Suns\",\"expiration\":\"0\",\"order_type\":\"FAK\",\"associate_trades\":[\"9a34f42f-492d-4e10-a1cb-151f71451f98\"],\"created_at\":1768944180}\n",
+    "body_parsed": {
+      "asset_id": "26310511444966676152901239545213464869875480698266972830365142324057733576025",
+      "associate_trades": [
+        "9a34f42f-492d-4e10-a1cb-151f71451f98"
+      ],
+      "created_at": 1768944180,
+      "expiration": "0",
+      "id": "0x300b6f4a853408b38846aee01695d25ff0da109a1072fea577f067fbb67bb80f",
+      "maker_address": "0xE49d13C6addd6900bDAF5d1bE19C7deb72A4e76f",
+      "market": "0x85c21822935272188a7e4120b41e22c3e9c8a7a83748775927b2fffb50579189",
+      "order_type": "FAK",
+      "original_size": "5",
+      "outcome": "Suns",
+      "owner": "f8f7370d-52b6-b764-0776-48aa65b6ec0a",
+      "price": "0.53",
+      "side": "BUY",
+      "size_matched": "5",
+      "status": "MATCHED"
+    }
+  }
+}

@@ -16,6 +16,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest_middleware::ClientWithMiddleware;
 use serde::Serialize;
 use serde_json::json;
+use tokio::time::{sleep, Duration};
 
 use super::types::{
     get_order_amounts_buy, get_order_amounts_sell, price_to_bps, price_valid, size_to_micro,
@@ -428,7 +429,15 @@ impl PolymarketAsyncClient {
             return Err(anyhow!("get_order failed {}: {}", status, body));
         }
 
-        Ok(resp.json().await?)
+        // Polymarket sometimes returns JSON `null` briefly right after placing an order.
+        // Treat that as "not ready yet" so the caller can retry.
+        let body = resp.text().await.unwrap_or_default();
+        let trimmed = body.trim();
+        if trimmed.eq_ignore_ascii_case("null") {
+            return Err(anyhow!("get_order returned null (order not ready yet)"));
+        }
+
+        Ok(serde_json::from_str::<PolymarketOrderResponse>(trimmed)?)
     }
 
     /// Check neg_risk for token.
@@ -568,8 +577,28 @@ impl SharedAsyncClient {
             .unwrap_or("unknown")
             .to_string();
 
-        // Query fill status
-        let order_info = self.inner.get_order_async(&order_id, &self.creds).await?;
+        // Query fill status. The order endpoint can return before the order is visible to /data/order.
+        // Retry briefly if we see a transient `null` response.
+        let mut last_err: Option<anyhow::Error> = None;
+        let order_info = 'retry: loop {
+            // Up to ~1.2s total wait (including jitterless backoff).
+            for attempt in 0..6 {
+                match self.inner.get_order_async(&order_id, &self.creds).await {
+                    Ok(info) => break 'retry Ok(info),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        last_err = Some(e);
+                        if msg.contains("order not ready yet") && attempt < 5 {
+                            sleep(Duration::from_millis(150 * (attempt as u64 + 1))).await;
+                            continue;
+                        }
+                        break 'retry Err(anyhow!("{}", msg));
+                    }
+                }
+            }
+            // If we get here without returning, surface the last error.
+            break Err(last_err.unwrap_or_else(|| anyhow!("get_order failed (unknown error)")));
+        }?;
         let filled_size: f64 = order_info.size_matched.parse().unwrap_or(0.0);
         let order_price: f64 = order_info.price.parse().unwrap_or(price);
 

@@ -51,8 +51,8 @@ async fn test_both_sides_full_fill() {
     let kalshi_exchange = mount_fixture_file(&kalshi_server, fixture_path("kalshi_full_fill.json")).await;
 
     // Mount Polymarket fixtures (order + status check)
-    mount_fixture_file(&poly_server, fixture_path("poly_full_fill.json")).await;
-    mount_fixture_file(&poly_server, fixture_path("poly_order_status_full.json")).await;
+    mount_fixture_file(&poly_server, fixture_path("poly_full_fill_real.json")).await;
+    mount_fixture_file(&poly_server, fixture_path("poly_order_status_full_real.json")).await;
 
     // Verify Kalshi fixture loaded correctly
     assert_eq!(kalshi_exchange.response.status, 200);
@@ -95,11 +95,13 @@ async fn test_both_sides_full_fill() {
 
     assert_eq!(poly_resp.status(), 200);
     let poly_result: serde_json::Value = poly_resp.json().await.unwrap();
-    assert_eq!(poly_result["orderID"], "poly-order-001");
+    // Real fixture has hex order ID
+    let poly_order_id = poly_result["orderID"].as_str().unwrap();
+    assert!(poly_order_id.starts_with("0x"));
 
-    // Polymarket status check
+    // Polymarket status check - use actual order ID from POST response
     let poly_status_resp = client
-        .get(format!("{}/data/order/poly-order-001", poly_server.uri()))
+        .get(format!("{}/data/order/{}", poly_server.uri(), poly_order_id))
         .send()
         .await
         .expect("Poly status request should succeed");
@@ -107,7 +109,8 @@ async fn test_both_sides_full_fill() {
     assert_eq!(poly_status_resp.status(), 200);
     let poly_status: serde_json::Value = poly_status_resp.json().await.unwrap();
     assert_eq!(poly_status["status"], "MATCHED");
-    assert_eq!(poly_status["size_matched"], "10");
+    // Real fixture filled 5 contracts
+    assert_eq!(poly_status["size_matched"], "5");
 }
 
 // ============================================================================
@@ -196,8 +199,8 @@ async fn test_both_partial_fills() {
     mount_fixture_file(&kalshi_server, fixture_path("kalshi_partial_fill.json")).await;
 
     // Mount Polymarket partial fill fixtures
-    mount_fixture_file(&poly_server, fixture_path("poly_partial_fill.json")).await;
-    mount_fixture_file(&poly_server, fixture_path("poly_order_status_partial.json")).await;
+    mount_fixture_file(&poly_server, fixture_path("poly_partial_fill_real.json")).await;
+    mount_fixture_file(&poly_server, fixture_path("poly_order_status_partial_real.json")).await;
 
     let client = reqwest::Client::new();
 
@@ -246,14 +249,15 @@ async fn test_both_partial_fills() {
     assert_eq!(poly_status_resp.status(), 200);
     let poly_status: serde_json::Value = poly_status_resp.json().await.unwrap();
     let poly_filled: f64 = poly_status["size_matched"].as_str().unwrap().parse().unwrap();
-    assert_eq!(poly_filled as i64, 7, "Poly should partially fill 7 contracts");
+    // Real fixture: 5/10 contracts filled (50% partial)
+    assert_eq!(poly_filled as i64, 5, "Poly should partially fill 5 contracts");
 
     // Verify imbalanced position
-    // Kalshi: 6 NO contracts
-    // Polymarket: 7 YES contracts
-    // Imbalance: 1 contract (Poly has more)
+    // Kalshi: 6 NO contracts (synthetic fixture)
+    // Polymarket: 5 YES contracts (real fixture)
+    // Imbalance: -1 contract (Kalshi has more)
     let imbalance = (poly_filled as i64) - kalshi_filled;
-    assert_eq!(imbalance, 1, "Should have 1 contract imbalance");
+    assert_eq!(imbalance, -1, "Should have 1 contract imbalance (Kalshi excess)");
 }
 
 // ============================================================================
@@ -275,8 +279,8 @@ async fn test_kalshi_fails_poly_fills() {
     mount_fixture_file(&kalshi_server, fixture_path("kalshi_insufficient_balance.json")).await;
 
     // Mount Polymarket full fill
-    mount_fixture_file(&poly_server, fixture_path("poly_full_fill.json")).await;
-    mount_fixture_file(&poly_server, fixture_path("poly_order_status_full.json")).await;
+    mount_fixture_file(&poly_server, fixture_path("poly_full_fill_real.json")).await;
+    mount_fixture_file(&poly_server, fixture_path("poly_order_status_full_real.json")).await;
 
     let client = reqwest::Client::new();
 
@@ -322,16 +326,17 @@ async fn test_kalshi_fails_poly_fills() {
     assert_eq!(poly_status_resp.status(), 200);
     let poly_status: serde_json::Value = poly_status_resp.json().await.unwrap();
     let poly_filled: f64 = poly_status["size_matched"].as_str().unwrap().parse().unwrap();
-    assert_eq!(poly_filled as i64, 10, "Poly should fill completely");
+    // Real fixture: 5 contracts filled
+    assert_eq!(poly_filled as i64, 5, "Poly should fill 5 contracts (real fixture)");
 
     // Verify reverse exposure
     // Kalshi: 0 contracts (failed)
-    // Polymarket: 10 YES contracts
-    // Exposure: -10 (we own YES without offsetting NO)
+    // Polymarket: 5 YES contracts (real fixture)
+    // Exposure: -5 (we own YES without offsetting NO)
     let net_kalshi_position: i64 = 0;
     let net_poly_position = poly_filled as i64;
     let reverse_exposure = net_poly_position - net_kalshi_position;
-    assert_eq!(reverse_exposure, 10, "Should have 10 contracts of reverse exposure");
+    assert_eq!(reverse_exposure, 5, "Should have 5 contracts of reverse exposure");
 }
 
 // ============================================================================
@@ -350,8 +355,8 @@ async fn test_concurrent_execution_both_fill() {
 
     // Mount fixtures
     mount_fixture_file(&kalshi_server, fixture_path("kalshi_full_fill.json")).await;
-    mount_fixture_file(&poly_server, fixture_path("poly_full_fill.json")).await;
-    mount_fixture_file(&poly_server, fixture_path("poly_order_status_full.json")).await;
+    mount_fixture_file(&poly_server, fixture_path("poly_full_fill_real.json")).await;
+    mount_fixture_file(&poly_server, fixture_path("poly_order_status_full_real.json")).await;
 
     let client = reqwest::Client::new();
     let kalshi_uri = kalshi_server.uri();
@@ -412,13 +417,14 @@ async fn test_fixture_loading_integrity() {
     assert_eq!(kalshi_error.response.status, 400);
 
     // Test Polymarket fixtures
-    let poly_full = load_fixture(fixture_path("poly_full_fill.json")).unwrap();
+    let poly_full = load_fixture(fixture_path("poly_full_fill_real.json")).unwrap();
     assert_eq!(poly_full.request.method, "POST");
     assert_eq!(poly_full.response.status, 200);
 
-    let poly_status = load_fixture(fixture_path("poly_order_status_full.json")).unwrap();
+    let poly_status = load_fixture(fixture_path("poly_order_status_full_real.json")).unwrap();
     let status_body = poly_status.response.body_parsed.unwrap();
-    assert_eq!(status_body["size_matched"], "10");
+    // Real fixture: 5 contracts filled
+    assert_eq!(status_body["size_matched"], "5");
 }
 
 /// Test creating exchanges programmatically for custom scenarios.
@@ -770,4 +776,167 @@ async fn test_real_fixture_loading_integrity() {
     assert_eq!(not_found.response.status, 404);
     let body = not_found.response.body_parsed.unwrap();
     assert_eq!(body["error"]["code"], "market_not_found");
+}
+
+// ============================================================================
+// REAL POLYMARKET API FIXTURE TESTS
+// ============================================================================
+//
+// These tests use real API responses captured from live Polymarket trading.
+// They verify that our test harness correctly replays actual API behavior.
+
+/// Test with real Polymarket full fill response from live API.
+///
+/// Captured scenario:
+/// - Token: Phoenix Suns NBA Championship YES token
+/// - Requested: 5 contracts at 53c
+/// - Result: Full fill (5/5 contracts executed)
+/// - Order ID: 0x300b6f4a853408b38846aee01695d25ff0da109a1072fea577f067fbb67bb80f
+#[tokio::test]
+async fn test_real_poly_full_fill() {
+    let server = setup_mock_server().await;
+
+    // Mount real captured fixtures (order + status)
+    let order_exchange = mount_fixture_file(&server, fixture_path("poly_full_fill_real.json")).await;
+    mount_fixture_file(&server, fixture_path("poly_order_status_full_real.json")).await;
+
+    // Verify fixture loaded correctly
+    assert_eq!(order_exchange.response.status, 200);
+    let body = order_exchange.response.body_parsed.as_ref().unwrap();
+    assert_eq!(body["status"], "matched");
+    assert!(body["success"].as_bool().unwrap());
+    let order_id = body["orderID"].as_str().unwrap();
+    assert!(order_id.starts_with("0x"), "Real order ID should be hex");
+
+    // Make POST request to mock server (order submission)
+    let client = reqwest::Client::new();
+    let order_resp = client
+        .post(format!("{}/order", server.uri()))
+        .json(&json!({
+            "order": {"tokenId": "26310511444966676152901239545213464869875480698266972830365142324057733576025"},
+            "orderType": "FAK"
+        }))
+        .send()
+        .await
+        .expect("Order request should succeed");
+
+    assert_eq!(order_resp.status(), 200);
+    let order_result: serde_json::Value = order_resp.json().await.unwrap();
+
+    // Verify order response
+    assert!(order_result["success"].as_bool().unwrap());
+    assert_eq!(order_result["status"], "matched");
+    let returned_order_id = order_result["orderID"].as_str().unwrap();
+    assert!(returned_order_id.starts_with("0x"));
+
+    // Make GET request for order status
+    let status_resp = client
+        .get(format!("{}/data/order/{}", server.uri(), returned_order_id))
+        .send()
+        .await
+        .expect("Status request should succeed");
+
+    assert_eq!(status_resp.status(), 200);
+    let status_result: serde_json::Value = status_resp.json().await.unwrap();
+
+    // Verify status response - real fixture shows 5 contracts filled
+    assert_eq!(status_result["status"], "MATCHED");
+    assert_eq!(status_result["size_matched"], "5");
+    assert_eq!(status_result["original_size"], "5");
+    assert_eq!(status_result["side"], "BUY");
+    assert_eq!(status_result["order_type"], "FAK");
+}
+
+/// Test with real Polymarket partial fill response from live API.
+///
+/// Captured scenario:
+/// - Token: NBA game NO token
+/// - Requested: 10 contracts at 47c
+/// - Result: Partial fill (5/10 contracts executed)
+/// - Order ID: 0x8b416d01048aea99086ea6c1e4510cad2d0bb881a0def312b9b81b7ac732ad8e
+#[tokio::test]
+async fn test_real_poly_partial_fill() {
+    let server = setup_mock_server().await;
+
+    // Mount real captured fixtures (order + status)
+    let order_exchange = mount_fixture_file(&server, fixture_path("poly_partial_fill_real.json")).await;
+    mount_fixture_file(&server, fixture_path("poly_order_status_partial_real.json")).await;
+
+    // Verify fixture loaded correctly
+    assert_eq!(order_exchange.response.status, 200);
+    let body = order_exchange.response.body_parsed.as_ref().unwrap();
+    assert!(body["success"].as_bool().unwrap());
+    // Even partial fills return status "matched" in the order response
+    assert_eq!(body["status"], "matched");
+
+    // Make POST request to mock server (order submission)
+    let client = reqwest::Client::new();
+    let order_resp = client
+        .post(format!("{}/order", server.uri()))
+        .json(&json!({
+            "order": {"tokenId": "53831553061883006530739877284105938919721408776239639687877978808906551086026"},
+            "orderType": "FAK"
+        }))
+        .send()
+        .await
+        .expect("Order request should succeed");
+
+    assert_eq!(order_resp.status(), 200);
+    let order_result: serde_json::Value = order_resp.json().await.unwrap();
+    let returned_order_id = order_result["orderID"].as_str().unwrap();
+
+    // Make GET request for order status
+    let status_resp = client
+        .get(format!("{}/data/order/{}", server.uri(), returned_order_id))
+        .send()
+        .await
+        .expect("Status request should succeed");
+
+    assert_eq!(status_resp.status(), 200);
+    let status_result: serde_json::Value = status_resp.json().await.unwrap();
+
+    // Verify partial fill - real fixture shows 5/10 contracts filled
+    assert_eq!(status_result["status"], "MATCHED");
+    assert_eq!(status_result["original_size"], "10", "Requested 10 contracts");
+    assert_eq!(status_result["size_matched"], "5", "Only 5 contracts filled (50% partial)");
+    assert_eq!(status_result["side"], "BUY");
+    assert_eq!(status_result["outcome"], "No");
+}
+
+/// Test loading real Polymarket fixtures maintains integrity with capture format.
+#[tokio::test]
+async fn test_real_poly_fixture_loading_integrity() {
+    use super::replay_harness::load_fixture;
+
+    // Test real full fill fixture
+    let full_fill = load_fixture(fixture_path("poly_full_fill_real.json")).unwrap();
+    assert_eq!(full_fill.request.method, "POST");
+    assert_eq!(full_fill.response.status, 200);
+    assert!(full_fill.latency_ms > 0, "Should have real latency");
+    let body = full_fill.response.body_parsed.unwrap();
+    assert!(body["success"].as_bool().unwrap());
+    assert!(body["orderID"].as_str().unwrap().starts_with("0x"));
+
+    // Test real full fill status fixture
+    let full_status = load_fixture(fixture_path("poly_order_status_full_real.json")).unwrap();
+    assert_eq!(full_status.request.method, "GET");
+    assert_eq!(full_status.response.status, 200);
+    let body = full_status.response.body_parsed.unwrap();
+    assert_eq!(body["status"], "MATCHED");
+    assert_eq!(body["size_matched"], "5");
+    assert_eq!(body["original_size"], "5");
+
+    // Test real partial fill fixture
+    let partial_fill = load_fixture(fixture_path("poly_partial_fill_real.json")).unwrap();
+    assert_eq!(partial_fill.response.status, 200);
+    let body = partial_fill.response.body_parsed.unwrap();
+    assert!(body["success"].as_bool().unwrap());
+
+    // Test real partial fill status fixture
+    let partial_status = load_fixture(fixture_path("poly_order_status_partial_real.json")).unwrap();
+    assert_eq!(partial_status.response.status, 200);
+    let body = partial_status.response.body_parsed.unwrap();
+    assert_eq!(body["status"], "MATCHED");
+    assert_eq!(body["original_size"], "10");
+    assert_eq!(body["size_matched"], "5");
 }
