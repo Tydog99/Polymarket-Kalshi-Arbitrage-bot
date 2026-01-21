@@ -302,6 +302,15 @@ impl KalshiApiClient {
         Ok(resp.markets)
     }
 
+    /// Get markets for a given series ticker (used for MVE series that don't expose events).
+    ///
+    /// Note: Kalshi's API accepts `status=open` to return actively tradable markets (often `status: "active"`).
+    pub async fn get_markets_for_series(&self, series_ticker: &str, limit: u32) -> Result<Vec<KalshiMarket>> {
+        let path = format!("/markets?series_ticker={}&status=open&limit={}", series_ticker, limit);
+        let resp: KalshiMarketsResponse = self.get(&path).await?;
+        Ok(resp.markets)
+    }
+
     /// Get markets created since a given timestamp for a series
     pub async fn get_markets_since(&self, series_ticker: &str, since_ts: u64) -> Result<Vec<KalshiMarket>> {
         let path = format!(

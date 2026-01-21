@@ -383,6 +383,36 @@ See `controller/src/cache.rs` for the complete mapping across all supported leag
 
 ---
 
+## Kalshi "MVE" series support (developer note)
+
+Kalshi has been migrating some sports content under **MVE** series tickers (`KXMVE...`). These behave differently from the legacy sports series:
+
+- **Legacy series**: discovery uses `GET /events?series_ticker=...` then `GET /markets?event_ticker=...`
+- **MVE series**: `GET /events` is not reliable, so discovery must use `GET /markets?series_ticker=...` and then use the market’s `mve_collection_ticker` (or `event_ticker`) as the parseable “event key”
+
+### How to enable the NFL-style MVE fallback for another league
+
+1. **Find the Kalshi MVE series ticker**
+   - Look at Kalshi market tickers for that league and identify the series prefix (it will start with `KXMVE...`), or query Kalshi’s markets endpoint and inspect the returned `series_ticker`.
+   - Example we currently support for NFL: `KXMVENFLSINGLEGAME`.
+
+2. **Add the MVE series to discovery (2 call sites)**
+   - **Primary discovery** (used on startup / full scans): update `DiscoveryEngine::get_series_list_for_type()` in `controller/src/discovery.rs` to add your league’s MVE series alongside the legacy series.
+   - **Runtime discovery** (used for “new markets since timestamp” scans): update `discover_series_since()` in `controller/src/discovery.rs` to add the same MVE series there too.
+   - Today this is gated as **NFL-only** (`if config.league_code == "nfl" { ... }`). To enable another league, replicate that pattern for the new `league_code` and add its `KXMVE...` series constant.
+
+3. **Ensure the MVE “event key” parses cleanly**
+   - For MVE, pairing prefers `market.mve_collection_ticker` (e.g. `KXMVENFLSINGLEGAME-26JAN18LACHI`) and runs it through `parse_kalshi_event_ticker()` in `controller/src/discovery.rs`.
+   - If the new league uses different team-code lengths (2/3/4+ chars), you may need to adjust team-splitting heuristics in `split_team_codes()` and/or the conservative 2-letter allowlist in `is_likely_two_letter_code()`.
+
+4. **Validate with pairing debug**
+   - Run a discovery-only scan and confirm you see a log line like: `"... MVE collections from Kalshi (... markets)"`
+   - Then confirm Polymarket matches are found for the generated slugs:
+
+```bash
+DISCOVERY_ONLY=1 FORCE_DISCOVERY=1 cargo run -p controller --release -- --leagues <league> --pairing-debug --pairing-debug-limit 50
+```
+
 ## Known Issues & Technical Notes
 
 ### Startup Race Condition (Cached Discovery)

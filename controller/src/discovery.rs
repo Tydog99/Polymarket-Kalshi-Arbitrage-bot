@@ -346,11 +346,9 @@ impl DiscoveryClient {
             .collect();
 
         // Parallel discovery across market types
-        let type_futures: Vec<_> = market_types.iter()
-            .filter_map(|market_type| {
-                let series = self.get_series_for_type(config, *market_type)?;
-                Some(self.discover_series(config, series, *market_type, cache))
-            })
+        let type_futures: Vec<_> = market_types
+            .iter()
+            .map(|market_type| self.discover_market_type(config, *market_type, cache))
             .collect();
 
         let type_results = futures_util::future::join_all(type_futures).await;
@@ -376,14 +374,87 @@ impl DiscoveryClient {
 
         result
     }
-    
-    fn get_series_for_type(&self, config: &LeagueConfig, market_type: MarketType) -> Option<&'static str> {
+
+    /// Return all Kalshi series candidates for this league + market type.
+    ///
+    /// We primarily use the legacy series declared in `LeagueConfig`, but some leagues
+    /// may additionally publish equivalent markets under an "MVE" series.
+    fn get_series_list_for_type(&self, config: &LeagueConfig, market_type: MarketType) -> Vec<&'static str> {
+        let mut series = Vec::new();
+
+        // Legacy series (always first)
         match market_type {
-            MarketType::Moneyline => Some(config.kalshi_series_game),
-            MarketType::Spread => config.kalshi_series_spread,
-            MarketType::Total => config.kalshi_series_total,
-            MarketType::Btts => config.kalshi_series_btts,
+            MarketType::Moneyline => series.push(config.kalshi_series_game),
+            MarketType::Spread => {
+                if let Some(s) = config.kalshi_series_spread {
+                    series.push(s);
+                }
+            }
+            MarketType::Total => {
+                if let Some(s) = config.kalshi_series_total {
+                    series.push(s);
+                }
+            }
+            MarketType::Btts => {
+                if let Some(s) = config.kalshi_series_btts {
+                    series.push(s);
+                }
+            }
         }
+
+        // MVE fallback(s) - currently only enabled for NFL.
+        //
+        // Kalshi has been migrating some sports content under MVE collection tickers (KXMVE...).
+        // Those series don't expose the `/events` listing reliably, so discovery must query markets by series.
+        if config.league_code == "nfl" {
+            const NFL_MVE_SERIES: &str = "KXMVENFLSINGLEGAME";
+            if !series.iter().any(|s| *s == NFL_MVE_SERIES) {
+                series.push(NFL_MVE_SERIES);
+            }
+        }
+
+        series
+    }
+
+    /// Discover a single market type for a league across all series candidates (legacy + MVE).
+    async fn discover_market_type(
+        &self,
+        config: &LeagueConfig,
+        market_type: MarketType,
+        cache: Option<&DiscoveryCache>,
+    ) -> Result<(Vec<MarketPair>, usize)> {
+        let series_list = self.get_series_list_for_type(config, market_type);
+        if series_list.is_empty() {
+            return Ok((vec![], 0));
+        }
+
+        let mut all_pairs: Vec<MarketPair> = Vec::new();
+        let mut kalshi_total = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::<String>::new();
+
+        for series in series_list {
+            match self.discover_series(config, series, market_type, cache).await {
+                Ok((pairs, kalshi_count)) => {
+                    kalshi_total += kalshi_count;
+                    for p in pairs {
+                        // De-dupe by Kalshi market ticker in case a market appears in multiple series.
+                        if seen.insert(p.kalshi_market_ticker.to_string()) {
+                            all_pairs.push(p);
+                        }
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!("{}: {}", series, e));
+                }
+            }
+        }
+
+        if !errors.is_empty() && all_pairs.is_empty() && kalshi_total == 0 {
+            anyhow::bail!("all series failed: {}", errors.join(" | "));
+        }
+
+        Ok((all_pairs, kalshi_total))
     }
     
     /// Discover markets for a specific series (PARALLEL Kalshi + Gamma lookups)
@@ -399,76 +470,164 @@ impl DiscoveryClient {
         let pairing_debug = config::pairing_debug_enabled();
         let pairing_debug_limit = config::pairing_debug_limit();
 
-        // Fetch Kalshi events
-        {
-            let _permit = self.kalshi_semaphore.acquire().await.map_err(|e| anyhow::anyhow!("semaphore closed: {}", e))?;
-            self.kalshi_limiter.until_ready().await;
-        }
-        let events = self.kalshi.get_events(series, 50).await?;
+        // MVE series do not reliably expose the `/events` listing. For those, discover by querying
+        // `/markets?series_ticker=...` and using `mve_collection_ticker` (or `event_ticker`) as the parseable event key.
+        let is_mve = series.starts_with("KXMVE");
 
-        if events.is_empty() {
-            return Ok((vec![], 0));
-        }
-        info!("  📡 {} {}: {} events from Kalshi", config.league_code, market_type, events.len());
-
-        // PHASE 2: Parallel market fetching 
-        let kalshi = self.kalshi.clone();
-        let limiter = self.kalshi_limiter.clone();
-        let semaphore = self.kalshi_semaphore.clone();
-
-        // Parse events first, filtering out unparseable ones
-        let parsed_events: Vec<_> = events.into_iter()
-            .filter_map(|event| {
-                let parsed = match parse_kalshi_event_ticker(&event.event_ticker) {
-                    Some(p) => p,
-                    None => {
-                        warn!("  ⚠️ Could not parse event ticker {}", event.event_ticker);
-                        return None;
-                    }
-                };
-                Some((parsed, event))
-            })
-            .collect();
-        let parsed_events_len = parsed_events.len();
-
-        // Execute market fetches with GLOBAL concurrency limit
-        let market_results: Vec<_> = stream::iter(parsed_events)
-            .map(|(parsed, event)| {
-                let kalshi = kalshi.clone();
-                let limiter = limiter.clone();
-                let semaphore = semaphore.clone();
-                let event_ticker = event.event_ticker.clone();
-                async move {
-                    let _permit = semaphore.acquire().await.ok();
-                    // rate limit
-                    limiter.until_ready().await;
-                    let markets_result = kalshi.get_markets(&event_ticker).await;
-                    (parsed, Arc::new(event), markets_result)
-                }
-            })
-            .buffer_unordered(KALSHI_GLOBAL_CONCURRENCY * 2)  // Allow some buffering, semaphore is the real limit
-            .collect()
-            .await;
-
-        // Collect all (event, market) pairs
-        let mut event_markets = Vec::with_capacity(market_results.len() * 3);
+        // Output container shared by legacy + MVE paths: (parsed_event, event, market)
+        let mut event_markets: Vec<(ParsedKalshiTicker, Arc<KalshiEvent>, KalshiMarket)> = Vec::new();
         let mut cached_count = 0usize;
-        for (parsed, event, markets_result) in market_results {
-            match markets_result {
-                Ok(markets) => {
-                    for market in markets {
-                        // Skip if already in cache
-                        if let Some(c) = cache {
-                            if c.has_ticker(&market.ticker) {
-                                cached_count += 1;
+        let parsed_events_len: usize;
+
+        if is_mve {
+            // Rate limit (single call)
+            {
+                let _permit = self.kalshi_semaphore
+                    .acquire()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("semaphore closed: {}", e))?;
+                self.kalshi_limiter.until_ready().await;
+            }
+
+            let markets = self.kalshi.get_markets_for_series(series, 200).await?;
+            if markets.is_empty() {
+                return Ok((vec![], 0));
+            }
+
+            // Group by parseable "event key" (prefer mve_collection_ticker)
+            let mut event_cache: HashMap<String, (ParsedKalshiTicker, Arc<KalshiEvent>)> = HashMap::new();
+            for market in markets {
+                // Skip if already in cache
+                if let Some(c) = cache {
+                    if c.has_ticker(&market.ticker) {
+                        cached_count += 1;
+                        continue;
+                    }
+                }
+
+                let event_key = market
+                    .mve_collection_ticker
+                    .clone()
+                    .or_else(|| market.event_ticker.clone());
+
+                let Some(event_key) = event_key else {
+                    if pairing_debug {
+                        warn!("  ⚠️ [MVE] missing event key for market {}", market.ticker);
+                    }
+                    continue;
+                };
+
+                let (parsed, event) = match event_cache.get(&event_key) {
+                    Some((p, e)) => (p.clone(), e.clone()),
+                    None => {
+                        let parsed = match parse_kalshi_event_ticker(&event_key) {
+                            Some(p) => p,
+                            None => {
+                                warn!("  ⚠️ [MVE] Could not parse event key {}", event_key);
                                 continue;
                             }
-                        }
-                        event_markets.push((parsed.clone(), event.clone(), market));
+                        };
+                        let event = Arc::new(KalshiEvent {
+                            event_ticker: event_key.clone(),
+                            title: event_key.clone(),
+                            sub_title: None,
+                        });
+                        event_cache.insert(event_key.clone(), (parsed.clone(), event.clone()));
+                        (parsed, event)
                     }
-                }
-                Err(e) => {
-                    warn!("  ⚠️ Failed to get markets for {}: {}", event.event_ticker, e);
+                };
+
+                event_markets.push((parsed, event, market));
+            }
+
+            parsed_events_len = event_cache.len();
+            info!(
+                "  📡 {} {}: {} MVE collections from Kalshi ({} markets)",
+                config.league_code,
+                market_type,
+                parsed_events_len,
+                event_markets.len() + cached_count
+            );
+        } else {
+            // Legacy event-based discovery: /events → /markets?event_ticker=...
+
+            // Fetch Kalshi events
+            {
+                let _permit = self.kalshi_semaphore
+                    .acquire()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("semaphore closed: {}", e))?;
+                self.kalshi_limiter.until_ready().await;
+            }
+            let events = self.kalshi.get_events(series, 50).await?;
+
+            if events.is_empty() {
+                return Ok((vec![], 0));
+            }
+            info!(
+                "  📡 {} {}: {} events from Kalshi",
+                config.league_code, market_type, events.len()
+            );
+
+            // PHASE 2: Parallel market fetching
+            let kalshi = self.kalshi.clone();
+            let limiter = self.kalshi_limiter.clone();
+            let semaphore = self.kalshi_semaphore.clone();
+
+            // Parse events first, filtering out unparseable ones
+            let parsed_events: Vec<_> = events
+                .into_iter()
+                .filter_map(|event| {
+                    let parsed = match parse_kalshi_event_ticker(&event.event_ticker) {
+                        Some(p) => p,
+                        None => {
+                            warn!("  ⚠️ Could not parse event ticker {}", event.event_ticker);
+                            return None;
+                        }
+                    };
+                    Some((parsed, event))
+                })
+                .collect();
+            parsed_events_len = parsed_events.len();
+
+            // Execute market fetches with GLOBAL concurrency limit
+            let market_results: Vec<_> = stream::iter(parsed_events)
+                .map(|(parsed, event)| {
+                    let kalshi = kalshi.clone();
+                    let limiter = limiter.clone();
+                    let semaphore = semaphore.clone();
+                    let event_ticker = event.event_ticker.clone();
+                    async move {
+                        let _permit = semaphore.acquire().await.ok();
+                        // rate limit
+                        limiter.until_ready().await;
+                        let markets_result = kalshi.get_markets(&event_ticker).await;
+                        (parsed, Arc::new(event), markets_result)
+                    }
+                })
+                .buffer_unordered(KALSHI_GLOBAL_CONCURRENCY * 2) // Allow some buffering, semaphore is the real limit
+                .collect()
+                .await;
+
+            // Collect all (event, market) pairs
+            event_markets = Vec::with_capacity(market_results.len() * 3);
+            for (parsed, event, markets_result) in market_results {
+                match markets_result {
+                    Ok(markets) => {
+                        for market in markets {
+                            // Skip if already in cache
+                            if let Some(c) = cache {
+                                if c.has_ticker(&market.ticker) {
+                                    cached_count += 1;
+                                    continue;
+                                }
+                            }
+                            event_markets.push((parsed.clone(), event.clone(), market));
+                        }
+                    }
+                    Err(e) => {
+                        warn!("  ⚠️ Failed to get markets for {}: {}", event.event_ticker, e);
+                    }
                 }
             }
         }
@@ -929,12 +1088,20 @@ impl DiscoveryClient {
         let mut all_pairs = Vec::new();
 
         // Check all series for this league
-        let series_list: Vec<&str> = [
+        let mut series_list: Vec<&str> = [
             Some(config.kalshi_series_game),
             config.kalshi_series_spread,
             config.kalshi_series_total,
             config.kalshi_series_btts,
         ].into_iter().flatten().collect();
+
+        // MVE fallback(s) - currently only enabled for NFL.
+        if config.league_code == "nfl" {
+            const NFL_MVE_SERIES: &str = "KXMVENFLSINGLEGAME";
+            if !series_list.iter().any(|s| *s == NFL_MVE_SERIES) {
+                series_list.push(NFL_MVE_SERIES);
+            }
+        }
 
         for series in series_list {
             // Rate limit
@@ -962,10 +1129,22 @@ impl DiscoveryClient {
             }
 
             // Look up on Polymarket in parallel
+            let market_type = if series.contains("SPREAD") {
+                MarketType::Spread
+            } else if series.contains("TOTAL") {
+                MarketType::Total
+            } else if series.contains("BTTS") {
+                MarketType::Btts
+            } else {
+                MarketType::Moneyline
+            };
+            let series_string = series.to_string();
+
             let pairs: Vec<MarketPair> = stream::iter(new_markets)
                 .map(|market| {
+                    let series_string = series_string.clone();
                     async move {
-                        self.try_match_market(config, &market).await
+                        self.try_match_market(config, &market, market_type, &series_string).await
                     }
                 })
                 .buffer_unordered(GAMMA_CONCURRENCY)
@@ -980,30 +1159,32 @@ impl DiscoveryClient {
     }
 
     /// Try to match a single Kalshi market to Polymarket
-    async fn try_match_market(&self, config: &LeagueConfig, market: &KalshiMarket) -> Option<MarketPair> {
+    async fn try_match_market(
+        &self,
+        config: &LeagueConfig,
+        market: &KalshiMarket,
+        market_type: MarketType,
+        series: &str,
+    ) -> Option<MarketPair> {
         let pairing_debug = config::pairing_debug_enabled();
 
-        // Extract event ticker from market ticker (format: SERIES-EVENTID-SUFFIX)
-        let parts: Vec<&str> = market.ticker.split('-').collect();
-        if parts.len() < 2 {
-            if pairing_debug {
-                info!("❌ [PAIR] cannot split market ticker: {}", market.ticker);
-            }
-            return None;
-        }
-
-        // Reconstruct event ticker (SERIES-EVENTID)
-        let event_ticker = format!("{}-{}", parts[0], parts[1]);
-
-        // Determine market type from series
-        let market_type = if market.ticker.contains("SPREAD") {
-            MarketType::Spread
-        } else if market.ticker.contains("TOTAL") {
-            MarketType::Total
-        } else if market.ticker.contains("BTTS") {
-            MarketType::Btts
+        // Prefer a parseable event key from the API (supports MVE markets).
+        // - MVE: `mve_collection_ticker` is like "KXMVENFLSINGLEGAME-26JAN18LACHI" (date+teams embedded)
+        // - Legacy list endpoints may also include `event_ticker`
+        let event_ticker = if let Some(t) = market.mve_collection_ticker.as_ref() {
+            t.clone()
+        } else if let Some(t) = market.event_ticker.as_ref() {
+            t.clone()
         } else {
-            MarketType::Moneyline
+            // Fallback: reconstruct event ticker from market ticker (format: SERIES-EVENTID-SUFFIX)
+            let parts: Vec<&str> = market.ticker.split('-').collect();
+            if parts.len() < 2 {
+                if pairing_debug {
+                    info!("❌ [PAIR] cannot split market ticker: {}", market.ticker);
+                }
+                return None;
+            }
+            format!("{}-{}", parts[0], parts[1])
         };
 
         // Parse event ticker to get teams and date
@@ -1012,8 +1193,8 @@ impl DiscoveryClient {
             None => {
                 if pairing_debug {
                     info!(
-                        "❌ [PAIR] cannot parse event_ticker={} (market={})",
-                        event_ticker, market.ticker
+                        "❌ [PAIR] cannot parse event_ticker={} (market={} series={} type={:?})",
+                        event_ticker, market.ticker, series, market_type
                     );
                 }
                 return None;
@@ -1524,8 +1705,8 @@ fn is_likely_two_letter_code(code: &str) -> bool {
         "OH" |
         // NHL 2-letter codes (can appear as first team, e.g., SJFLA = SJ+FLA)
         "SJ" | "TB" | "NJ" | "LA" |
-        // NFL 2-letter codes (e.g., SFSEA = SF+SEA)
-        "SF" |
+        // NFL 2-letter codes (appear as first team in tickers like SFSEA, NEDEN, GBCHI)
+        "SF" | "NE" | "GB" | "KC" | "NO" | "LV" |
         // Generic short codes
         "BC" | "SC" | "AC" | "AS" | "US"
     )
