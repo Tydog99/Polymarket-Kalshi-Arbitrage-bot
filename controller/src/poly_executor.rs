@@ -45,7 +45,12 @@ pub trait PolyExecutor: Send + Sync {
 // MOCK IMPLEMENTATION (FOR TESTING)
 // =============================================================================
 
-/// Mock module for testing. Available in all builds but only used in tests.
+/// Mock implementation used by integration tests.
+///
+/// This code lives in the main crate so integration tests can import it, but it
+/// is not referenced by normal binaries. Suppress `dead_code` warnings for the
+/// module as a whole.
+#[allow(dead_code)]
 pub mod mock {
     use super::*;
     use anyhow::anyhow;
