@@ -921,7 +921,15 @@ async fn main() -> Result<()> {
                     Some((req, pair)) = confirm_rx.recv() => {
                         // Push to confirmation queue
                         confirm_queue_clone.push(req, pair.clone()).await;
-                        info!("[CONFIRM] Queued arb for {} ({} pending)", pair.description, confirm_queue_clone.len().await);
+                        let pending_count = confirm_queue_clone.len().await;
+                        let tui_active = confirm_tui_state.read().await.active;
+                        let msg = format!("[{}]  INFO [CONFIRM] Queued arb for {} ({} pending)",
+                            chrono::Local::now().format("%H:%M:%S"), pair.description, pending_count);
+                        if tui_active {
+                            let _ = confirm_log_tx.try_send(msg);
+                        } else {
+                            println!("{}", msg);
+                        }
 
                         // Launch TUI when first arb arrives (take ownership of channels)
                         if let Some(update_rx) = tui_update_rx_opt.take() {
@@ -1012,7 +1020,8 @@ async fn main() -> Result<()> {
                                     note,
                                 };
                                 if let Err(e) = log.log(record) {
-                                    warn!("[CONFIRM] Failed to log decision: {}", e);
+                                    log_msg(format!("[{}]  WARN [CONFIRM] Failed to log decision: {}",
+                                        chrono::Local::now().format("%H:%M:%S"), e));
                                 }
                             }
                         }
@@ -1551,7 +1560,8 @@ async fn main() -> Result<()> {
                     }
                 }
             } else if with_both == 0 {
-                warn!("⚠️  No markets with both Kalshi and Polymarket prices - verify WebSocket connections");
+                log_line(format!("[{}]  WARN controller: ⚠️  No markets with both Kalshi and Polymarket prices - verify WebSocket connections",
+                    chrono::Local::now().format("%H:%M:%S")));
             }
 
             // Print league summary table
