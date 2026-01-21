@@ -580,11 +580,11 @@ impl SharedAsyncClient {
         // Query fill status. The order endpoint can return before the order is visible to /data/order.
         // Retry briefly if we see a transient `null` response.
         let mut last_err: Option<anyhow::Error> = None;
-        let order_info = loop {
+        let order_info = 'retry: loop {
             // Up to ~1.2s total wait (including jitterless backoff).
             for attempt in 0..6 {
                 match self.inner.get_order_async(&order_id, &self.creds).await {
-                    Ok(info) => break Ok(info),
+                    Ok(info) => break 'retry Ok(info),
                     Err(e) => {
                         let msg = e.to_string();
                         last_err = Some(e);
@@ -592,7 +592,7 @@ impl SharedAsyncClient {
                             sleep(Duration::from_millis(150 * (attempt as u64 + 1))).await;
                             continue;
                         }
-                        break Err(anyhow!("{}", msg));
+                        break 'retry Err(anyhow!("{}", msg));
                     }
                 }
             }

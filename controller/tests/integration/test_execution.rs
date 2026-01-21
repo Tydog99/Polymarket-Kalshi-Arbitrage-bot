@@ -4,6 +4,23 @@
 //! 1. Makes HTTP requests to Kalshi API
 //! 2. Parses responses correctly
 //! 3. Returns appropriate LegResult (success/failure)
+//!
+//! ## Kalshi Tests
+//!
+//! Kalshi tests use real captured fixtures with wiremock because KalshiApiClient
+//! supports a custom base URL and uses simple RSA signature auth (which wiremock ignores).
+//!
+//! ## Polymarket Tests
+//!
+//! Polymarket tests are NOT included here because SharedAsyncClient requires:
+//! 1. /auth/derive-api-key endpoint to get HMAC credentials
+//! 2. /neg-risk endpoint to check token risk flags
+//! 3. HMAC-SHA256 signed headers for each request
+//!
+//! Mocking this full flow for wiremock is complex. Instead, Polymarket execution is
+//! tested in test_execution_engine.rs using MockPolyClient with values from real fixtures.
+//! For HTTP-level Poly fixture tests, see test_combined_scenarios.rs which tests the
+//! request/response format without going through the full client.
 
 use std::sync::Arc;
 

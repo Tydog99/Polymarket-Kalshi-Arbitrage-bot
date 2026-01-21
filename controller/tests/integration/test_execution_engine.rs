@@ -3,10 +3,15 @@
 //! These tests verify the actual data flow from API responses through to
 //! PositionTracker fills. Unlike the previous "e2e" tests, these tests:
 //!
-//! 1. Use real KalshiApiClient pointing to wiremock (not manual fixture loading)
-//! 2. Use MockPolyClient with canned responses
+//! 1. Use real KalshiApiClient pointing to wiremock with real captured fixtures
+//! 2. Use MockPolyClient configured with values from real captured fixtures
+//!    (poly_full_fill_real.json, poly_partial_fill_real.json)
 //! 3. Verify FillRecords are created with data from API responses (not hardcoded)
 //! 4. Verify auto-close behavior when fills are mismatched
+//!
+//! Note: MockPolyClient is used instead of wiremock because Polymarket requires
+//! complex auth flow (/auth/derive-api-key + HMAC signing). The mock values are
+//! configured to match the prices from real captured Polymarket responses.
 //!
 //! Test Matrix:
 //! | Test | Kalshi | Poly | Verifies |
@@ -184,9 +189,11 @@ async fn test_engine_both_full_fill() {
         .await;
 
     // Configure mock Poly client for full fill
+    // Values based on poly_full_fill_real.json: 5 contracts at 0.53 price
+    // But we use 1 contract to match the Kalshi full_fill_real fixture (1 contract)
     let mock_poly = Arc::new(MockPolyClient::new());
     // For PolyYesKalshiNo, we buy Poly YES token
-    mock_poly.set_full_fill("poly-yes-token-12345", 1.0, 0.09);
+    mock_poly.set_full_fill("poly-yes-token-12345", 1.0, 0.53);
 
     let (engine, mut fill_rx) = create_test_engine(&kalshi_server, mock_poly);
 
@@ -244,8 +251,9 @@ async fn test_engine_partial_fills() {
         .await;
 
     // Configure mock Poly client for partial fill
+    // Values based on poly_partial_fill_real.json: 5/10 contracts at 0.47 price
     let mock_poly = Arc::new(MockPolyClient::new());
-    mock_poly.set_partial_fill("poly-yes-token-12345", 50.0, 0.09);
+    mock_poly.set_partial_fill("poly-yes-token-12345", 5.0, 0.47);
 
     let (engine, mut fill_rx) = create_test_engine(&kalshi_server, mock_poly);
 
@@ -263,8 +271,8 @@ async fn test_engine_partial_fills() {
     let poly_fill = fills.iter().find(|f| f.platform == "polymarket");
 
     // The matched contracts should be min(kalshi_filled, poly_filled)
-    // Kalshi fixture has 114 filled, Poly mock has 50 filled
-    // So matched = 50
+    // Kalshi fixture has 114 filled, Poly fixture has 5 filled
+    // So matched = 5
     if let (Some(k), Some(p)) = (kalshi_fill, poly_fill) {
         let matched = k.contracts.min(p.contracts);
         assert!(matched > 0.0, "Should have some matched contracts");
@@ -559,8 +567,9 @@ async fn test_auto_close_poly_excess_sells_on_poly() {
 
     // Configure mock Poly for FULL fill on YES token (buy and sell)
     // This creates the mismatch - Poly fills, Kalshi doesn't
+    // Values based on poly_full_fill_real.json: price 0.53
     let mock_poly = Arc::new(MockPolyClient::new());
-    mock_poly.set_full_fill("poly-yes-token-12345", 1.0, 0.09);
+    mock_poly.set_full_fill("poly-yes-token-12345", 1.0, 0.53);
 
     let (engine, mut fill_rx) = create_test_engine(&kalshi_server, mock_poly.clone());
 
