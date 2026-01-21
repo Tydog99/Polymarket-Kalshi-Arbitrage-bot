@@ -71,6 +71,8 @@ pub struct TuiState {
     pub selected: MenuOption,
     /// Note being typed (None if not in note mode)
     pub note_input: Option<String>,
+    /// Saved note to attach to action (persists after exiting note mode)
+    pub saved_note: Option<String>,
     /// Whether TUI is active
     pub active: bool,
 }
@@ -81,6 +83,7 @@ impl Default for TuiState {
             log_buffer: VecDeque::with_capacity(MAX_LOG_LINES),
             selected: MenuOption::Proceed,
             note_input: None,
+            saved_note: None,
             active: false,
         }
     }
@@ -115,6 +118,7 @@ pub async fn run_tui(
     state: Arc<RwLock<TuiState>>,
     mut update_rx: mpsc::Receiver<()>,
     action_tx: mpsc::Sender<ConfirmAction>,
+    mut log_rx: mpsc::Receiver<String>,
 ) -> anyhow::Result<()> {
     // Setup terminal
     enable_raw_mode()?;
@@ -129,6 +133,14 @@ pub async fn run_tui(
         // Check if queue is empty - if so, exit TUI
         if queue.is_empty().await {
             break;
+        }
+
+        // Drain log channel into buffer
+        {
+            let mut tui_state = state.write().await;
+            while let Ok(line) = log_rx.try_recv() {
+                tui_state.add_log(line);
+            }
         }
 
         // Get current pending arb
@@ -188,16 +200,12 @@ async fn handle_key(
     if let Some(ref mut note) = tui_state.note_input {
         match key.code {
             KeyCode::Enter => {
-                let note_text = if note.is_empty() { None } else { Some(note.clone()) };
-                let action = match tui_state.selected {
-                    MenuOption::Proceed => ConfirmAction::Proceed,
-                    MenuOption::Reject => ConfirmAction::Reject { note: note_text },
-                    MenuOption::Blacklist => ConfirmAction::Blacklist { note: note_text },
-                };
+                // Save note and return to menu (don't submit action yet)
+                tui_state.saved_note = if note.is_empty() { None } else { Some(note.clone()) };
                 tui_state.note_input = None;
-                return TuiResult::Action(action);
             }
             KeyCode::Esc => {
+                // Cancel note entry (don't save)
                 tui_state.note_input = None;
             }
             KeyCode::Backspace => {
@@ -221,17 +229,18 @@ async fn handle_key(
         }
         KeyCode::Enter => {
             if pending.is_some() {
+                let note = tui_state.saved_note.take(); // Take and clear saved note
                 let action = match tui_state.selected {
                     MenuOption::Proceed => ConfirmAction::Proceed,
-                    MenuOption::Reject => ConfirmAction::Reject { note: None },
-                    MenuOption::Blacklist => ConfirmAction::Blacklist { note: None },
+                    MenuOption::Reject => ConfirmAction::Reject { note },
+                    MenuOption::Blacklist => ConfirmAction::Blacklist { note },
                 };
                 return TuiResult::Action(action);
             }
         }
         KeyCode::Char('n') => {
-            // Enter note mode
-            tui_state.note_input = Some(String::new());
+            // Enter note mode (pre-fill with existing saved note if any)
+            tui_state.note_input = Some(tui_state.saved_note.clone().unwrap_or_default());
         }
         KeyCode::Char('q') => {
             return TuiResult::Quit;
@@ -263,14 +272,23 @@ fn draw_ui(
 }
 
 fn draw_log_pane(f: &mut Frame, state: &TuiState, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Logs ");
+
+    // Calculate visible height (subtract 2 for top/bottom borders)
+    let visible_height = area.height.saturating_sub(2) as usize;
+
+    // Get only the most recent logs that fit in the visible area (auto-scroll to bottom)
+    let log_count = state.log_buffer.len();
+    let skip = log_count.saturating_sub(visible_height);
+
     let items: Vec<ListItem> = state
         .log_buffer
         .iter()
+        .skip(skip)
         .map(|line| ListItem::new(line.as_str()))
         .collect();
 
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Logs "));
+    let list = List::new(items).block(block);
 
     f.render_widget(list, area);
 }
@@ -290,6 +308,7 @@ fn draw_confirm_pane(f: &mut Frame, state: &TuiState, pending: Option<&PendingAr
                 Constraint::Length(6),  // Market info
                 Constraint::Length(3),  // URLs
                 Constraint::Length(3),  // Menu
+                Constraint::Length(1),  // Help
             ])
             .split(inner);
 
@@ -339,9 +358,25 @@ fn draw_confirm_pane(f: &mut Frame, state: &TuiState, pending: Option<&PendingAr
                 })
                 .collect();
 
-            let menu = Paragraph::new(Line::from(menu_spans));
+            // Add note indicator if note is saved
+            let mut spans = menu_spans;
+            if state.saved_note.is_some() {
+                spans.push(Span::styled("  [note ✓]", Style::default().fg(Color::Green)));
+            }
+
+            let menu = Paragraph::new(Line::from(spans));
             f.render_widget(menu, chunks[2]);
         }
+
+        // Help line
+        let help_text = if state.saved_note.is_some() {
+            "← → navigate | Enter confirm | n edit note | q quit"
+        } else {
+            "← → navigate | Enter confirm | n add note | q quit"
+        };
+        let help = Paragraph::new(help_text)
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(help, chunks[3]);
     } else {
         let waiting = Paragraph::new("Waiting for opportunities...")
             .block(block);

@@ -45,7 +45,6 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tailscale::beacon::BeaconSender;
 use tokio::sync::{RwLock, watch};
 use tokio_util::sync::CancellationToken;
@@ -53,44 +52,6 @@ use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-
-/// Global counter for lines printed since last table clear.
-static LINES_SINCE_TABLE: AtomicUsize = AtomicUsize::new(0);
-
-/// Custom tracing layer that counts output lines for table replacement.
-/// Estimates visual lines based on message length and terminal width.
-struct LineCountingLayer;
-
-impl<S> tracing_subscriber::Layer<S> for LineCountingLayer
-where
-    S: tracing::Subscriber,
-{
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-        // Get actual terminal width, fallback to 80
-        let term_width = terminal_size::terminal_size()
-            .map(|(w, _)| w.0 as usize)
-            .unwrap_or(80);
-
-        // Extract message length from event
-        struct MsgLen(usize);
-        impl tracing::field::Visit for MsgLen {
-            fn record_debug(&mut self, _field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0 += format!("{:?}", value).len();
-            }
-            fn record_str(&mut self, _field: &tracing::field::Field, value: &str) {
-                self.0 += value.len();
-            }
-        }
-
-        let mut visitor = MsgLen(60); // Base overhead for timestamp, level, target, emojis
-        event.record(&mut visitor);
-
-        // Calculate visual lines - be conservative (emojis take 2 chars, add buffer)
-        // Use 1.5x message length estimate and always at least 1 line
-        let visual_lines = ((visitor.0 * 3 / 2) / term_width).max(1) + 1;
-        LINES_SINCE_TABLE.fetch_add(visual_lines, Ordering::Relaxed);
-    }
-}
 
 use cache::TeamCache;
 use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
@@ -454,9 +415,8 @@ fn init_logging() -> (PathBuf, WorkerGuard) {
         .with_ansi(false)
         .with_writer(non_blocking);
 
-    // Combine layers (including LineCountingLayer for table replacement)
+    // Combine layers
     tracing_subscriber::registry()
-        .with(LineCountingLayer)
         .with(env_filter)
         .with(console_layer)
         .with(file_layer)
@@ -792,6 +752,7 @@ async fn main() -> Result<()> {
     let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::channel::<(FastExecutionRequest, Arc<MarketPair>)>(256);
     let (tui_update_tx, tui_update_rx) = tokio::sync::mpsc::channel::<()>(16);
     let (tui_action_tx, mut tui_action_rx) = tokio::sync::mpsc::channel::<ConfirmAction>(16);
+    let (tui_log_tx, tui_log_rx) = tokio::sync::mpsc::channel::<String>(1024);
 
     let confirm_queue = Arc::new(ConfirmationQueue::new(state.clone(), tui_update_tx));
     let tui_state = Arc::new(RwLock::new(TuiState::new()));
@@ -933,6 +894,7 @@ async fn main() -> Result<()> {
     let confirm_exec_tx = exec_tx.clone();
     let confirm_queue_clone = confirm_queue.clone();
     let confirm_tui_state = tui_state.clone();
+    let confirm_log_tx = tui_log_tx.clone();
     let _confirm_handle = if confirm_enabled {
         Some(tokio::spawn(async move {
             use chrono::Utc;
@@ -949,8 +911,9 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // Option to hold tui_update_rx until we need to launch the TUI
+            // Options to hold channels until we need to launch the TUI
             let mut tui_update_rx_opt = Some(tui_update_rx);
+            let mut tui_log_rx_opt = Some(tui_log_rx);
 
             loop {
                 tokio::select! {
@@ -960,8 +923,9 @@ async fn main() -> Result<()> {
                         confirm_queue_clone.push(req, pair.clone()).await;
                         info!("[CONFIRM] Queued arb for {} ({} pending)", pair.description, confirm_queue_clone.len().await);
 
-                        // Launch TUI when first arb arrives (take ownership of tui_update_rx)
+                        // Launch TUI when first arb arrives (take ownership of channels)
                         if let Some(update_rx) = tui_update_rx_opt.take() {
+                            let log_rx = tui_log_rx_opt.take().expect("log_rx should exist");
                             let tui_queue = confirm_queue_clone.clone();
                             let tui_state_inner = confirm_tui_state.clone();
                             let tui_action_tx_clone = tui_action_tx.clone();
@@ -971,6 +935,7 @@ async fn main() -> Result<()> {
                                     tui_state_inner,
                                     update_rx,
                                     tui_action_tx_clone,
+                                    log_rx,
                                 ).await {
                                     error!("[CONFIRM] TUI error: {}", e);
                                 }
@@ -983,26 +948,41 @@ async fn main() -> Result<()> {
                         // Get the front arb
                         if let Some(arb) = confirm_queue_clone.pop_front().await {
                             let market_id = arb.request.market_id;
+
+                            // Helper to log with TUI routing
+                            let tui_active = confirm_tui_state.read().await.active;
+                            let log_msg = |msg: String| {
+                                if tui_active {
+                                    let _ = confirm_log_tx.try_send(msg);
+                                } else {
+                                    println!("{}", msg);
+                                }
+                            };
+
                             let status = match &action {
                                 ConfirmAction::Proceed => {
                                     // Validate arb is still profitable
                                     if confirm_queue_clone.validate_arb(&arb) {
-                                        info!("[CONFIRM] ✅ Approved: {} - forwarding to execution", arb.pair.description);
+                                        log_msg(format!("[{}]  INFO [CONFIRM] ✅ Approved: {} - forwarding to execution",
+                                            chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
                                         let _ = confirm_exec_tx.try_send(arb.request.clone());
                                         ConfirmationStatus::Accepted
                                     } else {
-                                        warn!("[CONFIRM] ⚠️ Approved but EXPIRED: {} - prices moved", arb.pair.description);
+                                        log_msg(format!("[{}]  WARN [CONFIRM] ⚠️ Approved but EXPIRED: {} - prices moved",
+                                            chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
                                         ConfirmationStatus::AcceptedExpired
                                     }
                                 }
                                 ConfirmAction::Reject { note } => {
-                                    info!("[CONFIRM] ❌ Rejected: {}{}", arb.pair.description,
-                                          note.as_ref().map(|n| format!(" ({})", n)).unwrap_or_default());
+                                    log_msg(format!("[{}]  INFO [CONFIRM] ❌ Rejected: {}{}",
+                                        chrono::Local::now().format("%H:%M:%S"), arb.pair.description,
+                                        note.as_ref().map(|n| format!(" ({})", n)).unwrap_or_default()));
                                     ConfirmationStatus::Rejected
                                 }
                                 ConfirmAction::Blacklist { note } => {
-                                    info!("[CONFIRM] 🚫 Blacklisted: {}{}", arb.pair.description,
-                                          note.as_ref().map(|n| format!(" ({})", n)).unwrap_or_default());
+                                    log_msg(format!("[{}]  INFO [CONFIRM] 🚫 Blacklisted: {}{}",
+                                        chrono::Local::now().format("%H:%M:%S"), arb.pair.description,
+                                        note.as_ref().map(|n| format!(" ({})", n)).unwrap_or_default()));
                                     confirm_queue_clone.blacklist_market(market_id).await;
                                     ConfirmationStatus::Blacklisted
                                 }
@@ -1057,6 +1037,7 @@ async fn main() -> Result<()> {
     if test_arb {
         let test_state = state.clone();
         let test_exec_tx = exec_tx.clone();
+        let test_confirm_tx = confirm_tx.clone();
         let test_dry_run = dry_run;
 
         // Parse arb type from environment (default: poly_yes_kalshi_no)
@@ -1111,8 +1092,16 @@ async fn main() -> Result<()> {
                         warn!("[TEST]    Position size capped to 10 contracts for safety");
                         warn!("[TEST]    Execution mode: DRY_RUN={}", test_dry_run);
 
-                        if let Err(e) = test_exec_tx.send(fake_req).await {
-                            error!("[TEST] Failed to send fake arb: {}", e);
+                        // Route based on confirmation requirement (same logic as WebSocket handlers)
+                        if config::requires_confirmation(&pair.league) {
+                            warn!("[TEST]    Routing to confirm queue (league {} requires confirmation)", pair.league);
+                            if let Err(e) = test_confirm_tx.send((fake_req, pair)).await {
+                                error!("[TEST] Failed to send to confirm queue: {}", e);
+                            }
+                        } else {
+                            if let Err(e) = test_exec_tx.send(fake_req).await {
+                                error!("[TEST] Failed to send fake arb: {}", e);
+                            }
                         }
                         break;
                     }
@@ -1246,6 +1235,8 @@ async fn main() -> Result<()> {
     // System health monitoring and arbitrage diagnostics
     let heartbeat_state = state.clone();
     let heartbeat_threshold = threshold_cents;
+    let heartbeat_tui_state = tui_state.clone();
+    let heartbeat_log_tx = tui_log_tx.clone();
     let heartbeat_handle = tokio::spawn(async move {
         use crate::types::kalshi_fee_cents;
         use std::collections::HashMap;
@@ -1258,13 +1249,23 @@ async fn main() -> Result<()> {
         let mut prev_kalshi_updates: u64 = 0;
         let mut prev_poly_updates: u64 = 0;
 
-        // Clear line counter from startup logs before first heartbeat
-        LINES_SINCE_TABLE.store(0, Ordering::SeqCst);
-
         // Track previous stats for delta calculation
         let mut prev_league_type_stats: HashMap<(String, MarketType), (u32, u32)> = HashMap::new();
         loop {
             interval.tick().await;
+
+            // Check TUI state once per iteration for efficient log routing
+            let tui_active = heartbeat_tui_state.read().await.active;
+
+            // Helper closure to route log output
+            let log_line = |line: String| {
+                if tui_active {
+                    let _ = heartbeat_log_tx.try_send(line);
+                } else {
+                    println!("{}", line);
+                }
+            };
+
             let market_count = heartbeat_state.market_count();
             let verbose = config::verbose_heartbeat_enabled();
             let now_ms = now_unix_ms();
@@ -1390,9 +1391,9 @@ async fn main() -> Result<()> {
 
             if verbose {
                 // Verbose mode: hierarchical tree view
-                println!();
-                info!("💓 VERBOSE - {} markets", market_count);
-                println!();
+                log_line(String::new());
+                log_line(format!("[{}]  INFO controller: 💓 VERBOSE - {} markets", chrono::Local::now().format("%H:%M:%S"), market_count));
+                log_line(String::new());
 
                 // Group by league, then by market type
                 let mut by_league: HashMap<String, Vec<&MarketDetail>> = HashMap::new();
@@ -1407,8 +1408,8 @@ async fn main() -> Result<()> {
                     let markets = by_league.get(&league).unwrap();
                     let league_updates: u64 = markets.iter().map(|m| m.k_updates as u64 + m.p_updates as u64).sum();
 
-                    println!("📊 {} ({} markets, {} updates)",
-                             league.to_uppercase(), markets.len(), league_updates);
+                    log_line(format!("📊 {} ({} markets, {} updates)",
+                             league.to_uppercase(), markets.len(), league_updates));
 
                     // Group by market type
                     let mut by_type: HashMap<MarketType, Vec<&&MarketDetail>> = HashMap::new();
@@ -1429,7 +1430,7 @@ async fn main() -> Result<()> {
                             let is_last_type = type_idx == type_count;
                             let branch = if is_last_type { "└" } else { "├" };
 
-                            println!("{}─ {:?} ({})", branch, mt, type_markets.len());
+                            log_line(format!("{}─ {:?} ({})", branch, mt, type_markets.len()));
 
                             // Show all markets
                             for (i, m) in type_markets.iter().enumerate() {
@@ -1476,26 +1477,26 @@ async fn main() -> Result<()> {
                                 let k_age = fmt_age(now_ms, m.k_last_ms);
                                 let p_age = fmt_age(now_ms, m.p_last_ms);
 
-                                println!(
-                                    "{}  {}── \x1b[97m{:<55}\x1b[0m \x1b[36mK:{} P:{}\x1b[0m gap:{}    \x1b[33mupd:K{}/P{}\x1b[0m \x1b[90mlast:K{}({}) P{}({})\x1b[0m",
+                                log_line(format!(
+                                    "{}  {}── {:<55} K:{} P:{} gap:{}    upd:K{}/P{} last:K{}({}) P{}({})",
                                          prefix, item_branch, desc,
                                          k_str, p_str,
                                          gap_str, m.k_updates, m.p_updates,
                                          k_time, k_age, p_time, p_age
-                                );
+                                ));
                             }
                         }
                     }
-                    println!();
+                    log_line(String::new());
                 }
 
-                println!("Legend: gap = cost - {}¢ | negative = arb opportunity", heartbeat_threshold);
-                println!();
+                log_line(format!("Legend: gap = cost - {}¢ | negative = arb opportunity", heartbeat_threshold));
+                log_line(String::new());
             } else {
                 // Default mode: compact summary
-                println!();
-                info!("💓 {} markets | K:{} P:{} updates/min",
-                      market_count, kalshi_delta, poly_delta);
+                log_line(String::new());
+                log_line(format!("[{}]  INFO controller: 💓 {} markets | K:{} P:{} updates/min",
+                      chrono::Local::now().format("%H:%M:%S"), market_count, kalshi_delta, poly_delta));
             }
 
             // Log best opportunity
@@ -1519,10 +1520,9 @@ async fn main() -> Result<()> {
                     format!("K_yes({}¢) + P_no({}¢) + K_fee({}¢) = {}¢", k_yes, p_no, fee, cost)
                 };
                 if gap < 0 {
-                    println!();  // Move to new line before logging opportunity
-                    // Use println! for ANSI color support (tracing escapes control chars)
-                    println!(
-                        "[{}]  \x1b[32mINFO\x1b[0m controller: 📊 Best opportunity: {} | {} | gap=\x1b[32m{:+}¢\x1b[0m | size={}¢/{}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
+                    log_line(String::new());
+                    log_line(format!(
+                        "[{}]  INFO controller: 📊 Best opportunity: {} | {} | gap={:+}¢ | size={}¢/{}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
                         chrono::Local::now().format("%H:%M:%S"),
                         desc,
                         leg_breakdown,
@@ -1533,7 +1533,7 @@ async fn main() -> Result<()> {
                         k_no,
                         k_yes,
                         p_no
-                    );
+                    ));
                     // Log URLs for easy access
                     if let Some(p) = pair.as_ref() {
                         let kalshi_series = p.kalshi_event_ticker
@@ -1544,18 +1544,17 @@ async fn main() -> Result<()> {
                         let kalshi_event_ticker_lower = p.kalshi_event_ticker.to_lowercase();
                         let poly_url = config::build_polymarket_url(&p.league, &p.poly_slug);
                         let kalshi_url = format!("{}/{}/{}/{}", config::KALSHI_WEB_BASE, kalshi_series, p.kalshi_event_slug, kalshi_event_ticker_lower);
-                        // OSC 8 hyperlinks (must use print! as tracing escapes control chars)
-                        println!("[{}]  \x1b[32mINFO\x1b[0m controller: 🔗 \x1b]8;;{}\x07Kalshi\x1b]8;;\x07 | \x1b]8;;{}\x07Polymarket\x1b]8;;\x07",
+                        log_line(format!("[{}]  INFO controller: 🔗 Kalshi: {} | Polymarket: {}",
                               chrono::Local::now().format("%H:%M:%S"),
                               kalshi_url,
-                              poly_url);
+                              poly_url));
                     }
                 }
             } else if with_both == 0 {
                 warn!("⚠️  No markets with both Kalshi and Polymarket prices - verify WebSocket connections");
             }
 
-            // Print league summary table (replaces previous table using ANSI escape codes)
+            // Print league summary table
             let market_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
             let type_headers = ["Moneyline", "Spread", "Total", "BTTS"];
 
@@ -1567,27 +1566,11 @@ async fn main() -> Result<()> {
             leagues.sort();
 
             if !leagues.is_empty() {
-                static PREV_TABLE_LINES: AtomicUsize = AtomicUsize::new(0);
-
-                // Get lines logged since last table and reset counter
-                let extra_lines = LINES_SINCE_TABLE.swap(0, Ordering::SeqCst);
-                let prev_lines = PREV_TABLE_LINES.load(Ordering::Relaxed);
-
-                // Only replace table if few/no interleaved logs (preserve important logs)
-                // If many logs appeared, just print fresh table below them
-                // In verbose mode, skip replacement since println!() lines aren't tracked
-                if prev_lines > 0 && extra_lines <= 3 && !verbose {
-                    use std::io::Write;
-                    // Move up to start of previous table, clear to end of screen
-                    print!("\x1b[{}A\x1b[J", prev_lines);
-                    std::io::stdout().flush().ok();
-                }
-
                 // Print header
-                println!("┌──────────┬────────────┬────────────┬────────────┬────────────┐");
-                println!("│ {:8} │ {:^10} │ {:^10} │ {:^10} │ {:^10} │",
-                         "League", type_headers[0], type_headers[1], type_headers[2], type_headers[3]);
-                println!("├──────────┼────────────┼────────────┼────────────┼────────────┤");
+                log_line("┌──────────┬────────────┬────────────┬────────────┬────────────┐".to_string());
+                log_line(format!("│ {:8} │ {:^10} │ {:^10} │ {:^10} │ {:^10} │",
+                         "League", type_headers[0], type_headers[1], type_headers[2], type_headers[3]));
+                log_line("├──────────┼────────────┼────────────┼────────────┼────────────┤".to_string());
 
                 for league in &leagues {
                     let mut cells: Vec<String> = Vec::new();
@@ -1601,19 +1584,16 @@ async fn main() -> Result<()> {
                             cells.push("-".to_string());
                         }
                     }
-                    println!("│ {:8} │ {:^10} │ {:^10} │ {:^10} │ {:^10} │",
-                             league, cells[0], cells[1], cells[2], cells[3]);
+                    log_line(format!("│ {:8} │ {:^10} │ {:^10} │ {:^10} │ {:^10} │",
+                             league, cells[0], cells[1], cells[2], cells[3]));
                 }
 
-                println!("└──────────┴────────────┴────────────┴────────────┴────────────┘");
+                log_line("└──────────┴────────────┴────────────┴────────────┴────────────┘".to_string());
 
                 // Update previous stats for next iteration
                 for (key, &(_, k_upd, p_upd)) in &league_type_stats {
                     prev_league_type_stats.insert(key.clone(), (k_upd, p_upd));
                 }
-
-                // Store table height: 3 header lines + league rows + 1 footer
-                PREV_TABLE_LINES.store(4 + leagues.len(), Ordering::Relaxed);
             }
         }
     });
