@@ -12,3 +12,6 @@ positions.json
 
 # HTTP capture sessions (use fixtures/ for test data)
 .captures/
+
+# Confirmation logs
+.confirmations/

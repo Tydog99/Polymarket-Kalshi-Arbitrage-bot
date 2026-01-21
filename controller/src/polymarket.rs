@@ -13,10 +13,10 @@ use tokio::time::{interval, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
-use crate::config::{POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS, GAMMA_API_BASE, POLY_MAX_TOKENS_PER_WS};
+use crate::config::{self, POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS, GAMMA_API_BASE, POLY_MAX_TOKENS_PER_WS};
 use crate::execution::NanoClock;
 use crate::types::{
-    GlobalState, FastExecutionRequest, ArbType, PriceCents, SizeCents,
+    GlobalState, FastExecutionRequest, ArbType, MarketPair, PriceCents, SizeCents,
     parse_price, fxhash_str,
 };
 
@@ -281,6 +281,7 @@ fn parse_size(s: &str) -> SizeCents {
 pub async fn run_ws(
     state: Arc<GlobalState>,
     exec_tx: mpsc::Sender<FastExecutionRequest>,
+    confirm_tx: mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
     threshold_cents: PriceCents,
     shutdown_rx: watch::Receiver<bool>,
     clock: Arc<NanoClock>,
@@ -316,6 +317,7 @@ pub async fn run_ws(
             tokens,
             state,
             exec_tx,
+            confirm_tx,
             threshold_cents,
             shutdown_rx,
             clock,
@@ -346,6 +348,7 @@ pub async fn run_ws(
         let chunk_tokens = chunk.to_vec();
         let state = Arc::clone(&state);
         let exec_tx = exec_tx.clone();
+        let confirm_tx = confirm_tx.clone();
         let shutdown_rx = shutdown_rx.clone();
         let clock = Arc::clone(&clock);
 
@@ -355,6 +358,7 @@ pub async fn run_ws(
                 chunk_tokens,
                 state,
                 exec_tx,
+                confirm_tx,
                 threshold_cents,
                 shutdown_rx,
                 clock,
@@ -385,6 +389,7 @@ async fn run_single_ws(
     tokens: Vec<String>,
     state: Arc<GlobalState>,
     exec_tx: mpsc::Sender<FastExecutionRequest>,
+    confirm_tx: mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
     threshold_cents: PriceCents,
     mut shutdown_rx: watch::Receiver<bool>,
     clock: Arc<NanoClock>,
@@ -453,7 +458,7 @@ async fn run_single_ws(
                                         book.asks.len(),
                                         book.bids.len()
                                     );
-                                    process_book(&state, book, &exec_tx, threshold_cents, &clock).await;
+                                    process_book(&state, book, &exec_tx, &confirm_tx, threshold_cents, &clock).await;
                                 }
                             }
                             // Even if empty, this was a valid book array, don't try other parsers
@@ -464,7 +469,7 @@ async fn run_single_ws(
                         else if let Ok(event) = serde_json::from_str::<PriceChangeEvent>(&text) {
                             if let Some(changes) = &event.price_changes {
                                 for change in changes {
-                                    process_price_change(&state, change, &exec_tx, threshold_cents, &clock).await;
+                                    process_price_change(&state, change, &exec_tx, &confirm_tx, threshold_cents, &clock).await;
                                 }
                             }
                         }
@@ -514,6 +519,7 @@ async fn process_book(
     state: &GlobalState,
     book: &BookSnapshot,
     exec_tx: &mpsc::Sender<FastExecutionRequest>,
+    confirm_tx: &mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
     threshold_cents: PriceCents,
     clock: &NanoClock,
 ) {
@@ -556,7 +562,7 @@ async fn process_book(
         // Check arbs
         let arb_mask = market.check_arbs(threshold_cents);
         if arb_mask != 0 {
-            send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
+            send_arb_request(state, market_id, market, arb_mask, exec_tx, confirm_tx, clock).await;
         }
         matched = true;
     }
@@ -582,7 +588,7 @@ async fn process_book(
         // Check arbs
         let arb_mask = market.check_arbs(threshold_cents);
         if arb_mask != 0 {
-            send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
+            send_arb_request(state, market_id, market, arb_mask, exec_tx, confirm_tx, clock).await;
         }
         matched = true;
     }
@@ -602,6 +608,7 @@ async fn process_price_change(
     state: &GlobalState,
     change: &PriceChangeItem,
     exec_tx: &mpsc::Sender<FastExecutionRequest>,
+    confirm_tx: &mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
     threshold_cents: PriceCents,
     clock: &NanoClock,
 ) {
@@ -640,7 +647,7 @@ async fn process_price_change(
         if price < current_yes || current_yes == 0 {
             let arb_mask = market.check_arbs(threshold_cents);
             if arb_mask != 0 {
-                send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
+                send_arb_request(state, market_id, market, arb_mask, exec_tx, confirm_tx, clock).await;
             }
         }
     }
@@ -664,19 +671,21 @@ async fn process_price_change(
         if price < current_no || current_no == 0 {
             let arb_mask = market.check_arbs(threshold_cents);
             if arb_mask != 0 {
-                send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
+                send_arb_request(state, market_id, market, arb_mask, exec_tx, confirm_tx, clock).await;
             }
         }
     }
 }
 
-/// Send arb request to execution engine
+/// Send arb request to execution engine, routing to confirm channel if required
 #[inline]
 async fn send_arb_request(
+    state: &GlobalState,
     market_id: u16,
     market: &crate::types::AtomicMarketState,
     arb_mask: u8,
     exec_tx: &mpsc::Sender<FastExecutionRequest>,
+    confirm_tx: &mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
     clock: &NanoClock,
 ) {
     let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
@@ -709,12 +718,36 @@ async fn send_arb_request(
         detected_ns: clock.now_ns(),
     };
 
-    // Send to execution engine; log if channel is full (backpressure)
-    if let Err(e) = exec_tx.try_send(req) {
-        tracing::warn!(
-            "[POLY] Arb request dropped for market {}: {} (channel backpressure)",
-            market_id, e
-        );
+    // Get market pair to check if confirmation is required
+    let pair = match state.get_by_id(market_id).and_then(|m| m.pair()) {
+        Some(p) => p,
+        None => {
+            // No pair found, send directly to exec channel
+            if let Err(e) = exec_tx.try_send(req) {
+                tracing::warn!(
+                    "[POLY] Arb request dropped for market {}: {} (channel backpressure)",
+                    market_id, e
+                );
+            }
+            return;
+        }
+    };
+
+    // Route based on confirmation requirement
+    if config::requires_confirmation(&pair.league) {
+        if let Err(e) = confirm_tx.try_send((req, pair)) {
+            tracing::warn!(
+                "[POLY] Confirm request dropped for market {}: {} (channel backpressure)",
+                market_id, e
+            );
+        }
+    } else {
+        if let Err(e) = exec_tx.try_send(req) {
+            tracing::warn!(
+                "[POLY] Arb request dropped for market {}: {} (channel backpressure)",
+                market_id, e
+            );
+        }
     }
 }
 

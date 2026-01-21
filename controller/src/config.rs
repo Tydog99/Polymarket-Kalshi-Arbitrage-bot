@@ -3,6 +3,8 @@
 //! This module contains all configuration constants, league mappings, and
 //! environment variable parsing for the trading system.
 
+use std::collections::HashSet;
+
 /// Kalshi WebSocket URL
 pub const KALSHI_WS_URL: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
 
@@ -135,6 +137,42 @@ pub fn is_league_disabled(league: &str) -> bool {
     disabled_leagues().contains(&league.to_lowercase())
 }
 
+/// Leagues that skip confirmation mode (auto-execute)
+/// Set CONFIRM_MODE_SKIP env var to comma-separated list, e.g., "nba,nfl"
+pub fn confirm_mode_skip_leagues() -> HashSet<String> {
+    std::env::var("CONFIRM_MODE_SKIP")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').map(|l| l.trim().to_lowercase()).collect())
+        .unwrap_or_default()
+}
+
+/// Check if a league requires confirmation before trading
+/// Returns true if league has confirm_mode=true AND is not in CONFIRM_MODE_SKIP list
+pub fn requires_confirmation(league: &str) -> bool {
+    let league_lower = league.to_lowercase();
+
+    // Check if explicitly skipped
+    if confirm_mode_skip_leagues().contains(&league_lower) {
+        return false;
+    }
+
+    // Check league config
+    get_league_configs()
+        .iter()
+        .find(|c| c.league_code == league_lower)
+        .map(|c| c.confirm_mode)
+        .unwrap_or(true) // Default to requiring confirmation for unknown leagues
+}
+
+/// Check if any league requires confirmation
+pub fn any_league_requires_confirmation() -> bool {
+    let skip_leagues = confirm_mode_skip_leagues();
+    get_league_configs()
+        .iter()
+        .any(|c| c.confirm_mode && !skip_leagues.contains(&c.league_code.to_lowercase()))
+}
+
 /// Enable verbose heartbeat output with hierarchical tree view.
 /// Set `VERBOSE_HEARTBEAT=1` or use `--verbose-heartbeat` CLI flag.
 pub fn verbose_heartbeat_enabled() -> bool {
@@ -184,6 +222,8 @@ pub struct LeagueConfig {
     /// Team order in Kalshi tickers: true = HOME-AWAY (soccer), false = AWAY-HOME (US sports)
     /// This affects spread slug generation (spread-home vs spread-away).
     pub home_team_first: bool,
+    /// Require manual confirmation before executing trades for this league
+    pub confirm_mode: bool,
 }
 
 /// Get all supported leagues with their configurations
@@ -200,6 +240,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: None,
             kalshi_web_slug: "premier-league-game",
             home_team_first: true,
+            confirm_mode: true,
         },
         LeagueConfig {
             league_code: "bundesliga",
@@ -211,6 +252,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: None,
             kalshi_web_slug: "bundesliga-game",
             home_team_first: true,
+            confirm_mode: true,
         },
         LeagueConfig {
             league_code: "laliga",
@@ -222,6 +264,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: None,
             kalshi_web_slug: "la-liga-game",
             home_team_first: true,
+            confirm_mode: true,
         },
         LeagueConfig {
             league_code: "seriea",
@@ -233,6 +276,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: None,
             kalshi_web_slug: "serie-a-game",
             home_team_first: true,
+            confirm_mode: true,
         },
         LeagueConfig {
             league_code: "ligue1",
@@ -244,6 +288,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: None,
             kalshi_web_slug: "ligue-1-game",
             home_team_first: true,
+            confirm_mode: true,
         },
         LeagueConfig {
             league_code: "ucl",
@@ -255,6 +300,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: None,
             kalshi_web_slug: "champions-league-game",
             home_team_first: true,
+            confirm_mode: true,
         },
         // Secondary European leagues (moneyline only) - HOME-AWAY ticker order
         LeagueConfig {
@@ -267,6 +313,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: None,
             kalshi_web_slug: "europa-league-game",
             home_team_first: true,
+            confirm_mode: true,
         },
         LeagueConfig {
             league_code: "eflc",
@@ -278,6 +325,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: None,
             kalshi_web_slug: "efl-championship-game",
             home_team_first: true,
+            confirm_mode: true,
         },
         // MLS (soccer) - HOME-AWAY ticker order
         LeagueConfig {
@@ -290,6 +338,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: None,
             kalshi_web_slug: "mls-game",
             home_team_first: true,
+            confirm_mode: true,
         },
         // US Sports - AWAY-HOME ticker order
         LeagueConfig {
@@ -302,6 +351,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: None,
             kalshi_web_slug: "nba-game",
             home_team_first: false,
+            confirm_mode: true,
         },
         LeagueConfig {
             league_code: "nfl",
@@ -313,6 +363,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: None,
             kalshi_web_slug: "nfl-game",
             home_team_first: false,
+            confirm_mode: true,
         },
         LeagueConfig {
             league_code: "nhl",
@@ -324,6 +375,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: None,
             kalshi_web_slug: "nhl-game",
             home_team_first: false,
+            confirm_mode: true,
         },
         LeagueConfig {
             league_code: "mlb",
@@ -335,6 +387,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: None,
             kalshi_web_slug: "mlb-game",
             home_team_first: false,
+            confirm_mode: true,
         },
         LeagueConfig {
             league_code: "ncaaf",
@@ -346,6 +399,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: None,
             kalshi_web_slug: "ncaaf-game",
             home_team_first: false,
+            confirm_mode: true,
         },
         // Esports - no home/away concept, default to false
         LeagueConfig {
@@ -358,6 +412,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: Some("10310"),
             kalshi_web_slug: "counterstrike-2-game",
             home_team_first: false,
+            confirm_mode: true,
         },
         LeagueConfig {
             league_code: "lol",
@@ -369,6 +424,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: Some("10311"),
             kalshi_web_slug: "league-of-legends-game",
             home_team_first: false,
+            confirm_mode: true,
         },
         LeagueConfig {
             league_code: "cod",
@@ -380,6 +436,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             poly_series_id: Some("10427"),
             kalshi_web_slug: "call-of-duty-game",
             home_team_first: false,
+            confirm_mode: true,
         },
     ]
 }
@@ -425,7 +482,6 @@ pub fn discovery_interval_mins() -> u64 {
     })
 }
 
-use std::collections::HashSet;
 use trading::execution::Platform;
 
 /// Parse CONTROLLER_PLATFORMS env var.

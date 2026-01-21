@@ -241,6 +241,16 @@ Example: `ENABLED_LEAGUES=cs2,lol,cod` to monitor only esports.
 - `poly_only` (or `poly`, `2`) - Both sides on Polymarket
 - `kalshi_only` (or `kalshi`, `3`) - Both sides on Kalshi
 
+### Confirmation Mode
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONFIRM_MODE_SKIP` | *(empty)* | Comma-separated leagues to auto-execute (skip confirmation) |
+
+Or use CLI flag: `--confirm-mode-skip "nba,nfl"`
+
+See [Confirmation Mode](#confirmation-mode-1) section below for full documentation.
+
 ### Circuit Breaker (Risk Management)
 
 | Variable | Default | Description |
@@ -394,4 +404,151 @@ By the time all prices are populated, no new WebSocket update triggers a recheck
 |-----|-------------|-----------|
 | **Remove price improvement filter** | Always recheck arbs on any price update in `process_price_change` | Higher CPU usage, more channel traffic |
 | **Both-platforms-ready gate** | Only start arb checking after both WebSocket connections confirm initial snapshots complete | Requires connection state tracking, slight delay on all arb detection |
+
+---
+
+## Confirmation Mode
+
+Confirmation mode requires explicit user approval before executing arbitrage trades. When enabled, detected arbs queue for approval instead of auto-executing, and a terminal-based TUI launches for real-time decision making.
+
+### Why Use Confirmation Mode?
+
+- **Learning**: Watch arbs in real-time before committing capital
+- **Risk control**: Manually verify each trade during initial deployment
+- **Debugging**: Inspect arb details (prices, sizes, URLs) before execution
+- **Selective execution**: Auto-execute trusted leagues, confirm others
+
+### Configuration
+
+**Default behavior**: All 17 leagues require confirmation.
+
+**Skip confirmation for specific leagues:**
+```bash
+# Via environment variable
+CONFIRM_MODE_SKIP=nba,nfl cargo run -p controller --release
+
+# Via CLI flag
+cargo run -p controller --release -- --confirm-mode-skip "nba,nfl"
+
+# Disable confirmation entirely (all leagues auto-execute)
+CONFIRM_MODE_SKIP=nba,nfl,nhl,mlb,ncaaf,epl,bundesliga,laliga,seriea,ligue1,ucl,uel,eflc,mls,cs2,lol,cod cargo run -p controller --release
+```
+
+### TUI Interface
+
+When the first arb requiring confirmation is detected, a split-pane TUI launches:
+
+```
+┌─────────────────────────────────────── Logs ───────────────────────────────────────┐
+│ [2026-01-20 21:45:12] [POLY] Connected to WebSocket                                │
+│ [2026-01-20 21:45:13] [KALSHI] Connected to WebSocket                              │
+│ [2026-01-20 21:45:15] [CONFIRM] Queued arb for NBA: Lakers vs Celtics (1 pending)  │
+│                                                                                     │
+├─────────────────────────────────── Confirmation ───────────────────────────────────┤
+│ NBA: Lakers vs Celtics - Moneyline                                                 │
+│ BUY Poly YES + BUY Kalshi NO                                                       │
+│ Profit: 3¢/contract | Size: 50 contracts | Detected 2x                             │
+│                                                                                     │
+│ Kalshi: https://kalshi.com/markets/KXNBAGAME-26JAN20LALLAC-LAL                     │
+│ Poly:   https://polymarket.com/event/nba-lal-lac-2026-01-20                        │
+│                                                                                     │
+│  [Proceed]   [Reject]   [Reject + Blacklist]                                       │
+└────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Keyboard controls:**
+| Key | Action |
+|-----|--------|
+| `←` `→` | Navigate menu options |
+| `Enter` | Select highlighted option |
+| `n` | Add a note before selecting (opens text input) |
+| `q` or `Ctrl+C` | Quit TUI |
+
+### Decision Options
+
+| Option | Behavior |
+|--------|----------|
+| **Proceed** | Validates arb is still profitable, then sends to execution engine |
+| **Reject** | Removes from queue; arb can re-queue on next detection |
+| **Reject + Blacklist** | Removes from queue and suppresses market for 5 minutes |
+
+**Price validation**: When you select "Proceed", the system re-checks current prices. If the arb is no longer profitable (prices moved), it logs "AcceptedExpired" instead of executing.
+
+### Blacklist
+
+The 5-minute blacklist prevents a market from re-entering the confirmation queue. Use this for:
+- Markets you know are stale or illiquid
+- Markets where you've already taken a position
+- False positives from price glitches
+
+Blacklist is per-session (resets on restart) and per-market (not per-league).
+
+### Notes
+
+Press `n` before selecting an option to add a note. Notes are included in the audit log for later review. Examples:
+- "Spread looks too wide, waiting for better entry"
+- "Already have exposure to this game"
+- "Price glitch on Kalshi side"
+
+### Audit Log (`confirmations_*.json`)
+
+All decisions are logged to a timestamped JSON file in the working directory:
+
+**Filename**: `confirmations_2026-01-20_21-45-30.json`
+
+**Format** (one JSON object per line):
+```json
+{
+  "timestamp": "2026-01-20T05:45:30.123Z",
+  "status": "accepted",
+  "market_id": 42,
+  "pair_id": "KXNBAGAME-26JAN20LALLAC-LAL",
+  "description": "NBA: Lakers vs Celtics - Moneyline",
+  "league": "nba",
+  "arb_type": "poly_yes_kalshi_no",
+  "yes_price_cents": 48,
+  "no_price_cents": 49,
+  "profit_cents": 3,
+  "max_contracts": 50,
+  "detection_count": 2,
+  "kalshi_url": "https://kalshi.com/markets/KXNBAGAME-26JAN20LALLAC-LAL",
+  "poly_url": "https://polymarket.com/event/nba-lal-lac-2026-01-20",
+  "note": "Looks good, executing"
+}
+```
+
+**Status values:**
+| Status | Meaning |
+|--------|---------|
+| `accepted` | User approved, arb was still valid, sent to execution |
+| `accepted_expired` | User approved, but prices had moved (not executed) |
+| `rejected` | User rejected (can re-queue) |
+| `blacklisted` | User rejected with 5-minute blacklist |
+
+### Architecture
+
+```
+WebSocket Feeds (kalshi.rs, polymarket.rs)
+         │
+         ▼
+   requires_confirmation(&league)?
+         │
+    ┌────┴────┐
+    ▼         ▼
+confirm_tx  exec_tx
+(queue)     (auto)
+    │
+    ▼
+ConfirmationQueue
+    │
+    ▼
+TUI (launches on first arb)
+    │
+    ▼
+User decision
+    │
+    ├─→ ConfirmationLogger (audit trail)
+    │
+    └─→ exec_tx (if approved and valid)
+```
 

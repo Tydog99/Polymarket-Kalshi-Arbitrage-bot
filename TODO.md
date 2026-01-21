@@ -14,13 +14,13 @@ Last updated: 2026-01-20
   - [ ] Compute and display **drift** (per market + totals) and flag mismatches
   - [ ] Provide “reconcile hints” (which leg/side is missing)
 
-- [ ] **Controller confirm mode**
-  - [ ] Add a mode that requires explicit confirmation before dispatching execution legs
-  - [ ] Ensure it works for cross-platform + same-platform arbs (and remote-trader routing)
+- [x] **Controller confirm mode**
+  - [x] Add a mode that requires explicit confirmation before dispatching execution legs
+  - [x] Ensure it works for cross-platform + same-platform arbs (and remote-trader routing)
 
-- [ ] **Integration test: exposure sell failure is handled gracefully**
-  - [ ] Simulate one leg filling and the compensating sell failing
-  - [ ] Verify we record exposure, trip appropriate safeguards, and keep system running
+- [x] **Integration test: exposure sell failure is handled gracefully** (PR #18)
+  - [x] Simulate one leg filling and the compensating sell failing
+  - [x] Verify we record exposure, trip appropriate safeguards, and keep system running
 
 ## Notes / decisions
 
