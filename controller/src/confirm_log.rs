@@ -56,11 +56,14 @@ pub struct ConfirmationLogger {
 }
 
 impl ConfirmationLogger {
-    /// Create a new logger with a timestamped filename
+    /// Create a new logger with a timestamped filename in .confirmations/
     pub fn new() -> Result<Self> {
+        let dir = PathBuf::from(".confirmations");
+        std::fs::create_dir_all(&dir)?;
+
         let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
         let filename = format!("confirmations_{}.json", timestamp);
-        let file_path = PathBuf::from(&filename);
+        let file_path = dir.join(&filename);
 
         let file = OpenOptions::new()
             .create(true)
