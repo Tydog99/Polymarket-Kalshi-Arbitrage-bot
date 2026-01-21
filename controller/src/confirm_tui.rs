@@ -186,6 +186,18 @@ pub async fn run_tui(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
+    // Dump captured logs to main terminal
+    {
+        let tui_state = state.read().await;
+        if !tui_state.log_buffer.is_empty() {
+            println!("\n--- Logs from confirmation session ---");
+            for line in &tui_state.log_buffer {
+                println!("{}", line);
+            }
+            println!("--- End of confirmation session logs ---\n");
+        }
+    }
+
     Ok(())
 }
 
