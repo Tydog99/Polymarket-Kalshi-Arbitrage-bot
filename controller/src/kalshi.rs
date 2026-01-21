@@ -21,11 +21,12 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{connect_async, tungstenite::{http::Request, Message}};
 use tracing::{debug, error, info};
 
-use crate::config::{KALSHI_WS_URL, KALSHI_API_BASE, KALSHI_API_DELAY_MS};
+use crate::config::{self, KALSHI_WS_URL, KALSHI_API_BASE, KALSHI_API_DELAY_MS};
 use crate::execution::NanoClock;
 use crate::types::{
     KalshiEventsResponse, KalshiMarketsResponse, KalshiEvent, KalshiMarket,
     GlobalState, FastExecutionRequest, ArbType, PriceCents, SizeCents, fxhash_str,
+    MarketPair,
 };
 
 // === Order Types ===
@@ -450,6 +451,7 @@ pub async fn run_ws(
     config: &KalshiConfig,
     state: Arc<GlobalState>,
     exec_tx: mpsc::Sender<FastExecutionRequest>,
+    confirm_tx: mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
     threshold_cents: PriceCents,
     mut shutdown_rx: watch::Receiver<bool>,
     clock: Arc<NanoClock>,
@@ -541,7 +543,7 @@ pub async fn run_ws(
                                             // Check for arbs
                                             let arb_mask = market.check_arbs(threshold_cents);
                                             if arb_mask != 0 {
-                                                send_kalshi_arb_request(market_id, market, arb_mask, &exec_tx, &clock).await;
+                                                send_kalshi_arb_request(market_id, market, arb_mask, &exec_tx, &confirm_tx, &clock).await;
                                             }
                                         }
                                     }
@@ -556,7 +558,7 @@ pub async fn run_ws(
 
                                             let arb_mask = market.check_arbs(threshold_cents);
                                             if arb_mask != 0 {
-                                                send_kalshi_arb_request(market_id, market, arb_mask, &exec_tx, &clock).await;
+                                                send_kalshi_arb_request(market_id, market, arb_mask, &exec_tx, &confirm_tx, &clock).await;
                                             }
                                         }
                                     }
@@ -701,6 +703,7 @@ async fn send_kalshi_arb_request(
     market: &crate::types::AtomicMarketState,
     arb_mask: u8,
     exec_tx: &mpsc::Sender<FastExecutionRequest>,
+    confirm_tx: &mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
     clock: &NanoClock,
 ) {
     let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
@@ -728,11 +731,35 @@ async fn send_kalshi_arb_request(
         detected_ns: clock.now_ns(),
     };
 
-    // Send to execution engine; log if channel is full (backpressure)
-    if let Err(e) = exec_tx.try_send(req) {
-        tracing::warn!(
-            "[KALSHI] Arb request dropped for market {}: {} (channel backpressure)",
-            market_id, e
-        );
+    // Get the market pair to determine routing
+    let pair = match market.pair() {
+        Some(p) => p,
+        None => {
+            // No pair info, fall back to direct execution
+            if let Err(e) = exec_tx.try_send(req) {
+                tracing::warn!(
+                    "[KALSHI] Arb request dropped for market {}: {} (channel backpressure)",
+                    market_id, e
+                );
+            }
+            return;
+        }
+    };
+
+    // Route based on confirmation requirements
+    if config::requires_confirmation(&pair.league) {
+        if let Err(e) = confirm_tx.try_send((req, pair)) {
+            tracing::warn!(
+                "[KALSHI] Confirm request dropped for market {}: {} (channel backpressure)",
+                market_id, e
+            );
+        }
+    } else {
+        if let Err(e) = exec_tx.try_send(req) {
+            tracing::warn!(
+                "[KALSHI] Arb request dropped for market {}: {} (channel backpressure)",
+                market_id, e
+            );
+        }
     }
 }
