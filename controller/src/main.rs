@@ -938,6 +938,10 @@ async fn main() -> Result<()> {
                             let tui_queue = confirm_queue_clone.clone();
                             let tui_state_inner = confirm_tui_state.clone();
                             let tui_action_tx_clone = tui_action_tx.clone();
+
+                            // Set TUI active BEFORE spawning to prevent race with heartbeat output
+                            confirm_tui_state.write().await.active = true;
+
                             tokio::spawn(async move {
                                 if let Err(e) = confirm_tui::run_tui(
                                     tui_queue,
