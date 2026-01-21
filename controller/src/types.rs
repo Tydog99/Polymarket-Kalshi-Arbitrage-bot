@@ -1311,6 +1311,18 @@ pub struct KalshiMarketsResponse {
 pub struct KalshiMarket {
     pub ticker: String,
     pub title: String,
+    /// Event ticker this market belongs to (present on some list endpoints).
+    #[serde(default)]
+    pub event_ticker: Option<String>,
+    /// Market status (e.g., "active", "finalized").
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Market subtitle (empty string on many markets).
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    /// For MVE markets, the normalized collection ticker with date+teams (e.g. "KXMVENFLSINGLEGAME-26JAN18LACHI").
+    #[serde(default)]
+    pub mve_collection_ticker: Option<String>,
     pub yes_ask: Option<i64>,
     pub yes_bid: Option<i64>,
     pub no_ask: Option<i64>,
