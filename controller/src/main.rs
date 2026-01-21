@@ -26,6 +26,7 @@ mod cache;
 mod circuit_breaker;
 mod config;
 mod confirm_log;
+mod confirm_queue;
 mod discovery;
 mod execution;
 mod kalshi;
