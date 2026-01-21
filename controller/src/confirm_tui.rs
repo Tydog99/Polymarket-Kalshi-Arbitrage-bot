@@ -395,3 +395,321 @@ fn draw_confirm_pane(f: &mut Frame, state: &TuiState, pending: Option<&PendingAr
         f.render_widget(waiting, area);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    // ==================== TuiState Tests ====================
+
+    #[test]
+    fn test_tui_state_default() {
+        let state = TuiState::default();
+        assert!(state.log_buffer.is_empty());
+        assert_eq!(state.selected, MenuOption::Proceed);
+        assert!(state.note_input.is_none());
+        assert!(state.saved_note.is_none());
+        assert!(!state.active);
+    }
+
+    #[test]
+    fn test_tui_state_new() {
+        let state = TuiState::new();
+        assert!(state.log_buffer.is_empty());
+        assert_eq!(state.selected, MenuOption::Proceed);
+    }
+
+    // ==================== MenuOption Tests ====================
+
+    #[test]
+    fn test_menu_option_next_cycles() {
+        assert_eq!(MenuOption::Proceed.next(), MenuOption::Reject);
+        assert_eq!(MenuOption::Reject.next(), MenuOption::Blacklist);
+        assert_eq!(MenuOption::Blacklist.next(), MenuOption::Proceed);
+    }
+
+    #[test]
+    fn test_menu_option_prev_cycles() {
+        assert_eq!(MenuOption::Proceed.prev(), MenuOption::Blacklist);
+        assert_eq!(MenuOption::Blacklist.prev(), MenuOption::Reject);
+        assert_eq!(MenuOption::Reject.prev(), MenuOption::Proceed);
+    }
+
+    #[test]
+    fn test_menu_option_labels() {
+        assert_eq!(MenuOption::Proceed.label(), "Proceed");
+        assert_eq!(MenuOption::Reject.label(), "Reject");
+        assert_eq!(MenuOption::Blacklist.label(), "Reject + Blacklist");
+    }
+
+    #[test]
+    fn test_menu_option_all() {
+        let all = MenuOption::all();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0], MenuOption::Proceed);
+        assert_eq!(all[1], MenuOption::Reject);
+        assert_eq!(all[2], MenuOption::Blacklist);
+    }
+
+    // ==================== Log Buffer Tests ====================
+
+    #[test]
+    fn test_add_log_basic() {
+        let mut state = TuiState::new();
+        state.add_log("line 1".to_string());
+        state.add_log("line 2".to_string());
+
+        assert_eq!(state.log_buffer.len(), 2);
+        assert_eq!(state.log_buffer[0], "line 1");
+        assert_eq!(state.log_buffer[1], "line 2");
+    }
+
+    #[test]
+    fn test_add_log_ring_buffer_overflow() {
+        let mut state = TuiState::new();
+
+        // Fill buffer to max
+        for i in 0..MAX_LOG_LINES {
+            state.add_log(format!("line {}", i));
+        }
+        assert_eq!(state.log_buffer.len(), MAX_LOG_LINES);
+        assert_eq!(state.log_buffer[0], "line 0");
+
+        // Add one more - should evict oldest
+        state.add_log("overflow line".to_string());
+        assert_eq!(state.log_buffer.len(), MAX_LOG_LINES);
+        assert_eq!(state.log_buffer[0], "line 1"); // "line 0" evicted
+        assert_eq!(state.log_buffer[MAX_LOG_LINES - 1], "overflow line");
+    }
+
+    #[test]
+    fn test_log_scroll_calculation() {
+        // Test the scrolling logic used in draw_log_pane
+        let visible_height: usize = 10;
+
+        // Case 1: Fewer logs than visible area - no skip
+        let log_count: usize = 5;
+        let skip = log_count.saturating_sub(visible_height);
+        assert_eq!(skip, 0);
+
+        // Case 2: Exact fit - no skip
+        let log_count: usize = 10;
+        let skip = log_count.saturating_sub(visible_height);
+        assert_eq!(skip, 0);
+
+        // Case 3: More logs than visible - skip oldest
+        let log_count: usize = 25;
+        let skip = log_count.saturating_sub(visible_height);
+        assert_eq!(skip, 15); // Show logs 15-24 (newest 10)
+    }
+
+    #[test]
+    fn test_log_scroll_shows_newest() {
+        let mut state = TuiState::new();
+        for i in 0..20 {
+            state.add_log(format!("log {}", i));
+        }
+
+        let visible_height = 5;
+        let skip = state.log_buffer.len().saturating_sub(visible_height);
+
+        let visible: Vec<&String> = state.log_buffer.iter().skip(skip).collect();
+        assert_eq!(visible.len(), 5);
+        assert_eq!(visible[0], "log 15");
+        assert_eq!(visible[4], "log 19");
+    }
+
+    // ==================== Key Handling Tests ====================
+
+    fn make_key_event(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn make_key_event_with_mods(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[tokio::test]
+    async fn test_key_left_navigates_prev() {
+        let state = Arc::new(RwLock::new(TuiState::new()));
+        let pending: Option<PendingArb> = None;
+
+        // Start at Proceed, go left to Blacklist
+        let result = handle_key(make_key_event(KeyCode::Left), &state, &pending).await;
+        assert!(matches!(result, TuiResult::Continue));
+        assert_eq!(state.read().await.selected, MenuOption::Blacklist);
+    }
+
+    #[tokio::test]
+    async fn test_key_right_navigates_next() {
+        let state = Arc::new(RwLock::new(TuiState::new()));
+        let pending: Option<PendingArb> = None;
+
+        // Start at Proceed, go right to Reject
+        let result = handle_key(make_key_event(KeyCode::Right), &state, &pending).await;
+        assert!(matches!(result, TuiResult::Continue));
+        assert_eq!(state.read().await.selected, MenuOption::Reject);
+    }
+
+    #[tokio::test]
+    async fn test_key_q_quits() {
+        let state = Arc::new(RwLock::new(TuiState::new()));
+        let pending: Option<PendingArb> = None;
+
+        let result = handle_key(make_key_event(KeyCode::Char('q')), &state, &pending).await;
+        assert!(matches!(result, TuiResult::Quit));
+    }
+
+    #[tokio::test]
+    async fn test_key_ctrl_c_quits() {
+        let state = Arc::new(RwLock::new(TuiState::new()));
+        let pending: Option<PendingArb> = None;
+
+        let key = make_key_event_with_mods(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let result = handle_key(key, &state, &pending).await;
+        assert!(matches!(result, TuiResult::Quit));
+    }
+
+    #[tokio::test]
+    async fn test_key_n_enters_note_mode() {
+        let state = Arc::new(RwLock::new(TuiState::new()));
+        let pending: Option<PendingArb> = None;
+
+        let result = handle_key(make_key_event(KeyCode::Char('n')), &state, &pending).await;
+        assert!(matches!(result, TuiResult::Continue));
+        assert!(state.read().await.note_input.is_some());
+        assert_eq!(state.read().await.note_input.as_ref().unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn test_key_n_prefills_existing_note() {
+        let state = Arc::new(RwLock::new(TuiState::new()));
+        state.write().await.saved_note = Some("existing note".to_string());
+        let pending: Option<PendingArb> = None;
+
+        handle_key(make_key_event(KeyCode::Char('n')), &state, &pending).await;
+        assert_eq!(
+            state.read().await.note_input.as_ref().unwrap(),
+            "existing note"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_note_mode_typing() {
+        let state = Arc::new(RwLock::new(TuiState::new()));
+        state.write().await.note_input = Some(String::new());
+        let pending: Option<PendingArb> = None;
+
+        // Type characters
+        handle_key(make_key_event(KeyCode::Char('h')), &state, &pending).await;
+        handle_key(make_key_event(KeyCode::Char('i')), &state, &pending).await;
+
+        assert_eq!(state.read().await.note_input.as_ref().unwrap(), "hi");
+    }
+
+    #[tokio::test]
+    async fn test_note_mode_backspace() {
+        let state = Arc::new(RwLock::new(TuiState::new()));
+        state.write().await.note_input = Some("hello".to_string());
+        let pending: Option<PendingArb> = None;
+
+        handle_key(make_key_event(KeyCode::Backspace), &state, &pending).await;
+        assert_eq!(state.read().await.note_input.as_ref().unwrap(), "hell");
+    }
+
+    #[tokio::test]
+    async fn test_note_mode_enter_saves_and_exits() {
+        let state = Arc::new(RwLock::new(TuiState::new()));
+        state.write().await.note_input = Some("my note".to_string());
+        let pending: Option<PendingArb> = None;
+
+        let result = handle_key(make_key_event(KeyCode::Enter), &state, &pending).await;
+        assert!(matches!(result, TuiResult::Continue));
+
+        let s = state.read().await;
+        assert!(s.note_input.is_none()); // Exited note mode
+        assert_eq!(s.saved_note.as_ref().unwrap(), "my note"); // Note saved
+    }
+
+    #[tokio::test]
+    async fn test_note_mode_enter_empty_clears_saved() {
+        let state = Arc::new(RwLock::new(TuiState::new()));
+        state.write().await.note_input = Some(String::new());
+        state.write().await.saved_note = Some("old note".to_string());
+        let pending: Option<PendingArb> = None;
+
+        handle_key(make_key_event(KeyCode::Enter), &state, &pending).await;
+
+        let s = state.read().await;
+        assert!(s.note_input.is_none());
+        assert!(s.saved_note.is_none()); // Empty note clears saved
+    }
+
+    #[tokio::test]
+    async fn test_note_mode_esc_cancels_without_saving() {
+        let state = Arc::new(RwLock::new(TuiState::new()));
+        state.write().await.note_input = Some("draft note".to_string());
+        state.write().await.saved_note = Some("original".to_string());
+        let pending: Option<PendingArb> = None;
+
+        handle_key(make_key_event(KeyCode::Esc), &state, &pending).await;
+
+        let s = state.read().await;
+        assert!(s.note_input.is_none()); // Exited note mode
+        assert_eq!(s.saved_note.as_ref().unwrap(), "original"); // Original preserved
+    }
+
+    #[tokio::test]
+    async fn test_enter_without_pending_does_nothing() {
+        let state = Arc::new(RwLock::new(TuiState::new()));
+        let pending: Option<PendingArb> = None;
+
+        let result = handle_key(make_key_event(KeyCode::Enter), &state, &pending).await;
+        assert!(matches!(result, TuiResult::Continue));
+    }
+
+    // ==================== TUI Active State Tests ====================
+
+    #[test]
+    fn test_tui_state_starts_inactive() {
+        let state = TuiState::new();
+        assert!(!state.active);
+    }
+
+    #[tokio::test]
+    async fn test_tui_active_flag_toggle() {
+        let state = Arc::new(RwLock::new(TuiState::new()));
+
+        // Simulate TUI activation
+        state.write().await.active = true;
+        assert!(state.read().await.active);
+
+        // Simulate TUI deactivation
+        state.write().await.active = false;
+        assert!(!state.read().await.active);
+    }
+
+    // ==================== Log Dump on Exit Tests ====================
+
+    #[test]
+    fn test_log_buffer_preserved_for_dump() {
+        let mut state = TuiState::new();
+        state.add_log("log 1".to_string());
+        state.add_log("log 2".to_string());
+        state.add_log("log 3".to_string());
+
+        // Verify all logs are available for iteration (as done in dump)
+        let logs: Vec<&String> = state.log_buffer.iter().collect();
+        assert_eq!(logs.len(), 3);
+        assert_eq!(logs[0], "log 1");
+        assert_eq!(logs[2], "log 3");
+    }
+
+    #[test]
+    fn test_empty_log_buffer_check() {
+        let state = TuiState::new();
+        // The dump logic checks is_empty() before printing
+        assert!(state.log_buffer.is_empty());
+    }
+}
