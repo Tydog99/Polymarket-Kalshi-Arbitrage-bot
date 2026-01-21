@@ -632,6 +632,9 @@ impl ExecutionEngine {
 
     /// Background task to automatically close excess exposure from mismatched fills.
     /// Records close fills to position tracker with negative contracts.
+    ///
+    /// Retry strategy: Start at original_price - 1c and walk down 1c at a time
+    /// until all contracts are filled or we hit the minimum price (1c).
     #[allow(clippy::too_many_arguments)]
     async fn auto_close_background(
         kalshi: Arc<KalshiApiClient>,
@@ -654,6 +657,11 @@ impl ExecutionEngine {
             return;
         }
 
+        // Configuration for retry logic
+        const MIN_PRICE_CENTS: i64 = 1;  // Don't go below 1c
+        const PRICE_STEP_CENTS: i64 = 1; // Walk down 1c at a time
+        const RETRY_DELAY_MS: u64 = 100; // Brief delay between retries
+
         // Helper to record close fill (negative contracts to reduce position)
         let record_close = |position_channel: &PositionChannel, platform: &str, side: &str,
                            closed: f64, price: f64, order_id: &str| {
@@ -667,121 +675,249 @@ impl ExecutionEngine {
             }
         };
 
-        // Helper to log P&L after close
-        let log_close_pnl = |platform: &str, closed: i64, proceeds: i64| {
-            if closed > 0 {
-                let close_pnl = proceeds - (original_cost_per_contract * excess);
+        // Helper to log final P&L after close attempts
+        let log_final_result = |platform: &str, total_closed: i64, total_proceeds: i64, remaining: i64| {
+            if total_closed > 0 {
+                let close_pnl = total_proceeds - (original_cost_per_contract * total_closed);
                 info!("[EXEC] ✅ Closed {} {} contracts for {}¢ (P&L: {}¢)",
-                    closed, platform, proceeds, close_pnl);
-            } else {
-                warn!("[EXEC] ⚠️ Failed to close {} excess - 0 filled", platform);
+                    total_closed, platform, total_proceeds, close_pnl);
+            }
+            if remaining > 0 {
+                error!("[EXEC] ❌ Failed to close {} {} contracts - EXPOSURE REMAINS!", remaining, platform);
             }
         };
 
         match arb_type {
             ArbType::PolyOnly => {
-                let (token, side, price) = if yes_filled > no_filled {
+                let (token, side, start_price) = if yes_filled > no_filled {
                     (&poly_yes_token, "yes", yes_price)
                 } else {
                     (&poly_no_token, "no", no_price)
                 };
-                let close_price = cents_to_price((price as i16).saturating_sub(10).max(1) as u16);
 
                 info!("[EXEC] 🔄 Waiting 2s for Poly settlement before auto-close ({} {} contracts)", excess, side);
                 tokio::time::sleep(Duration::from_secs(2)).await;
 
-                match poly_async.sell_fak(token, close_price, excess as f64).await {
-                    Ok(fill) => {
-                        log_close_pnl("Poly", fill.filled_size as i64, (fill.fill_cost * 100.0) as i64);
-                        record_close(&position_channel, "polymarket", side,
-                                   fill.filled_size, fill.fill_cost / fill.filled_size.max(0.001), &fill.order_id);
-                    }
-                    Err(e) => warn!("[EXEC] ⚠️ Failed to close Poly excess: {}", e),
-                }
+                Self::close_poly_with_retry(
+                    &poly_async, &position_channel, token, side, start_price,
+                    excess, MIN_PRICE_CENTS, PRICE_STEP_CENTS, RETRY_DELAY_MS,
+                    record_close, log_final_result,
+                ).await;
             }
 
             ArbType::KalshiOnly => {
-                let (side, price) = if yes_filled > no_filled {
+                let (side, start_price) = if yes_filled > no_filled {
                     ("yes", yes_price as i64)
                 } else {
                     ("no", no_price as i64)
                 };
-                let close_price = price.saturating_sub(10).max(1);
 
-                match kalshi.sell_ioc(&kalshi_ticker, side, close_price, excess).await {
-                    Ok(resp) => {
-                        let filled = resp.order.filled_count();
-                        let proceeds = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
-                        log_close_pnl("Kalshi", filled, proceeds);
-                        record_close(&position_channel, "kalshi", side,
-                                   filled as f64, proceeds as f64 / 100.0 / filled.max(1) as f64, &resp.order.order_id);
-                    }
-                    Err(e) => warn!("[EXEC] ⚠️ Failed to close Kalshi excess: {}", e),
-                }
+                Self::close_kalshi_with_retry(
+                    &kalshi, &position_channel, &kalshi_ticker, side, start_price,
+                    excess, MIN_PRICE_CENTS, PRICE_STEP_CENTS, RETRY_DELAY_MS,
+                    record_close, log_final_result,
+                ).await;
             }
 
             ArbType::PolyYesKalshiNo => {
                 if yes_filled > no_filled {
                     // Poly YES excess - close on Poly
-                    let close_price = cents_to_price((yes_price as i16).saturating_sub(10).max(1) as u16);
                     info!("[EXEC] 🔄 Waiting 2s for Poly settlement before auto-close ({} yes contracts)", excess);
                     tokio::time::sleep(Duration::from_secs(2)).await;
 
-                    match poly_async.sell_fak(&poly_yes_token, close_price, excess as f64).await {
-                        Ok(fill) => {
-                            log_close_pnl("Poly", fill.filled_size as i64, (fill.fill_cost * 100.0) as i64);
-                            record_close(&position_channel, "polymarket", "yes",
-                                       fill.filled_size, fill.fill_cost / fill.filled_size.max(0.001), &fill.order_id);
-                        }
-                        Err(e) => warn!("[EXEC] ⚠️ Failed to close Poly excess: {}", e),
-                    }
+                    Self::close_poly_with_retry(
+                        &poly_async, &position_channel, &poly_yes_token, "yes", yes_price,
+                        excess, MIN_PRICE_CENTS, PRICE_STEP_CENTS, RETRY_DELAY_MS,
+                        record_close, log_final_result,
+                    ).await;
                 } else {
                     // Kalshi NO excess - close on Kalshi
-                    let close_price = (no_price as i64).saturating_sub(10).max(1);
-                    match kalshi.sell_ioc(&kalshi_ticker, "no", close_price, excess).await {
-                        Ok(resp) => {
-                            let filled = resp.order.filled_count();
-                            let proceeds = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
-                            log_close_pnl("Kalshi", filled, proceeds);
-                            record_close(&position_channel, "kalshi", "no",
-                                       filled as f64, proceeds as f64 / 100.0 / filled.max(1) as f64, &resp.order.order_id);
-                        }
-                        Err(e) => warn!("[EXEC] ⚠️ Failed to close Kalshi excess: {}", e),
-                    }
+                    Self::close_kalshi_with_retry(
+                        &kalshi, &position_channel, &kalshi_ticker, "no", no_price as i64,
+                        excess, MIN_PRICE_CENTS, PRICE_STEP_CENTS, RETRY_DELAY_MS,
+                        record_close, log_final_result,
+                    ).await;
                 }
             }
 
             ArbType::KalshiYesPolyNo => {
                 if yes_filled > no_filled {
                     // Kalshi YES excess - close on Kalshi
-                    let close_price = (yes_price as i64).saturating_sub(10).max(1);
-                    match kalshi.sell_ioc(&kalshi_ticker, "yes", close_price, excess).await {
-                        Ok(resp) => {
-                            let filled = resp.order.filled_count();
-                            let proceeds = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
-                            log_close_pnl("Kalshi", filled, proceeds);
-                            record_close(&position_channel, "kalshi", "yes",
-                                       filled as f64, proceeds as f64 / 100.0 / filled.max(1) as f64, &resp.order.order_id);
-                        }
-                        Err(e) => warn!("[EXEC] ⚠️ Failed to close Kalshi excess: {}", e),
-                    }
+                    Self::close_kalshi_with_retry(
+                        &kalshi, &position_channel, &kalshi_ticker, "yes", yes_price as i64,
+                        excess, MIN_PRICE_CENTS, PRICE_STEP_CENTS, RETRY_DELAY_MS,
+                        record_close, log_final_result,
+                    ).await;
                 } else {
                     // Poly NO excess - close on Poly
-                    let close_price = cents_to_price((no_price as i16).saturating_sub(10).max(1) as u16);
                     info!("[EXEC] 🔄 Waiting 2s for Poly settlement before auto-close ({} no contracts)", excess);
                     tokio::time::sleep(Duration::from_secs(2)).await;
 
-                    match poly_async.sell_fak(&poly_no_token, close_price, excess as f64).await {
-                        Ok(fill) => {
-                            log_close_pnl("Poly", fill.filled_size as i64, (fill.fill_cost * 100.0) as i64);
-                            record_close(&position_channel, "polymarket", "no",
-                                       fill.filled_size, fill.fill_cost / fill.filled_size.max(0.001), &fill.order_id);
-                        }
-                        Err(e) => warn!("[EXEC] ⚠️ Failed to close Poly excess: {}", e),
-                    }
+                    Self::close_poly_with_retry(
+                        &poly_async, &position_channel, &poly_no_token, "no", no_price,
+                        excess, MIN_PRICE_CENTS, PRICE_STEP_CENTS, RETRY_DELAY_MS,
+                        record_close, log_final_result,
+                    ).await;
                 }
             }
         }
+    }
+
+    /// Close Polymarket position with retry, walking down the book 1c at a time.
+    #[allow(clippy::too_many_arguments)]
+    async fn close_poly_with_retry<F, G>(
+        poly_async: &Arc<dyn PolyExecutor>,
+        position_channel: &PositionChannel,
+        token: &str,
+        side: &str,
+        start_price_cents: u16,
+        total_to_close: i64,
+        min_price_cents: i64,
+        price_step_cents: i64,
+        retry_delay_ms: u64,
+        record_close: F,
+        log_final_result: G,
+    )
+    where
+        F: Fn(&PositionChannel, &str, &str, f64, f64, &str),
+        G: Fn(&str, i64, i64, i64),
+    {
+        let mut remaining = total_to_close;
+        let mut current_price_cents = (start_price_cents as i64).saturating_sub(1).max(min_price_cents);
+        let mut total_closed: i64 = 0;
+        let mut total_proceeds_cents: i64 = 0;
+        let mut attempt = 0;
+
+        while remaining > 0 && current_price_cents >= min_price_cents {
+            attempt += 1;
+            let price_decimal = cents_to_price(current_price_cents as u16);
+
+            match poly_async.sell_fak(token, price_decimal, remaining as f64).await {
+                Ok(fill) => {
+                    let filled = fill.filled_size as i64;
+                    let proceeds_cents = (fill.fill_cost * 100.0) as i64;
+
+                    if filled > 0 {
+                        info!(
+                            "[EXEC] 🔄 Poly close attempt #{}: filled {}/{} @ {}c (total: {}/{})",
+                            attempt, filled, remaining, current_price_cents, total_closed + filled, total_to_close
+                        );
+
+                        record_close(
+                            position_channel, "polymarket", side,
+                            fill.filled_size, fill.fill_cost / fill.filled_size.max(0.001), &fill.order_id
+                        );
+
+                        total_closed += filled;
+                        total_proceeds_cents += proceeds_cents;
+                        remaining -= filled;
+                    } else {
+                        info!(
+                            "[EXEC] 🔄 Poly close attempt #{}: 0 filled @ {}c, stepping down",
+                            attempt, current_price_cents
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "[EXEC] ⚠️ Poly close attempt #{} failed @ {}c: {}",
+                        attempt, current_price_cents, e
+                    );
+                }
+            }
+
+            if remaining > 0 {
+                current_price_cents -= price_step_cents;
+                if current_price_cents >= min_price_cents {
+                    info!(
+                        "[EXEC] 🔄 Stepping down to {}c ({} contracts remaining)",
+                        current_price_cents, remaining
+                    );
+                    tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                }
+            }
+        }
+
+        log_final_result("Poly", total_closed, total_proceeds_cents, remaining);
+    }
+
+    /// Close Kalshi position with retry, walking down the book 1c at a time.
+    #[allow(clippy::too_many_arguments)]
+    async fn close_kalshi_with_retry<F, G>(
+        kalshi: &Arc<KalshiApiClient>,
+        position_channel: &PositionChannel,
+        ticker: &str,
+        side: &str,
+        start_price_cents: i64,
+        total_to_close: i64,
+        min_price_cents: i64,
+        price_step_cents: i64,
+        retry_delay_ms: u64,
+        record_close: F,
+        log_final_result: G,
+    )
+    where
+        F: Fn(&PositionChannel, &str, &str, f64, f64, &str),
+        G: Fn(&str, i64, i64, i64),
+    {
+        let mut remaining = total_to_close;
+        let mut current_price_cents = start_price_cents.saturating_sub(1).max(min_price_cents);
+        let mut total_closed: i64 = 0;
+        let mut total_proceeds_cents: i64 = 0;
+        let mut attempt = 0;
+
+        while remaining > 0 && current_price_cents >= min_price_cents {
+            attempt += 1;
+
+            match kalshi.sell_ioc(ticker, side, current_price_cents, remaining).await {
+                Ok(resp) => {
+                    let filled = resp.order.filled_count();
+                    let proceeds_cents = resp.order.taker_fill_cost.unwrap_or(0)
+                        + resp.order.maker_fill_cost.unwrap_or(0);
+
+                    if filled > 0 {
+                        info!(
+                            "[EXEC] 🔄 Kalshi close attempt #{}: filled {}/{} @ {}c (total: {}/{})",
+                            attempt, filled, remaining, current_price_cents, total_closed + filled, total_to_close
+                        );
+
+                        record_close(
+                            position_channel, "kalshi", side,
+                            filled as f64, proceeds_cents as f64 / 100.0 / filled.max(1) as f64,
+                            &resp.order.order_id
+                        );
+
+                        total_closed += filled;
+                        total_proceeds_cents += proceeds_cents;
+                        remaining -= filled;
+                    } else {
+                        info!(
+                            "[EXEC] 🔄 Kalshi close attempt #{}: 0 filled @ {}c, stepping down",
+                            attempt, current_price_cents
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "[EXEC] ⚠️ Kalshi close attempt #{} failed @ {}c: {}",
+                        attempt, current_price_cents, e
+                    );
+                }
+            }
+
+            if remaining > 0 {
+                current_price_cents -= price_step_cents;
+                if current_price_cents >= min_price_cents {
+                    info!(
+                        "[EXEC] 🔄 Stepping down to {}c ({} contracts remaining)",
+                        current_price_cents, remaining
+                    );
+                    tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                }
+            }
+        }
+
+        log_final_result("Kalshi", total_closed, total_proceeds_cents, remaining);
     }
 
     #[inline(always)]

@@ -70,6 +70,27 @@ Position Tracking (position_tracker.rs)
 | `poly_only` | Both sides on Polymarket (rare) |
 | `kalshi_only` | Both sides on Kalshi (rare) |
 
+### Auto-Close on Mismatched Fills
+
+When one leg of an arbitrage fills but the other fails (creating unhedged exposure), the system automatically attempts to close the position:
+
+1. **Detection**: After concurrent execution, if `yes_filled != no_filled`, excess exposure exists
+2. **Settlement Wait**: For Polymarket, waits 2 seconds for on-chain settlement
+3. **Retry with Price Improvement**: Walks down the book 1¢ at a time until filled or hits 1¢ floor
+
+```
+[EXEC] 🔄 Waiting 2s for Poly settlement before auto-close (5 yes contracts)
+[EXEC] 🔄 Poly close attempt #1: filled 3/5 @ 52c (total: 3/5)
+[EXEC] 🔄 Stepping down to 51c (2 contracts remaining)
+[EXEC] 🔄 Poly close attempt #2: filled 2/2 @ 51c (total: 5/5)
+[EXEC] ✅ Closed 5 Poly contracts for 258¢ (P&L: -7¢)
+```
+
+**Configuration** (in `execution.rs`):
+- `MIN_PRICE_CENTS = 1` - Floor price, won't go below 1¢
+- `PRICE_STEP_CENTS = 1` - Decrement 1¢ per retry
+- `RETRY_DELAY_MS = 100` - Brief delay between attempts
+
 ### Lock-Free Orderbook Design
 
 `AtomicOrderbook` uses a packed u64 format for cache-line efficiency:

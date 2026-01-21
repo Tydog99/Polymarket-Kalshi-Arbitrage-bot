@@ -625,3 +625,175 @@ async fn test_auto_close_poly_excess_sells_on_poly() {
         close.contracts.abs()
     );
 }
+
+// ============================================================================
+// AUTO-CLOSE RETRY TESTS
+// ============================================================================
+
+/// Test: Auto-close with retry walks down the book 1c at a time.
+///
+/// Scenario:
+/// - Poly YES buy succeeds (1 contract filled)
+/// - Kalshi NO buy fails (0 contracts)
+/// - Auto-close attempts to sell Poly YES with retry
+///
+/// Expected behavior:
+/// - System starts at original_price - 1c
+/// - Walks down the book 1c at a time until filled
+/// - Multiple sell attempts are made with decreasing prices
+#[tokio::test]
+async fn test_auto_close_retries_with_price_improvement() {
+    let kalshi_server = MockServer::start().await;
+
+    // Mount Kalshi with NO fill (0 contracts) - simulates failed leg
+    let exchange = load_fixture(fixture_path("kalshi_no_fill_real.json"))
+        .expect("Failed to load fixture");
+
+    let mut response = ResponseTemplate::new(exchange.response.status)
+        .set_body_raw(exchange.response.body_raw.clone(), "application/json");
+
+    for (key, value) in &exchange.response.headers {
+        if key.to_lowercase() != "content-length" && key.to_lowercase() != "transfer-encoding" {
+            response = response.append_header(key.as_str(), value.as_str());
+        }
+    }
+
+    Mock::given(method("POST"))
+        .and(path_regex(".*portfolio/orders.*"))
+        .respond_with(response)
+        .mount(&kalshi_server)
+        .await;
+
+    // Configure mock Poly:
+    // Buy succeeds with 1 contract (creates exposure)
+    // Sell also succeeds (MockPolyClient returns same response for buy/sell)
+    let mock_poly = Arc::new(MockPolyClient::new());
+    mock_poly.set_full_fill("poly-yes-token-12345", 1.0, 0.53);
+
+    let (engine, mut fill_rx) = create_test_engine(&kalshi_server, mock_poly.clone());
+
+    // Execute
+    let req = create_test_request(ArbType::PolyYesKalshiNo);
+    let result = engine.process(req).await;
+    assert!(result.is_ok());
+
+    // Wait for auto-close background task (2s Poly settlement wait + buffer)
+    tokio::time::sleep(tokio::time::Duration::from_millis(2500)).await;
+
+    // Verify sell_fak WAS called
+    let sell_calls = mock_poly.get_sell_calls();
+    assert!(
+        !sell_calls.is_empty(),
+        "Auto-close should attempt to sell"
+    );
+
+    // First sell should be at original_price - 1c
+    // Test request has yes_price=9c, so first attempt is at 8c = 0.08
+    let first_call = &sell_calls[0];
+    let expected_first_price = 0.08; // 9c - 1c = 8c
+    assert!(
+        (first_call.price - expected_first_price).abs() < 0.02,
+        "First auto-close attempt should be at yes_price - 1c = 8c. Expected ~{}, got {}",
+        expected_first_price,
+        first_call.price
+    );
+
+    // Since mock returns full fill on first attempt, only 1 call should be made
+    // (no need to retry if fully filled)
+    assert_eq!(
+        sell_calls.len(),
+        1,
+        "Should stop retrying after full fill. Got {} calls",
+        sell_calls.len()
+    );
+
+    // Verify close fill was recorded
+    let fills = drain_fills(&mut fill_rx).await;
+    let close_fill = fills.iter().find(|f| f.contracts < 0.0);
+    assert!(
+        close_fill.is_some(),
+        "Should have recorded close fill. Fills: {:?}",
+        fills.iter().map(|f| (f.platform.as_str(), f.side.as_str(), f.contracts)).collect::<Vec<_>>()
+    );
+}
+
+/// Test: Auto-close retry verifies multiple attempts with partial fills.
+///
+/// This test uses a mock that always returns the same response, so we can't
+/// truly test partial fill → retry → remaining fill. But we verify:
+/// 1. The retry mechanism is in place (logs show multiple attempts possible)
+/// 2. Price starts at -1c and would walk down
+///
+/// For true partial fill testing, we'd need a stateful mock that returns
+/// different values on successive calls.
+#[tokio::test]
+async fn test_auto_close_retry_starts_at_minus_1c() {
+    let kalshi_server = MockServer::start().await;
+
+    // Mount Kalshi with NO fill (0 contracts)
+    let exchange = load_fixture(fixture_path("kalshi_no_fill_real.json"))
+        .expect("Failed to load fixture");
+
+    let mut response = ResponseTemplate::new(exchange.response.status)
+        .set_body_raw(exchange.response.body_raw.clone(), "application/json");
+
+    for (key, value) in &exchange.response.headers {
+        if key.to_lowercase() != "content-length" && key.to_lowercase() != "transfer-encoding" {
+            response = response.append_header(key.as_str(), value.as_str());
+        }
+    }
+
+    Mock::given(method("POST"))
+        .and(path_regex(".*portfolio/orders.*"))
+        .respond_with(response)
+        .mount(&kalshi_server)
+        .await;
+
+    // Configure mock Poly for full fill
+    let mock_poly = Arc::new(MockPolyClient::new());
+    mock_poly.set_full_fill("poly-yes-token-12345", 5.0, 0.53);
+
+    let (engine, mut fill_rx) = create_test_engine(&kalshi_server, mock_poly.clone());
+
+    // Execute
+    let req = create_test_request(ArbType::PolyYesKalshiNo);
+    let result = engine.process(req).await;
+    assert!(result.is_ok());
+
+    // Wait for auto-close background task
+    tokio::time::sleep(tokio::time::Duration::from_millis(2500)).await;
+
+    // Verify sell_fak was called
+    let sell_calls = mock_poly.get_sell_calls();
+    assert!(
+        !sell_calls.is_empty(),
+        "Auto-close should attempt to sell"
+    );
+
+    // First attempt should be at 8c (9c - 1c), NOT 1c (old 9c - 10c behavior)
+    let first_call = &sell_calls[0];
+    assert!(
+        first_call.price > 0.05, // Should be > 5c (definitely not 1c)
+        "Should start close attempt at -1c, not -10c. Got price {}",
+        first_call.price
+    );
+
+    // The sell was requested for 5 contracts (full excess)
+    assert!(
+        (first_call.size - 5.0).abs() < 0.01,
+        "Should attempt to close all 5 excess contracts, requested {}",
+        first_call.size
+    );
+
+    // Verify fills
+    let fills = drain_fills(&mut fill_rx).await;
+    let close_fill = fills.iter().find(|f| f.contracts < 0.0);
+    assert!(close_fill.is_some(), "Should have recorded close fill");
+
+    let close = close_fill.unwrap();
+    assert!(
+        (close.contracts.abs() - 5.0).abs() < 0.01,
+        "Should close 5 contracts, got {}",
+        close.contracts.abs()
+    );
+}
