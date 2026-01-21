@@ -1603,7 +1603,7 @@ static ESPORTS_TEAM_ALIASES: &[(&str, &[&str])] = &[
     ("ok-brion", &["bro", "bro2", "brion", "ok brion"]),
     ("fearx", &["fox", "fox1", "fearx", "foxy", "bnk-fearx-youth"]),
     ("dn-soopers", &["dnf", "dn soopers"]),
-    ("hanjin-brion", &["bro2", "hanjin", "hanjin brion"]),
+    ("hanjin-brion", &["bro", "bro2", "hanjin", "hanjin brion"]),
 
     // LEC (Europe LoL)
     ("g2-esports", &["g2", "g2 esports"]),
