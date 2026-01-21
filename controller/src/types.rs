@@ -341,7 +341,8 @@ pub fn parse_price(s: &str) -> PriceCents {
 }
 
 /// Arbitrage opportunity type, determining the execution strategy
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ArbType {
     /// Cross-platform: Buy Polymarket YES + Buy Kalshi NO
     PolyYesKalshiNo,
