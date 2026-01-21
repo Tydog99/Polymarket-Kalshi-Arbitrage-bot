@@ -621,6 +621,9 @@ async fn main() -> Result<()> {
     if let Some(v) = cli_arg_value(&args, "--heartbeat-interval") {
         std::env::set_var("HEARTBEAT_INTERVAL_SECS", v);
     }
+    if let Some(skip) = cli_arg_value(&args, "--confirm-mode-skip") {
+        std::env::set_var("CONFIRM_MODE_SKIP", &skip);
+    }
 
     // Build league list for discovery from CLI/env.
     // - `--leagues nba,nfl` overrides env.
