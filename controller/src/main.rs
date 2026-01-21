@@ -1306,6 +1306,8 @@ async fn main() -> Result<()> {
                 p_yes: u16,
                 p_no: u16,
                 gap: i16,
+                yes_size: u16,  // Size of YES leg for best arb
+                no_size: u16,   // Size of NO leg for best arb
                 k_updates: u32,
                 p_updates: u32,
                 k_last_ms: u64,
@@ -1344,16 +1346,22 @@ async fn main() -> Result<()> {
 
                     // For verbose mode, collect ALL discovered markets (not just those with both prices)
                     if verbose {
-                        // Calculate gap only if both platforms have prices
-                        let gap = if has_k && has_p {
+                        // Calculate gap and sizes only if both platforms have prices
+                        let (gap, yes_size, no_size) = if has_k && has_p {
                             let fee1 = kalshi_fee_cents(k_no);
                             let cost1 = p_yes + k_no + fee1;
                             let fee2 = kalshi_fee_cents(k_yes);
                             let cost2 = k_yes + fee2 + p_no;
-                            let best_cost = cost1.min(cost2);
-                            best_cost as i16 - heartbeat_threshold as i16
+                            // Determine which arb type is better and use those sizes
+                            if cost1 <= cost2 {
+                                // PolyYesKalshiNo: YES from Poly, NO from Kalshi
+                                (cost1 as i16 - heartbeat_threshold as i16, p_yes_size, k_no_size)
+                            } else {
+                                // KalshiYesPolyNo: YES from Kalshi, NO from Poly
+                                (cost2 as i16 - heartbeat_threshold as i16, k_yes_size, p_no_size)
+                            }
                         } else {
-                            i16::MAX // Sentinel value indicating no gap calculable
+                            (i16::MAX, 0, 0) // Sentinel value indicating no gap calculable
                         };
 
                         market_details.push(MarketDetail {
@@ -1365,6 +1373,8 @@ async fn main() -> Result<()> {
                             p_yes,
                             p_no,
                             gap,
+                            yes_size,
+                            no_size,
                             k_updates: k_upd,
                             p_updates: p_upd,
                             k_last_ms,
@@ -1494,16 +1504,25 @@ async fn main() -> Result<()> {
                                     format!("\x1b[31m{:+}¢\x1b[0m", m.gap) // Red for no arb
                                 };
 
+                                // Format size in dollars (cents / 100)
+                                let size_str = if m.yes_size > 0 || m.no_size > 0 {
+                                    let yes_dollars = m.yes_size as f64 / 100.0;
+                                    let no_dollars = m.no_size as f64 / 100.0;
+                                    format!("${:.0}/${:.0}", yes_dollars, no_dollars)
+                                } else {
+                                    "--/--".to_string()
+                                };
+
                                 let k_time = fmt_unix_ms_hhmmss(m.k_last_ms);
                                 let p_time = fmt_unix_ms_hhmmss(m.p_last_ms);
                                 let k_age = fmt_age(now_ms, m.k_last_ms);
                                 let p_age = fmt_age(now_ms, m.p_last_ms);
 
                                 log_line(format!(
-                                    "{}  {}── {:<55} K:{} P:{} gap:{}    upd:K{}/P{} last:K{}({}) P{}({})",
+                                    "{}  {}── {:<55} K:{} P:{} gap:{} size:{}    upd:K{}/P{} last:K{}({}) P{}({})",
                                          prefix, item_branch, desc,
                                          k_str, p_str,
-                                         gap_str, m.k_updates, m.p_updates,
+                                         gap_str, size_str, m.k_updates, m.p_updates,
                                          k_time, k_age, p_time, p_age
                                 ));
                             }
