@@ -191,6 +191,11 @@ impl ConfirmationQueue {
 
     /// Check if arb is still valid (prices haven't moved)
     pub fn validate_arb(&self, arb: &PendingArb) -> bool {
+        // Test arbs use synthetic prices, skip validation
+        if arb.request.is_test {
+            return true;
+        }
+
         let market = match self.state.get_by_id(arb.request.market_id) {
             Some(m) => m,
             None => return false,

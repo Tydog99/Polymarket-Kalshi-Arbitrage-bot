@@ -875,6 +875,7 @@ async fn main() -> Result<()> {
             trading_kalshi,
             trading_poly,
             dry_run,
+            Some(tui_log_tx.clone()),
         ));
         tokio::spawn(run_hybrid_execution_loop(exec_rx, hybrid_exec))
     } else {
@@ -1052,12 +1053,18 @@ async fn main() -> Result<()> {
         // Parse arb type from environment (default: poly_yes_kalshi_no)
         let arb_type_str = std::env::var("TEST_ARB_TYPE").unwrap_or_else(|_| "poly_yes_kalshi_no".to_string());
 
+        // Parse delay from environment (default: 10 seconds)
+        let test_arb_delay: u64 = std::env::var("TEST_ARB_DELAY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
         tokio::spawn(async move {
             use types::{FastExecutionRequest, ArbType};
 
             // Wait for WebSocket connections to establish and populate orderbooks
-            info!("[TEST] Injecting synthetic arbitrage opportunity in 10 seconds...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            info!("[TEST] Injecting synthetic arbitrage opportunity in {} seconds...", test_arb_delay);
+            tokio::time::sleep(tokio::time::Duration::from_secs(test_arb_delay)).await;
 
             // Parse arb type
             let arb_type = match arb_type_str.to_lowercase().as_str() {
@@ -1094,6 +1101,7 @@ async fn main() -> Result<()> {
                             no_size: 1000,   // 1000¢ = 10 contracts
                             arb_type,
                             detected_ns: 0,
+                            is_test: true,
                         };
 
                         warn!("[TEST] 🧪 Injecting synthetic {:?} arbitrage for: {}", arb_type, pair.description);
@@ -1229,6 +1237,7 @@ async fn main() -> Result<()> {
                     no_size,
                     arb_type,
                     detected_ns: sweep_clock.now_ns(),
+                    is_test: false,
                 };
 
                 if let Err(e) = sweep_exec_tx.try_send(req) {

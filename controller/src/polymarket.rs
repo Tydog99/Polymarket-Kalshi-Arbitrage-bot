@@ -716,6 +716,7 @@ async fn send_arb_request(
         no_size,
         arb_type,
         detected_ns: clock.now_ns(),
+        is_test: false,
     };
 
     // Get market pair to check if confirmation is required

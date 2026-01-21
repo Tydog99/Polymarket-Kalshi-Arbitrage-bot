@@ -144,6 +144,7 @@ fn create_test_request(arb_type: ArbType) -> FastExecutionRequest {
         no_size: 10000,
         arb_type,
         detected_ns: 0,
+        is_test: false,
     }
 }
 

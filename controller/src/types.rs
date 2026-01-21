@@ -371,6 +371,8 @@ pub struct FastExecutionRequest {
     pub arb_type: ArbType,
     /// Detection timestamp in nanoseconds since system start
     pub detected_ns: u64,
+    /// Whether this is a test arb (skips price validation in confirm mode)
+    pub is_test: bool,
 }
 
 impl FastExecutionRequest {
@@ -1025,6 +1027,7 @@ mod tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         assert_eq!(req.profit_cents(), 8);
@@ -1043,6 +1046,7 @@ mod tests {
             no_size: 1000,
             arb_type: ArbType::KalshiYesPolyNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         assert_eq!(req.profit_cents(), 8);
@@ -1061,6 +1065,7 @@ mod tests {
             no_size: 1000,
             arb_type: ArbType::PolyOnly,
             detected_ns: 0,
+            is_test: false,
         };
 
         assert_eq!(req.profit_cents(), 12);
@@ -1080,6 +1085,7 @@ mod tests {
             no_size: 1000,
             arb_type: ArbType::KalshiOnly,
             detected_ns: 0,
+            is_test: false,
         };
 
         assert_eq!(req.profit_cents(), 12);
@@ -1097,6 +1103,7 @@ mod tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         assert!(req.profit_cents() < 0, "Should have negative profit");
@@ -1113,6 +1120,7 @@ mod tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
         assert_eq!(req1.estimated_fee_cents(), kalshi_fee_cents(50));
 
@@ -1125,6 +1133,7 @@ mod tests {
             no_size: 1000,
             arb_type: ArbType::KalshiYesPolyNo,
             detected_ns: 0,
+            is_test: false,
         };
         assert_eq!(req2.estimated_fee_cents(), kalshi_fee_cents(40));
 
@@ -1137,6 +1146,7 @@ mod tests {
             no_size: 1000,
             arb_type: ArbType::PolyOnly,
             detected_ns: 0,
+            is_test: false,
         };
         assert_eq!(req3.estimated_fee_cents(), 0);
 
@@ -1149,6 +1159,7 @@ mod tests {
             no_size: 1000,
             arb_type: ArbType::KalshiOnly,
             detected_ns: 0,
+            is_test: false,
         };
         assert_eq!(req4.estimated_fee_cents(), kalshi_fee_cents(40) + kalshi_fee_cents(50));
     }
@@ -1233,6 +1244,7 @@ mod tests {
             no_size: k_no_sz,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         assert!(req.profit_cents() > 0, "Should have positive profit");
