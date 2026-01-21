@@ -3,6 +3,8 @@
 //! This module contains all configuration constants, league mappings, and
 //! environment variable parsing for the trading system.
 
+use std::collections::HashSet;
+
 /// Kalshi WebSocket URL
 pub const KALSHI_WS_URL: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
 
@@ -133,6 +135,42 @@ pub fn disabled_leagues() -> &'static HashSet<String> {
 /// Check if a league is disabled for trading (monitor only)
 pub fn is_league_disabled(league: &str) -> bool {
     disabled_leagues().contains(&league.to_lowercase())
+}
+
+/// Leagues that skip confirmation mode (auto-execute)
+/// Set CONFIRM_MODE_SKIP env var to comma-separated list, e.g., "nba,nfl"
+pub fn confirm_mode_skip_leagues() -> HashSet<String> {
+    std::env::var("CONFIRM_MODE_SKIP")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').map(|l| l.trim().to_lowercase()).collect())
+        .unwrap_or_default()
+}
+
+/// Check if a league requires confirmation before trading
+/// Returns true if league has confirm_mode=true AND is not in CONFIRM_MODE_SKIP list
+pub fn requires_confirmation(league: &str) -> bool {
+    let league_lower = league.to_lowercase();
+
+    // Check if explicitly skipped
+    if confirm_mode_skip_leagues().contains(&league_lower) {
+        return false;
+    }
+
+    // Check league config
+    get_league_configs()
+        .iter()
+        .find(|c| c.league_code == league_lower)
+        .map(|c| c.confirm_mode)
+        .unwrap_or(true) // Default to requiring confirmation for unknown leagues
+}
+
+/// Check if any league requires confirmation
+pub fn any_league_requires_confirmation() -> bool {
+    let skip_leagues = confirm_mode_skip_leagues();
+    get_league_configs()
+        .iter()
+        .any(|c| c.confirm_mode && !skip_leagues.contains(&c.league_code.to_lowercase()))
 }
 
 /// Enable verbose heartbeat output with hierarchical tree view.
@@ -444,7 +482,6 @@ pub fn discovery_interval_mins() -> u64 {
     })
 }
 
-use std::collections::HashSet;
 use trading::execution::Platform;
 
 /// Parse CONTROLLER_PLATFORMS env var.
