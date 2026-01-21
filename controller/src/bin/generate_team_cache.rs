@@ -60,13 +60,11 @@ const KNOWN_MAPPINGS: &[(&str, &str, &str)] = &[
 #[derive(Debug, Deserialize)]
 struct PolyEvent {
     slug: Option<String>,
-    title: Option<String>,
     markets: Option<Vec<PolyMarket>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PolyMarket {
-    slug: Option<String>,
     outcomes: Option<String>,
 }
 
