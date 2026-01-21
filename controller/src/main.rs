@@ -95,6 +95,9 @@ where
 use cache::TeamCache;
 use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use config::{ARB_THRESHOLD, enabled_leagues, get_league_configs, parse_controller_platforms, WS_RECONNECT_DELAY_SECS};
+use confirm_log::{ConfirmationLogger, ConfirmationRecord, ConfirmationStatus};
+use confirm_queue::{ConfirmAction, ConfirmationQueue};
+use confirm_tui::TuiState;
 use discovery::DiscoveryClient;
 use execution::{ExecutionEngine, NanoClock, create_execution_channel, run_execution_loop};
 use kalshi::{KalshiConfig, KalshiApiClient};
@@ -104,7 +107,7 @@ use crate::remote_execution::{HybridExecutor, run_hybrid_execution_loop};
 use crate::remote_protocol::Platform as WsPlatform;
 use crate::remote_trader::RemoteTraderServer;
 use trading::execution::Platform as TradingPlatform;
-use types::{GlobalState, MarketType, PriceCents};
+use types::{FastExecutionRequest, GlobalState, MarketPair, MarketType, PriceCents};
 
 /// Polymarket CLOB API host
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
@@ -781,6 +784,19 @@ async fn main() -> Result<()> {
     let (exec_tx, exec_rx) = create_execution_channel();
     let circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig::from_env()));
 
+    // Confirmation mode setup
+    let confirm_enabled = config::any_league_requires_confirmation();
+    let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::channel::<(FastExecutionRequest, Arc<MarketPair>)>(256);
+    let (tui_update_tx, tui_update_rx) = tokio::sync::mpsc::channel::<()>(16);
+    let (tui_action_tx, mut tui_action_rx) = tokio::sync::mpsc::channel::<ConfirmAction>(16);
+
+    let confirm_queue = Arc::new(ConfirmationQueue::new(state.clone(), tui_update_tx));
+    let tui_state = Arc::new(RwLock::new(TuiState::new()));
+
+    if confirm_enabled {
+        info!("   Confirmation mode: ENABLED (some leagues require manual approval)");
+    }
+
     // Create shutdown channel for WebSocket reconnection
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -910,6 +926,128 @@ async fn main() -> Result<()> {
         tokio::spawn(run_execution_loop(exec_rx, engine))
     };
 
+    // Confirmation handler task: receives arbs needing confirmation, manages queue and TUI
+    let confirm_exec_tx = exec_tx.clone();
+    let confirm_queue_clone = confirm_queue.clone();
+    let confirm_tui_state = tui_state.clone();
+    let _confirm_handle = if confirm_enabled {
+        Some(tokio::spawn(async move {
+            use chrono::Utc;
+
+            // Initialize logger for audit trail
+            let mut logger = match ConfirmationLogger::new() {
+                Ok(l) => {
+                    info!("[CONFIRM] Logging decisions to: {}", l.file_path().display());
+                    Some(l)
+                }
+                Err(e) => {
+                    warn!("[CONFIRM] Could not create logger: {} - decisions will not be persisted", e);
+                    None
+                }
+            };
+
+            // Option to hold tui_update_rx until we need to launch the TUI
+            let mut tui_update_rx_opt = Some(tui_update_rx);
+
+            loop {
+                tokio::select! {
+                    // Receive arbs needing confirmation
+                    Some((req, pair)) = confirm_rx.recv() => {
+                        // Push to confirmation queue
+                        confirm_queue_clone.push(req, pair.clone()).await;
+                        info!("[CONFIRM] Queued arb for {} ({} pending)", pair.description, confirm_queue_clone.len().await);
+
+                        // Launch TUI when first arb arrives (take ownership of tui_update_rx)
+                        if let Some(update_rx) = tui_update_rx_opt.take() {
+                            let tui_queue = confirm_queue_clone.clone();
+                            let tui_state_inner = confirm_tui_state.clone();
+                            let tui_action_tx_clone = tui_action_tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = confirm_tui::run_tui(
+                                    tui_queue,
+                                    tui_state_inner,
+                                    update_rx,
+                                    tui_action_tx_clone,
+                                ).await {
+                                    error!("[CONFIRM] TUI error: {}", e);
+                                }
+                            });
+                        }
+                    }
+
+                    // Process user actions from TUI
+                    Some(action) = tui_action_rx.recv() => {
+                        // Get the front arb
+                        if let Some(arb) = confirm_queue_clone.pop_front().await {
+                            let market_id = arb.request.market_id;
+                            let status = match &action {
+                                ConfirmAction::Proceed => {
+                                    // Validate arb is still profitable
+                                    if confirm_queue_clone.validate_arb(&arb) {
+                                        info!("[CONFIRM] ✅ Approved: {} - forwarding to execution", arb.pair.description);
+                                        let _ = confirm_exec_tx.try_send(arb.request.clone());
+                                        ConfirmationStatus::Accepted
+                                    } else {
+                                        warn!("[CONFIRM] ⚠️ Approved but EXPIRED: {} - prices moved", arb.pair.description);
+                                        ConfirmationStatus::AcceptedExpired
+                                    }
+                                }
+                                ConfirmAction::Reject { note } => {
+                                    info!("[CONFIRM] ❌ Rejected: {}{}", arb.pair.description,
+                                          note.as_ref().map(|n| format!(" ({})", n)).unwrap_or_default());
+                                    ConfirmationStatus::Rejected
+                                }
+                                ConfirmAction::Blacklist { note } => {
+                                    info!("[CONFIRM] 🚫 Blacklisted: {}{}", arb.pair.description,
+                                          note.as_ref().map(|n| format!(" ({})", n)).unwrap_or_default());
+                                    confirm_queue_clone.blacklist_market(market_id).await;
+                                    ConfirmationStatus::Blacklisted
+                                }
+                            };
+
+                            // Log the decision
+                            if let Some(ref mut log) = logger {
+                                let note = match &action {
+                                    ConfirmAction::Reject { note } | ConfirmAction::Blacklist { note } => note.clone(),
+                                    _ => None,
+                                };
+                                let record = ConfirmationRecord {
+                                    timestamp: Utc::now(),
+                                    status,
+                                    market_id,
+                                    pair_id: arb.pair.pair_id.to_string(),
+                                    description: arb.pair.description.to_string(),
+                                    league: arb.pair.league.to_string(),
+                                    arb_type: arb.request.arb_type,
+                                    yes_price_cents: arb.request.yes_price,
+                                    no_price_cents: arb.request.no_price,
+                                    profit_cents: arb.profit_cents(),
+                                    max_contracts: arb.max_contracts(),
+                                    detection_count: arb.detection_count,
+                                    kalshi_url: arb.kalshi_url.clone(),
+                                    poly_url: arb.poly_url.clone(),
+                                    note,
+                                };
+                                if let Err(e) = log.log(record) {
+                                    warn!("[CONFIRM] Failed to log decision: {}", e);
+                                }
+                            }
+                        }
+                    }
+
+                    else => break,
+                }
+            }
+        }))
+    } else {
+        // When confirm mode is disabled, drain confirm_rx and forward directly to execution
+        Some(tokio::spawn(async move {
+            while let Some((req, _pair)) = confirm_rx.recv().await {
+                let _ = confirm_exec_tx.try_send(req);
+            }
+        }))
+    };
+
     // === TEST MODE: Synthetic arbitrage injection ===
     // TEST_ARB=1 to enable, TEST_ARB_TYPE=poly_yes_kalshi_no|kalshi_yes_poly_no|poly_only|kalshi_only
     let test_arb = std::env::var("TEST_ARB").map(|v| v == "1" || v == "true").unwrap_or(false);
@@ -983,6 +1121,7 @@ async fn main() -> Result<()> {
     // Initialize Kalshi WebSocket connection (config reused on reconnects)
     let kalshi_state = state.clone();
     let kalshi_exec_tx = exec_tx.clone();
+    let kalshi_confirm_tx = confirm_tx.clone();
     let kalshi_threshold = threshold_cents;
     let kalshi_ws_config = KalshiConfig::from_env()?;
     let kalshi_shutdown_rx = shutdown_rx.clone();
@@ -994,6 +1133,7 @@ async fn main() -> Result<()> {
                 &kalshi_ws_config,
                 kalshi_state.clone(),
                 kalshi_exec_tx.clone(),
+                kalshi_confirm_tx.clone(),
                 kalshi_threshold,
                 shutdown_rx,
                 kalshi_clock.clone(),
@@ -1009,6 +1149,7 @@ async fn main() -> Result<()> {
     // Initialize Polymarket WebSocket connection
     let poly_state = state.clone();
     let poly_exec_tx = exec_tx.clone();
+    let poly_confirm_tx = confirm_tx.clone();
     let poly_threshold = threshold_cents;
     let poly_shutdown_rx = shutdown_rx.clone();
     let poly_clock = clock.clone();
@@ -1018,6 +1159,7 @@ async fn main() -> Result<()> {
             if let Err(e) = polymarket::run_ws(
                 poly_state.clone(),
                 poly_exec_tx.clone(),
+                poly_confirm_tx.clone(),
                 poly_threshold,
                 shutdown_rx,
                 poly_clock.clone(),
