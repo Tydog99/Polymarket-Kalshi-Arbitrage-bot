@@ -109,23 +109,23 @@ impl ConfirmationQueue {
     pub async fn push(&self, request: FastExecutionRequest, pair: Arc<MarketPair>) {
         let market_id = request.market_id;
 
-        // Check blacklist
-        {
-            let blacklist = self.blacklist.read().await;
-            if let Some(entry) = blacklist.get(&market_id) {
-                if entry.expires > Instant::now() {
-                    return; // Still blacklisted
-                }
-            }
-        }
-
-        // Clean expired blacklist entries periodically
+        // Check blacklist and clean expired entries in one lock acquisition
         {
             let mut blacklist = self.blacklist.write().await;
             let now = Instant::now();
+
+            // Check if this market is blacklisted
+            if let Some(entry) = blacklist.get(&market_id) {
+                if entry.expires > now {
+                    return; // Still blacklisted
+                }
+            }
+
+            // Clean expired entries while we have the lock
             blacklist.retain(|_, v| v.expires > now);
         }
 
+        // Acquire pending and order locks in consistent order
         let mut pending = self.pending.write().await;
         let mut order = self.order.write().await;
 
