@@ -199,15 +199,27 @@ async fn discovery_refresh_task(
     shutdown_tx: watch::Sender<bool>,
     interval_mins: u64,
     leagues: Vec<String>,
+    tui_state: Arc<tokio::sync::RwLock<crate::confirm_tui::TuiState>>,
+    log_tx: tokio::sync::mpsc::Sender<String>,
 ) {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // Helper to check TUI state and route logs appropriately
+    let log_line = |msg: String, tui_active: bool| {
+        if tui_active {
+            let _ = log_tx.try_send(msg);
+        } else {
+            info!("{}", msg);
+        }
+    };
+
+    let tui_active = tui_state.read().await.active;
     if interval_mins == 0 {
-        info!("[DISCOVERY] Runtime discovery disabled (DISCOVERY_INTERVAL_MINS=0)");
+        log_line("[DISCOVERY] Runtime discovery disabled (DISCOVERY_INTERVAL_MINS=0)".to_string(), tui_active);
         return;
     }
 
-    info!("[DISCOVERY] Runtime discovery enabled (interval: {}m)", interval_mins);
+    log_line(format!("[DISCOVERY] Runtime discovery enabled (interval: {}m)", interval_mins), tui_active);
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_mins * 60));
     interval.tick().await; // Skip immediate first tick
@@ -221,7 +233,8 @@ async fn discovery_refresh_task(
     loop {
         interval.tick().await;
 
-        info!("[DISCOVERY] Running scheduled discovery...");
+        let tui_active = tui_state.read().await.active;
+        log_line("[DISCOVERY] Running scheduled discovery...".to_string(), tui_active);
 
         // Build set of known tickers
         let known_tickers: HashSet<String> = state.markets.iter()
@@ -243,20 +256,21 @@ async fn discovery_refresh_task(
             .as_secs();
 
         // Log errors but continue
+        let tui_active = tui_state.read().await.active;
         for err in &result.errors {
-            warn!("[DISCOVERY] {}", err);
+            log_line(format!("[DISCOVERY] {}", err), tui_active);
         }
 
         if result.pairs.is_empty() {
-            info!("[DISCOVERY] No new markets found");
+            log_line("[DISCOVERY] No new markets found".to_string(), tui_active);
             continue;
         }
 
         // Log new markets with highlighted formatting
-        info!("[DISCOVERY] NEW MARKETS DISCOVERED: {}", result.pairs.len());
+        log_line(format!("[DISCOVERY] NEW MARKETS DISCOVERED: {}", result.pairs.len()), tui_active);
         for pair in &result.pairs {
-            info!("[DISCOVERY]   -> {} | {} | {}",
-                pair.league, pair.description, pair.kalshi_market_ticker);
+            log_line(format!("[DISCOVERY]   -> {} | {} | {}",
+                pair.league, pair.description, pair.kalshi_market_ticker), tui_active);
         }
 
         // Add new pairs to global state (thread-safe via interior mutability)
@@ -264,17 +278,17 @@ async fn discovery_refresh_task(
         for pair in result.pairs {
             if let Some(market_id) = state.add_pair(pair) {
                 added_count += 1;
-                info!("[DISCOVERY] Added market_id {} to state", market_id);
+                log_line(format!("[DISCOVERY] Added market_id {} to state", market_id), tui_active);
             } else {
-                warn!("[DISCOVERY] Failed to add pair - state full (MAX_MARKETS reached)");
+                log_line("[DISCOVERY] Failed to add pair - state full (MAX_MARKETS reached)".to_string(), tui_active);
             }
         }
-        info!("[DISCOVERY] Added {} new markets to state (total: {})", added_count, state.market_count());
+        log_line(format!("[DISCOVERY] Added {} new markets to state (total: {})", added_count, state.market_count()), tui_active);
 
         // Signal WebSockets to reconnect with updated subscriptions
-        info!("[DISCOVERY] Signaling WebSocket reconnect for {} new markets...", added_count);
+        log_line(format!("[DISCOVERY] Signaling WebSocket reconnect for {} new markets...", added_count), tui_active);
         if shutdown_tx.send(true).is_err() {
-            warn!("[DISCOVERY] Failed to signal WebSocket reconnect - receivers dropped");
+            log_line("[DISCOVERY] Failed to signal WebSocket reconnect - receivers dropped".to_string(), tui_active);
         }
 
         // Give WebSockets time to shut down gracefully
@@ -282,7 +296,7 @@ async fn discovery_refresh_task(
 
         // Reset shutdown signal for next cycle
         if shutdown_tx.send(false).is_err() {
-            warn!("[DISCOVERY] Failed to reset shutdown signal - receivers dropped");
+            log_line("[DISCOVERY] Failed to reset shutdown signal - receivers dropped".to_string(), tui_active);
         }
     }
 }
@@ -1698,6 +1712,8 @@ async fn main() -> Result<()> {
     let discovery_client = Arc::new(discovery);
     let discovery_state = state.clone();
     let refresh_leagues = leagues_owned.clone();
+    let discovery_tui_state = tui_state.clone();
+    let discovery_log_tx = tui_log_tx.clone();
     let discovery_handle = tokio::spawn(async move {
         discovery_refresh_task(
             discovery_client,
@@ -1705,6 +1721,8 @@ async fn main() -> Result<()> {
             shutdown_tx,
             discovery_interval,
             refresh_leagues,
+            discovery_tui_state,
+            discovery_log_tx,
         ).await;
     });
 
