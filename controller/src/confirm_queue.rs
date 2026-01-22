@@ -7,8 +7,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
+use crate::arb::{kalshi_fee, ArbConfig, ArbOpportunity};
 use crate::config::{build_polymarket_url, KALSHI_WEB_BASE};
-use crate::types::{ArbType, FastExecutionRequest, GlobalState, MarketPair, PriceCents, kalshi_fee_cents};
+use crate::types::{ArbType, FastExecutionRequest, GlobalState, MarketPair};
 
 /// A pending arbitrage opportunity awaiting confirmation
 #[derive(Debug, Clone)]
@@ -19,10 +20,6 @@ pub struct PendingArb {
     pub pair: Arc<MarketPair>,
     /// Number of times this arb has been detected while pending
     pub detection_count: u32,
-    /// First detection timestamp
-    pub first_detected: Instant,
-    /// Most recent detection timestamp
-    pub last_detected: Instant,
     /// Kalshi market URL
     pub kalshi_url: String,
     /// Polymarket event URL
@@ -33,14 +30,11 @@ impl PendingArb {
     pub fn new(request: FastExecutionRequest, pair: Arc<MarketPair>) -> Self {
         let kalshi_url = format!("{}/{}", KALSHI_WEB_BASE, pair.kalshi_market_ticker);
         let poly_url = build_polymarket_url(&pair.league, &pair.poly_slug);
-        let now = Instant::now();
 
         Self {
             request,
             pair,
             detection_count: 1,
-            first_detected: now,
-            last_detected: now,
             kalshi_url,
             poly_url,
         }
@@ -50,7 +44,6 @@ impl PendingArb {
     pub fn update(&mut self, request: FastExecutionRequest) {
         self.request = request;
         self.detection_count += 1;
-        self.last_detected = Instant::now();
     }
 
     /// Calculate profit in cents based on current request prices
@@ -114,6 +107,7 @@ impl ConfirmationQueue {
 
     /// Push a new arb opportunity (or update existing for same market).
     /// Returns `true` if this was a new entry, `false` if updating existing or blacklisted.
+    /// Note: Size validation is done upstream in ArbOpportunity::new()
     pub async fn push(&self, request: FastExecutionRequest, pair: Arc<MarketPair>) -> bool {
         let market_id = request.market_id;
 
@@ -195,20 +189,6 @@ impl ConfirmationQueue {
         });
     }
 
-    /// Remove a market from pending (e.g., when prices invalidate it)
-    pub async fn remove(&self, market_id: u16) -> Option<PendingArb> {
-        let mut pending = self.pending.write().await;
-        let mut order = self.order.write().await;
-
-        order.retain(|id| *id != market_id);
-        pending.remove(&market_id)
-    }
-
-    /// Check if arb is still valid (prices haven't moved)
-    pub fn validate_arb(&self, arb: &PendingArb) -> bool {
-        self.validate_arb_detailed(arb).map(|r| r.is_valid).unwrap_or(false)
-    }
-
     /// Check if arb is still valid with detailed cost info
     pub fn validate_arb_detailed(&self, arb: &PendingArb) -> Option<ValidationResult> {
         // Test arbs use synthetic prices, skip validation
@@ -228,26 +208,26 @@ impl ConfirmationQueue {
 
         // Calculate original cost (from when arb was queued)
         let original_cost = arb.request.yes_price + arb.request.no_price + match arb.request.arb_type {
-            ArbType::PolyYesKalshiNo => kalshi_fee_cents(arb.request.no_price),
-            ArbType::KalshiYesPolyNo => kalshi_fee_cents(arb.request.yes_price),
+            ArbType::PolyYesKalshiNo => kalshi_fee(arb.request.no_price),
+            ArbType::KalshiYesPolyNo => kalshi_fee(arb.request.yes_price),
             ArbType::PolyOnly => 0,
-            ArbType::KalshiOnly => kalshi_fee_cents(arb.request.yes_price) + kalshi_fee_cents(arb.request.no_price),
+            ArbType::KalshiOnly => kalshi_fee(arb.request.yes_price) + kalshi_fee(arb.request.no_price),
         };
 
         // Calculate current cost based on arb type
         let current_cost = match arb.request.arb_type {
             ArbType::PolyYesKalshiNo => {
-                let fee = kalshi_fee_cents(k_no);
+                let fee = kalshi_fee(k_no);
                 p_yes + k_no + fee
             }
             ArbType::KalshiYesPolyNo => {
-                let fee = kalshi_fee_cents(k_yes);
+                let fee = kalshi_fee(k_yes);
                 k_yes + fee + p_no
             }
             ArbType::PolyOnly => p_yes + p_no,
             ArbType::KalshiOnly => {
-                let fee_yes = kalshi_fee_cents(k_yes);
-                let fee_no = kalshi_fee_cents(k_no);
+                let fee_yes = kalshi_fee(k_yes);
+                let fee_no = kalshi_fee(k_no);
                 k_yes + fee_yes + k_no + fee_no
             }
         };
@@ -259,11 +239,33 @@ impl ConfirmationQueue {
         })
     }
 
-    /// Get current prices for an arb (for live display updates)
-    pub fn get_current_prices(&self, market_id: u16) -> Option<(PriceCents, PriceCents, PriceCents, PriceCents)> {
-        let market = self.state.get_by_id(market_id)?;
-        let (k_yes, k_no, _, _) = market.kalshi.load();
-        let (p_yes, p_no, _, _) = market.poly.load();
-        Some((k_yes, k_no, p_yes, p_no))
+    /// Re-validate arb using ArbOpportunity with current orderbook prices.
+    /// Returns Some(ArbOpportunity) if a valid arb still exists, None otherwise.
+    pub fn validate_arb(&self, arb: &PendingArb, config: &ArbConfig) -> Option<ArbOpportunity> {
+        // Test arbs always pass validation
+        if arb.request.is_test {
+            return Some(ArbOpportunity::new(
+                arb.request.market_id,
+                (arb.request.yes_price, arb.request.no_price, arb.request.yes_size, arb.request.no_size),
+                (arb.request.yes_price, arb.request.no_price, arb.request.yes_size, arb.request.no_size),
+                config,
+                0,
+            ));
+        }
+
+        let market = self.state.get_by_id(arb.request.market_id)?;
+
+        // Get current prices from orderbook
+        let kalshi = market.kalshi.load();
+        let poly = market.poly.load();
+
+        // Use ArbOpportunity to re-validate with current prices
+        let opp = ArbOpportunity::new(arb.request.market_id, kalshi, poly, config, 0);
+
+        if opp.is_valid() {
+            Some(opp)
+        } else {
+            None
+        }
     }
 }
