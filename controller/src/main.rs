@@ -204,10 +204,10 @@ async fn discovery_refresh_task(
 ) {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    // Helper to check TUI state and route logs appropriately
+    // Helper to route log output based on TUI state
     let log_line = |msg: String, tui_active: bool| {
         if tui_active {
-            let _ = log_tx.try_send(msg);
+            let _ = log_tx.try_send(format!("[{}]  INFO {}", chrono::Local::now().format("%H:%M:%S"), msg));
         } else {
             info!("{}", msg);
         }
@@ -1015,9 +1015,13 @@ async fn main() -> Result<()> {
                                     // Validate arb is still profitable
                                     match confirm_queue_clone.validate_arb_detailed(&arb) {
                                         Some(result) if result.is_valid => {
-                                            log_msg(format!("[{}]  INFO [CONFIRM] ✅ Approved: {} - forwarding to execution",
-                                                chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
-                                            let _ = confirm_exec_tx.try_send(arb.request.clone());
+                                            if let Err(e) = confirm_exec_tx.try_send(arb.request.clone()) {
+                                                log_msg(format!("[{}] ERROR [CONFIRM] ❌ FAILED to forward approved arb to execution: {} - {}",
+                                                    chrono::Local::now().format("%H:%M:%S"), arb.pair.description, e));
+                                            } else {
+                                                log_msg(format!("[{}]  INFO [CONFIRM] ✅ Approved: {} - forwarding to execution",
+                                                    chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
+                                            }
                                             ConfirmationStatus::Accepted
                                         }
                                         Some(result) => {
@@ -1093,8 +1097,10 @@ async fn main() -> Result<()> {
     } else {
         // When confirm mode is disabled, drain confirm_rx and forward directly to execution
         Some(tokio::spawn(async move {
-            while let Some((req, _pair)) = confirm_rx.recv().await {
-                let _ = confirm_exec_tx.try_send(req);
+            while let Some((req, pair)) = confirm_rx.recv().await {
+                if let Err(e) = confirm_exec_tx.try_send(req) {
+                    warn!("[CONFIRM] Failed to forward arb to execution: {} - {}", pair.description, e);
+                }
             }
         }))
     };
@@ -1273,7 +1279,7 @@ async fn main() -> Result<()> {
         // Helper closure to route log output based on TUI state
         let log_line = |line: String, tui_active: bool| {
             if tui_active {
-                let _ = sweep_log_tx.try_send(line);
+                let _ = sweep_log_tx.try_send(format!("[{}]  INFO {}", chrono::Local::now().format("%H:%M:%S"), line));
             } else {
                 info!("{}", line);
             }
@@ -1331,7 +1337,8 @@ async fn main() -> Result<()> {
                 };
 
                 if let Err(e) = sweep_exec_tx.try_send(req) {
-                    warn!("[SWEEP] Failed to send arb request: {}", e);
+                    let tui_active = sweep_tui_state.read().await.active;
+                    log_line(format!("[SWEEP] Failed to send arb request: {}", e), tui_active);
                 }
             }
         }
@@ -1366,10 +1373,10 @@ async fn main() -> Result<()> {
             // Check TUI state once per iteration for efficient log routing
             let tui_active = heartbeat_tui_state.read().await.active;
 
-            // Helper closure to route log output
+            // Helper closure to route log output based on TUI state
             let log_line = |line: String| {
                 if tui_active {
-                    let _ = heartbeat_log_tx.try_send(line);
+                    let _ = heartbeat_log_tx.try_send(format!("[{}]  INFO {}", chrono::Local::now().format("%H:%M:%S"), line));
                 } else {
                     println!("{}", line);
                 }

@@ -1023,12 +1023,13 @@ pub async fn run_execution_loop(
                 }
             };
             let log_error = |msg: String| {
+                // Always log errors to tracing for persistence/Sentry
+                error!("{}", msg);
+                // Also send to TUI if active
                 if tui_active {
                     if let Some(ref tx) = log_tx_clone {
                         let _ = tx.try_send(format!("[{}] ERROR {}", chrono::Local::now().format("%H:%M:%S"), msg));
                     }
-                } else {
-                    error!("{}", msg);
                 }
             };
 

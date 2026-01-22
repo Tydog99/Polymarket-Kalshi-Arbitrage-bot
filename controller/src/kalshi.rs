@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{connect_async, tungstenite::{http::Request, Message}};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{self, KALSHI_WS_URL, KALSHI_API_BASE, KALSHI_API_DELAY_MS};
 use crate::execution::NanoClock;
@@ -479,7 +479,7 @@ pub async fn run_ws(
         if tui_active {
             let _ = log_tx.try_send(format!("[{}]  WARN {}", chrono::Local::now().format("%H:%M:%S"), msg));
         } else {
-            tracing::warn!("{}", msg);
+            warn!("{}", msg);
         }
     };
     let log_error = |msg: &str, tui_active: bool| {
