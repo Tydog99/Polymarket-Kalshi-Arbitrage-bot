@@ -738,6 +738,7 @@ async fn send_kalshi_arb_request(
         no_size,
         arb_type,
         detected_ns: clock.now_ns(),
+        is_test: false,
     };
 
     // Get the market pair to determine routing

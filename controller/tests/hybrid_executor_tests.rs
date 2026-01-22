@@ -65,6 +65,7 @@ fn make_arb_request(arb_type: ArbType) -> FastExecutionRequest {
         no_size: 1000,
         arb_type,
         detected_ns: 0,
+        is_test: false,
     }
 }
 
@@ -97,6 +98,7 @@ async fn test_hybrid_executor_local_kalshi_drops_poly_arb() {
         None, // No Kalshi API client (but we're in dry_run mode)
         None, // No Poly client
         true, // dry_run
+        None, // No TUI log channel
     );
 
     // Try to execute a cross-platform arb (Poly YES + Kalshi NO)
@@ -136,6 +138,7 @@ async fn test_hybrid_executor_local_poly_drops_kalshi_arb() {
         None,
         None,
         true,
+        None,
     );
 
     // Try to execute a cross-platform arb
@@ -165,6 +168,7 @@ async fn test_hybrid_executor_no_local_no_remote_drops_all() {
         None,
         None,
         true,
+        None,
     );
 
     // All arb types should be dropped
@@ -210,6 +214,7 @@ async fn test_hybrid_executor_routes_to_remote_when_available() {
         None,
         None,
         true,
+        None,
     );
 
     let req = make_arb_request(ArbType::PolyYesKalshiNo);
@@ -268,6 +273,7 @@ async fn test_hybrid_executor_drops_arb_when_missing_remote_trader() {
         None,
         None,
         true,
+        None,
     );
 
     // Cross-platform arb should be dropped (no Poly trader)
@@ -310,6 +316,7 @@ async fn test_hybrid_executor_local_kalshi_remote_poly() {
         None, // No actual Kalshi client (dry_run will handle it)
         None,
         true, // dry_run
+        None, // No TUI log channel
     );
 
     let req = make_arb_request(ArbType::PolyYesKalshiNo);
@@ -354,6 +361,7 @@ async fn test_hybrid_executor_local_poly_remote_kalshi() {
         None,
         None,
         true,
+        None,
     );
 
     let req = make_arb_request(ArbType::PolyYesKalshiNo);
@@ -395,6 +403,7 @@ async fn test_hybrid_executor_poly_only_arb() {
         None,
         None,
         true,
+        None,
     );
 
     let req = make_arb_request(ArbType::PolyOnly);
@@ -439,6 +448,7 @@ async fn test_hybrid_executor_kalshi_only_arb() {
         None,
         None,
         true,
+        None,
     );
 
     let req = make_arb_request(ArbType::KalshiOnly);
@@ -488,6 +498,7 @@ async fn test_hybrid_executor_drops_zero_profit_arb() {
         None,
         None,
         true,
+        None,
     );
 
     // Prices sum to more than $1 (no profit)
@@ -499,6 +510,7 @@ async fn test_hybrid_executor_drops_zero_profit_arb() {
         no_size: 1000,
         arb_type: ArbType::PolyYesKalshiNo,
         detected_ns: 0,
+        is_test: false,
     };
 
     exec.process(req).await.unwrap();
@@ -531,6 +543,7 @@ async fn test_hybrid_executor_drops_insufficient_size_arb() {
         None,
         None,
         true,
+        None,
     );
 
     // Size too small for even 1 contract (need >= 100 cents)
@@ -542,6 +555,7 @@ async fn test_hybrid_executor_drops_insufficient_size_arb() {
         no_size: 50,
         arb_type: ArbType::PolyYesKalshiNo,
         detected_ns: 0,
+        is_test: false,
     };
 
     exec.process(req).await.unwrap();
@@ -578,6 +592,7 @@ async fn test_hybrid_executor_deduplication() {
         None,
         None,
         true,
+        None,
     ));
 
     let req = make_arb_request(ArbType::PolyYesKalshiNo);

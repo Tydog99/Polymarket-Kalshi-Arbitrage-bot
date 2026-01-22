@@ -625,6 +625,7 @@ mod infra_integration_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         assert_eq!(req.profit_cents(), 8, "Profit should be 8¢");
@@ -642,6 +643,7 @@ mod infra_integration_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         assert!(req.profit_cents() < 0, "Should calculate negative profit");
@@ -762,6 +764,7 @@ mod infra_integration_tests {
             no_size: k_no_sz,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         // 5. Verify request is valid
@@ -803,6 +806,7 @@ mod execution_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         // 50 + 50 + 2 (fee) = 102 > 100 → negative profit
@@ -1360,6 +1364,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         let result = MockExecutionResult {
@@ -1410,6 +1415,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         let result = MockExecutionResult {
@@ -1451,6 +1457,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::KalshiYesPolyNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         let result = MockExecutionResult {
@@ -1491,6 +1498,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         let result = MockExecutionResult {
@@ -1525,6 +1533,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         // Kalshi only fills 7 out of 10
@@ -1567,6 +1576,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         // Poly only fills 6 out of 10
@@ -1602,6 +1612,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         // Kalshi fills 0, Poly fills 10 (complete failure on one side)
@@ -1644,6 +1655,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         // Kalshi fills 10, Poly fills 0
@@ -1678,6 +1690,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         let result = MockExecutionResult {
@@ -1716,6 +1729,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         // Partial fill: Kalshi 7, Poly 10
@@ -1755,6 +1769,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         // First execution: 10 contracts
@@ -1813,6 +1828,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         // Execute multiple times
@@ -1856,6 +1872,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::PolyOnly,
             detected_ns: 0,
+            is_test: false,
         };
 
         // For PolyOnly, both fills are from Polymarket
@@ -1892,6 +1909,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::KalshiOnly,
             detected_ns: 0,
+            is_test: false,
         };
 
         // Double fee: kalshi_fee(44) + kalshi_fee(44)
@@ -1917,6 +1935,7 @@ mod process_mock_tests {
                     no_size: 1000,
                     arb_type: ArbType::PolyOnly,
                     detected_ns: 0,
+                    is_test: false,
                 };
                 assert_eq!(req.estimated_fee_cents(), 0,
                     "PolyOnly should always have 0 fees, got {} for prices ({}, {})",
@@ -1940,6 +1959,7 @@ mod process_mock_tests {
                     no_size: 1000,
                     arb_type: ArbType::KalshiOnly,
                     detected_ns: 0,
+                    is_test: false,
                 };
                 let expected = kalshi_fee_cents(yes_price) + kalshi_fee_cents(no_price);
                 assert_eq!(req.estimated_fee_cents(), expected,
@@ -1963,6 +1983,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
         assert_eq!(req1.estimated_fee_cents(), kalshi_fee_cents(50),
             "PolyYesKalshiNo fee should be on NO side (50¢)");
@@ -1976,6 +1997,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::KalshiYesPolyNo,
             detected_ns: 0,
+            is_test: false,
         };
         assert_eq!(req2.estimated_fee_cents(), kalshi_fee_cents(40),
             "KalshiYesPolyNo fee should be on YES side (40¢)");
@@ -1999,6 +2021,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::PolyOnly,
             detected_ns: 0,
+            is_test: false,
         };
 
         // KalshiOnly: double fees → less profit
@@ -2010,6 +2033,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::KalshiOnly,
             detected_ns: 0,
+            is_test: false,
         };
 
         // Cross-platform: single fee
@@ -2021,6 +2045,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         let cross2 = FastExecutionRequest {
@@ -2031,6 +2056,7 @@ mod process_mock_tests {
             no_size: 1000,
             arb_type: ArbType::KalshiYesPolyNo,
             detected_ns: 0,
+            is_test: false,
         };
 
         // PolyOnly should always be most profitable (no fees)
@@ -2160,6 +2186,7 @@ mod startup_sweep_tests {
                     no_size,
                     arb_type,
                     detected_ns: 0,
+                    is_test: false,
                 };
 
                 tx.try_send(req).unwrap();

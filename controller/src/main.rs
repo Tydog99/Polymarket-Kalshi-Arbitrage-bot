@@ -875,6 +875,7 @@ async fn main() -> Result<()> {
             trading_kalshi,
             trading_poly,
             dry_run,
+            Some(tui_log_tx.clone()),
         ));
         tokio::spawn(run_hybrid_execution_loop(exec_rx, hybrid_exec))
     } else {
@@ -912,43 +913,69 @@ async fn main() -> Result<()> {
             };
 
             // Options to hold channels until we need to launch the TUI
+            // These get returned by TUI on exit for reuse
             let mut tui_update_rx_opt = Some(tui_update_rx);
             let mut tui_log_rx_opt = Some(tui_log_rx);
+
+            // Channel to receive TUI receivers back when TUI exits
+            let (tui_done_tx, mut tui_done_rx) = tokio::sync::mpsc::channel::<confirm_tui::TuiReceivers>(1);
 
             loop {
                 tokio::select! {
                     // Receive arbs needing confirmation
                     Some((req, pair)) = confirm_rx.recv() => {
-                        // Push to confirmation queue
-                        confirm_queue_clone.push(req, pair.clone()).await;
-                        let pending_count = confirm_queue_clone.len().await;
+                        // Push to confirmation queue (returns true only for new entries)
+                        let is_new = confirm_queue_clone.push(req, pair.clone()).await;
                         let tui_active = confirm_tui_state.read().await.active;
-                        let msg = format!("[{}]  INFO [CONFIRM] Queued arb for {} ({} pending)",
-                            chrono::Local::now().format("%H:%M:%S"), pair.description, pending_count);
-                        if tui_active {
-                            let _ = confirm_log_tx.try_send(msg);
-                        } else {
-                            println!("{}", msg);
+
+                        // Only log when a new arb is queued (not updates to existing)
+                        if is_new {
+                            let pending_count = confirm_queue_clone.len().await;
+                            let msg = format!("[{}]  INFO [CONFIRM] Queued arb for {} ({} pending)",
+                                chrono::Local::now().format("%H:%M:%S"), pair.description, pending_count);
+                            if tui_active {
+                                let _ = confirm_log_tx.try_send(msg);
+                            } else {
+                                println!("{}", msg);
+                            }
                         }
 
-                        // Launch TUI when first arb arrives (take ownership of channels)
-                        if let Some(update_rx) = tui_update_rx_opt.take() {
+                        // Launch TUI when not active and we have receivers available
+                        if !tui_active && tui_update_rx_opt.is_some() {
+                            let update_rx = tui_update_rx_opt.take().unwrap();
                             let log_rx = tui_log_rx_opt.take().expect("log_rx should exist");
                             let tui_queue = confirm_queue_clone.clone();
                             let tui_state_inner = confirm_tui_state.clone();
                             let tui_action_tx_clone = tui_action_tx.clone();
+                            let done_tx = tui_done_tx.clone();
+
+                            // Set TUI active BEFORE spawning to prevent race with heartbeat output
+                            confirm_tui_state.write().await.active = true;
+
                             tokio::spawn(async move {
-                                if let Err(e) = confirm_tui::run_tui(
+                                match confirm_tui::run_tui(
                                     tui_queue,
                                     tui_state_inner,
                                     update_rx,
                                     tui_action_tx_clone,
                                     log_rx,
                                 ).await {
-                                    error!("[CONFIRM] TUI error: {}", e);
+                                    Ok(receivers) => {
+                                        // Return receivers for reuse
+                                        let _ = done_tx.send(receivers).await;
+                                    }
+                                    Err(e) => {
+                                        error!("[CONFIRM] TUI error: {}", e);
+                                    }
                                 }
                             });
                         }
+                    }
+
+                    // TUI exited - reclaim receivers for next launch
+                    Some(receivers) = tui_done_rx.recv() => {
+                        tui_update_rx_opt = Some(receivers.update_rx);
+                        tui_log_rx_opt = Some(receivers.log_rx);
                     }
 
                     // Process user actions from TUI
@@ -970,15 +997,31 @@ async fn main() -> Result<()> {
                             let status = match &action {
                                 ConfirmAction::Proceed => {
                                     // Validate arb is still profitable
-                                    if confirm_queue_clone.validate_arb(&arb) {
-                                        log_msg(format!("[{}]  INFO [CONFIRM] ✅ Approved: {} - forwarding to execution",
-                                            chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
-                                        let _ = confirm_exec_tx.try_send(arb.request.clone());
-                                        ConfirmationStatus::Accepted
-                                    } else {
-                                        log_msg(format!("[{}]  WARN [CONFIRM] ⚠️ Approved but EXPIRED: {} - prices moved",
-                                            chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
-                                        ConfirmationStatus::AcceptedExpired
+                                    match confirm_queue_clone.validate_arb_detailed(&arb) {
+                                        Some(result) if result.is_valid => {
+                                            log_msg(format!("[{}]  INFO [CONFIRM] ✅ Approved: {} - forwarding to execution",
+                                                chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
+                                            let _ = confirm_exec_tx.try_send(arb.request.clone());
+                                            ConfirmationStatus::Accepted
+                                        }
+                                        Some(result) => {
+                                            // Expired - show how much prices moved
+                                            let cost_change = result.current_cost as i32 - result.original_cost as i32;
+                                            log_msg(format!(
+                                                "[{}]  WARN [CONFIRM] ⚠️ Approved but EXPIRED: {} - cost {}c → {}c ({:+}c)",
+                                                chrono::Local::now().format("%H:%M:%S"),
+                                                arb.pair.description,
+                                                result.original_cost,
+                                                result.current_cost,
+                                                cost_change
+                                            ));
+                                            ConfirmationStatus::AcceptedExpired
+                                        }
+                                        None => {
+                                            log_msg(format!("[{}]  WARN [CONFIRM] ⚠️ Approved but EXPIRED: {} - market not found",
+                                                chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
+                                            ConfirmationStatus::AcceptedExpired
+                                        }
                                     }
                                 }
                                 ConfirmAction::Reject { note } => {
@@ -1052,12 +1095,18 @@ async fn main() -> Result<()> {
         // Parse arb type from environment (default: poly_yes_kalshi_no)
         let arb_type_str = std::env::var("TEST_ARB_TYPE").unwrap_or_else(|_| "poly_yes_kalshi_no".to_string());
 
+        // Parse delay from environment (default: 10 seconds)
+        let test_arb_delay: u64 = std::env::var("TEST_ARB_DELAY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
         tokio::spawn(async move {
             use types::{FastExecutionRequest, ArbType};
 
             // Wait for WebSocket connections to establish and populate orderbooks
-            info!("[TEST] Injecting synthetic arbitrage opportunity in 10 seconds...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            info!("[TEST] Injecting synthetic arbitrage opportunity in {} seconds...", test_arb_delay);
+            tokio::time::sleep(tokio::time::Duration::from_secs(test_arb_delay)).await;
 
             // Parse arb type
             let arb_type = match arb_type_str.to_lowercase().as_str() {
@@ -1094,6 +1143,7 @@ async fn main() -> Result<()> {
                             no_size: 1000,   // 1000¢ = 10 contracts
                             arb_type,
                             detected_ns: 0,
+                            is_test: true,
                         };
 
                         warn!("[TEST] 🧪 Injecting synthetic {:?} arbitrage for: {}", arb_type, pair.description);
@@ -1229,6 +1279,7 @@ async fn main() -> Result<()> {
                     no_size,
                     arb_type,
                     detected_ns: sweep_clock.now_ns(),
+                    is_test: false,
                 };
 
                 if let Err(e) = sweep_exec_tx.try_send(req) {
@@ -1293,6 +1344,8 @@ async fn main() -> Result<()> {
                 p_yes: u16,
                 p_no: u16,
                 gap: i16,
+                yes_size: u16,  // Size of YES leg for best arb
+                no_size: u16,   // Size of NO leg for best arb
                 k_updates: u32,
                 p_updates: u32,
                 k_last_ms: u64,
@@ -1331,16 +1384,22 @@ async fn main() -> Result<()> {
 
                     // For verbose mode, collect ALL discovered markets (not just those with both prices)
                     if verbose {
-                        // Calculate gap only if both platforms have prices
-                        let gap = if has_k && has_p {
+                        // Calculate gap and sizes only if both platforms have prices
+                        let (gap, yes_size, no_size) = if has_k && has_p {
                             let fee1 = kalshi_fee_cents(k_no);
                             let cost1 = p_yes + k_no + fee1;
                             let fee2 = kalshi_fee_cents(k_yes);
                             let cost2 = k_yes + fee2 + p_no;
-                            let best_cost = cost1.min(cost2);
-                            best_cost as i16 - heartbeat_threshold as i16
+                            // Determine which arb type is better and use those sizes
+                            if cost1 <= cost2 {
+                                // PolyYesKalshiNo: YES from Poly, NO from Kalshi
+                                (cost1 as i16 - heartbeat_threshold as i16, p_yes_size, k_no_size)
+                            } else {
+                                // KalshiYesPolyNo: YES from Kalshi, NO from Poly
+                                (cost2 as i16 - heartbeat_threshold as i16, k_yes_size, p_no_size)
+                            }
                         } else {
-                            i16::MAX // Sentinel value indicating no gap calculable
+                            (i16::MAX, 0, 0) // Sentinel value indicating no gap calculable
                         };
 
                         market_details.push(MarketDetail {
@@ -1352,6 +1411,8 @@ async fn main() -> Result<()> {
                             p_yes,
                             p_no,
                             gap,
+                            yes_size,
+                            no_size,
                             k_updates: k_upd,
                             p_updates: p_upd,
                             k_last_ms,
@@ -1481,16 +1542,25 @@ async fn main() -> Result<()> {
                                     format!("\x1b[31m{:+}¢\x1b[0m", m.gap) // Red for no arb
                                 };
 
+                                // Format size in dollars (cents / 100)
+                                let size_str = if m.yes_size > 0 || m.no_size > 0 {
+                                    let yes_dollars = m.yes_size as f64 / 100.0;
+                                    let no_dollars = m.no_size as f64 / 100.0;
+                                    format!("${:.0}/${:.0}", yes_dollars, no_dollars)
+                                } else {
+                                    "--/--".to_string()
+                                };
+
                                 let k_time = fmt_unix_ms_hhmmss(m.k_last_ms);
                                 let p_time = fmt_unix_ms_hhmmss(m.p_last_ms);
                                 let k_age = fmt_age(now_ms, m.k_last_ms);
                                 let p_age = fmt_age(now_ms, m.p_last_ms);
 
                                 log_line(format!(
-                                    "{}  {}── {:<55} K:{} P:{} gap:{}    upd:K{}/P{} last:K{}({}) P{}({})",
+                                    "{}  {}── {:<55} K:{} P:{} gap:{} size:{}    upd:K{}/P{} last:K{}({}) P{}({})",
                                          prefix, item_branch, desc,
                                          k_str, p_str,
-                                         gap_str, m.k_updates, m.p_updates,
+                                         gap_str, size_str, m.k_updates, m.p_updates,
                                          k_time, k_age, p_time, p_age
                                 ));
                             }
