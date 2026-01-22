@@ -357,6 +357,60 @@ impl FastExecutionRequest {
             ArbType::KalshiOnly => kalshi_fee(self.yes_price) + kalshi_fee(self.no_price),
         }
     }
+
+    /// Detect arbitrage opportunity from orderbook data.
+    /// Returns Some if a valid arb exists, None otherwise.
+    ///
+    /// This is the single source of truth for arb detection logic.
+    pub fn detect(
+        market_id: u16,
+        kalshi: (PriceCents, PriceCents, SizeCents, SizeCents),
+        poly: (PriceCents, PriceCents, SizeCents, SizeCents),
+        config: &ArbConfig,
+        detected_ns: u64,
+    ) -> Option<Self> {
+        let (k_yes, k_no, k_yes_size, k_no_size) = kalshi;
+        let (p_yes, p_no, p_yes_size, p_no_size) = poly;
+
+        // Check for invalid prices (0 = no price available)
+        if k_yes == 0 || k_no == 0 || p_yes == 0 || p_no == 0 {
+            return None;
+        }
+
+        // Calculate Kalshi fees
+        let k_yes_fee = kalshi_fee(k_yes);
+        let k_no_fee = kalshi_fee(k_no);
+
+        // Arb candidates in priority order
+        let candidates = [
+            (ArbType::PolyYesKalshiNo, p_yes + k_no + k_no_fee, p_yes, k_no, p_yes_size, k_no_size),
+            (ArbType::KalshiYesPolyNo, k_yes + k_yes_fee + p_no, k_yes, p_no, k_yes_size, p_no_size),
+            (ArbType::PolyOnly, p_yes + p_no, p_yes, p_no, p_yes_size, p_no_size),
+            (ArbType::KalshiOnly, k_yes + k_yes_fee + k_no + k_no_fee, k_yes, k_no, k_yes_size, k_no_size),
+        ];
+
+        // Find first valid arb (lowest cost that beats threshold)
+        for (arb_type, cost, yes_price, no_price, yes_size, no_size) in candidates {
+            if cost <= config.threshold_cents() {
+                let max_contracts = (yes_size.min(no_size) as f64) / 100.0;
+
+                if max_contracts >= config.min_contracts() {
+                    return Some(Self {
+                        market_id,
+                        arb_type,
+                        yes_price,
+                        no_price,
+                        yes_size,
+                        no_size,
+                        detected_ns,
+                        is_test: false,
+                    });
+                }
+            }
+        }
+
+        None
+    }
 }
 
 /// Global market state manager for all tracked markets across both platforms.
@@ -1146,6 +1200,247 @@ mod tests {
         // Verify arb_config() returns the custom values
         assert_eq!(state.arb_config().threshold_cents(), 95);
         assert_eq!(state.arb_config().min_contracts(), 5.0);
+    }
+
+    // =========================================================================
+    // FastExecutionRequest::detect() Tests
+    // =========================================================================
+
+    #[test]
+    fn test_detect_returns_none_when_prices_too_high() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // Prices sum to 100 cents = no profit
+        let result = FastExecutionRequest::detect(
+            1,                          // market_id
+            (50, 50, 1000, 1000),       // kalshi
+            (50, 50, 1000, 1000),       // poly
+            &config,
+            12345,
+        );
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_detect_finds_poly_yes_kalshi_no() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default(); // threshold = 99
+
+        // Poly YES @ 45 + Kalshi NO @ 52 = 97 cents (+ ~2c fee) = ~99 <= 99
+        let result = FastExecutionRequest::detect(
+            1,
+            (55, 52, 500, 500),        // kalshi
+            (45, 58, 500, 500),        // poly
+            &config,
+            12345,
+        );
+
+        let arb = result.expect("should detect arb");
+        assert_eq!(arb.arb_type, ArbType::PolyYesKalshiNo);
+        assert_eq!(arb.yes_price, 45);  // poly yes
+        assert_eq!(arb.no_price, 52);   // kalshi no
+    }
+
+    #[test]
+    fn test_detect_returns_none_when_size_insufficient() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // Great prices but no size on kalshi NO side
+        let result = FastExecutionRequest::detect(
+            1,
+            (55, 52, 500, 0),          // kalshi: no_size = 0
+            (45, 58, 500, 500),
+            &config,
+            12345,
+        );
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_detect_returns_none_when_any_price_is_zero() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // Kalshi yes price = 0 (no price available)
+        let result = FastExecutionRequest::detect(
+            1,
+            (0, 52, 500, 500),
+            (45, 58, 500, 500),
+            &config,
+            12345,
+        );
+
+        assert!(result.is_none(), "Should return None when kalshi yes price is 0");
+
+        // Poly no price = 0
+        let result2 = FastExecutionRequest::detect(
+            1,
+            (55, 52, 500, 500),
+            (45, 0, 500, 500),
+            &config,
+            12345,
+        );
+
+        assert!(result2.is_none(), "Should return None when poly no price is 0");
+    }
+
+    #[test]
+    fn test_detect_finds_kalshi_yes_poly_no() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // Kalshi YES @ 45 + Poly NO @ 52 = 97 + ~2c fee = ~99 <= 99
+        // Make Poly YES expensive so PolyYesKalshiNo doesn't win
+        let result = FastExecutionRequest::detect(
+            1,
+            (45, 60, 500, 500),        // kalshi: yes=45, no=60
+            (60, 52, 500, 500),        // poly: yes=60, no=52
+            &config,
+            12345,
+        );
+
+        let arb = result.expect("should detect arb");
+        assert_eq!(arb.arb_type, ArbType::KalshiYesPolyNo);
+        assert_eq!(arb.yes_price, 45);  // kalshi yes
+        assert_eq!(arb.no_price, 52);   // poly no
+    }
+
+    #[test]
+    fn test_detect_finds_poly_only() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // Make cross-platform arbs too expensive, but Poly YES + Poly NO = 88 (no fees)
+        let result = FastExecutionRequest::detect(
+            1,
+            (60, 60, 500, 500),        // kalshi: expensive
+            (40, 48, 500, 500),        // poly: 40 + 48 = 88 < 99
+            &config,
+            12345,
+        );
+
+        let arb = result.expect("should detect poly-only arb");
+        assert_eq!(arb.arb_type, ArbType::PolyOnly);
+        assert_eq!(arb.yes_price, 40);
+        assert_eq!(arb.no_price, 48);
+    }
+
+    #[test]
+    fn test_detect_finds_kalshi_only() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // Kalshi YES 40 + Kalshi NO 40 = 80 + ~4c fees = 84 < 99
+        // Make Poly expensive so cross-platform and poly-only don't win
+        let result = FastExecutionRequest::detect(
+            1,
+            (40, 40, 500, 500),        // kalshi: 40 + 40 + ~4 fees = 84
+            (60, 60, 500, 500),        // poly: expensive
+            &config,
+            12345,
+        );
+
+        let arb = result.expect("should detect kalshi-only arb");
+        assert_eq!(arb.arb_type, ArbType::KalshiOnly);
+        assert_eq!(arb.yes_price, 40);
+        assert_eq!(arb.no_price, 40);
+    }
+
+    #[test]
+    fn test_detect_respects_min_contracts_threshold() {
+        use crate::arb::ArbConfig;
+
+        // Require at least 5 contracts
+        let config = ArbConfig::new(99, 5.0);
+
+        // Good prices but only 400 cents of size = 4 contracts (400/100 = 4)
+        let result = FastExecutionRequest::detect(
+            1,
+            (55, 52, 400, 400),
+            (45, 58, 400, 400),
+            &config,
+            12345,
+        );
+
+        assert!(result.is_none(), "Should reject when size < min_contracts");
+
+        // Now with 500 cents = 5 contracts (exactly at threshold)
+        let result2 = FastExecutionRequest::detect(
+            1,
+            (55, 52, 500, 500),
+            (45, 58, 500, 500),
+            &config,
+            12345,
+        );
+
+        assert!(result2.is_some(), "Should accept when size >= min_contracts");
+    }
+
+    #[test]
+    fn test_detect_priority_order() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // All 4 arb types are valid with equal prices - should pick PolyYesKalshiNo (priority)
+        let result = FastExecutionRequest::detect(
+            1,
+            (40, 40, 500, 500),
+            (40, 40, 500, 500),
+            &config,
+            12345,
+        );
+
+        let arb = result.expect("should detect arb");
+        assert_eq!(arb.arb_type, ArbType::PolyYesKalshiNo, "Should pick PolyYesKalshiNo first in priority");
+    }
+
+    #[test]
+    fn test_detect_sets_is_test_false() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        let result = FastExecutionRequest::detect(
+            1,
+            (55, 52, 500, 500),
+            (45, 58, 500, 500),
+            &config,
+            12345,
+        );
+
+        let arb = result.expect("should detect arb");
+        assert!(!arb.is_test, "detect() should always set is_test to false");
+    }
+
+    #[test]
+    fn test_detect_preserves_market_id_and_timestamp() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        let result = FastExecutionRequest::detect(
+            42,                         // specific market_id
+            (55, 52, 500, 500),
+            (45, 58, 500, 500),
+            &config,
+            999888777,                  // specific timestamp
+        );
+
+        let arb = result.expect("should detect arb");
+        assert_eq!(arb.market_id, 42);
+        assert_eq!(arb.detected_ns, 999888777);
     }
 }
 
