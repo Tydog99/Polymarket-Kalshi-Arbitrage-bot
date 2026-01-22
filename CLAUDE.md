@@ -34,24 +34,28 @@ This is a Rust arbitrage bot that monitors price discrepancies between Kalshi an
 ### Data Flow
 
 ```
-WebSocket Feeds (kalshi.rs, polymarket.rs)
+WebSocket Price Updates (kalshi.rs, polymarket.rs)
     ↓
 Global State with Lock-Free Orderbook Cache (types.rs)
     ↓
-Heartbeat Arbitrage Detection (main.rs, every 10s default)
+Real-time Arb Detection in WebSocket Handlers (kalshi.rs, polymarket.rs)
     ↓
 ArbOpportunity Validation (arb.rs) - validates prices, fees, sizes
+    ↓
+Confirmation Queue (confirm_queue.rs) or Direct Execution
     ↓
 Execution Loop (execution.rs)
     ↓
 Platform Orders (kalshi.rs, polymarket_clob.rs)
     ↓
 Position Tracking (position_tracker.rs)
+
+Parallel: Heartbeat Monitoring (main.rs, every 10s) - logs status, does NOT trigger execution
 ```
 
 ### Key Modules
 
-- **`main.rs`** - Entry point, WebSocket orchestration, heartbeat-based arb detection
+- **`main.rs`** - Entry point, WebSocket orchestration, startup sweep, heartbeat monitoring
 - **`arb.rs`** - Centralized arbitrage opportunity detection (ArbConfig, ArbOpportunity)
 - **`types.rs`** - Core data structures including `AtomicOrderbook` (lock-free using packed u64 with CAS loops)
 - **`execution.rs`** - Concurrent order execution with in-flight deduplication (8-slot bitmask for 512 markets)
