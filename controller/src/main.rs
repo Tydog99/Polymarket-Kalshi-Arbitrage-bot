@@ -674,16 +674,6 @@ async fn main() -> Result<()> {
         discovery.discover_all(&leagues, market_type_filter).await
     };
 
-    info!("📊 Market discovery complete:");
-    print_discovery_summary(&result);
-    info!("   - Matched market pairs: {}", result.pairs.len());
-
-    if !result.errors.is_empty() {
-        for err in &result.errors {
-            warn!("   ⚠️ {}", err);
-        }
-    }
-
     if result.pairs.is_empty() {
         error!("No market pairs found!");
         return Ok(());
@@ -696,6 +686,16 @@ async fn main() -> Result<()> {
               pair.description,
               pair.market_type,
               pair.kalshi_market_ticker);
+    }
+
+    info!("📊 Market discovery complete:");
+    print_discovery_summary(&result);
+    info!("   - Matched market pairs: {}", result.pairs.len());
+
+    if !result.errors.is_empty() {
+        for err in &result.errors {
+            warn!("   ⚠️ {}", err);
+        }
     }
 
     if discovery_only {
