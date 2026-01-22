@@ -1131,8 +1131,8 @@ mod tests {
         let state = GlobalState::new(config);
 
         // Verify arb_config() returns the correct threshold
-        assert_eq!(state.arb_config().threshold_cents, 99);
-        assert_eq!(state.arb_config().min_contracts, 1.0);
+        assert_eq!(state.arb_config().threshold_cents(), 99);
+        assert_eq!(state.arb_config().min_contracts(), 1.0);
     }
 
     #[test]
@@ -1140,17 +1140,12 @@ mod tests {
         use crate::arb::ArbConfig;
 
         // Create GlobalState with custom ArbConfig
-        let config = ArbConfig {
-            threshold_cents: 95,
-            min_contracts: 5.0,
-            kalshi_fee_rate: 0.07,
-            poly_fee_rate: 0.0,
-        };
+        let config = ArbConfig::new(95, 5.0);
         let state = GlobalState::new(config);
 
         // Verify arb_config() returns the custom values
-        assert_eq!(state.arb_config().threshold_cents, 95);
-        assert_eq!(state.arb_config().min_contracts, 5.0);
+        assert_eq!(state.arb_config().threshold_cents(), 95);
+        assert_eq!(state.arb_config().min_contracts(), 5.0);
     }
 }
 

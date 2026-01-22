@@ -457,7 +457,13 @@ impl PositionChannel {
 
     #[inline]
     pub fn record_fill(&self, fill: FillRecord) {
-        let _ = self.tx.send(fill);
+        if let Err(e) = self.tx.send(fill) {
+            // This is critical - losing fills means incorrect P&L and audit trail
+            tracing::error!(
+                "[POSITION] Failed to record fill - DATA LOSS! Fill: {:?}, Error: {}",
+                e.0, e
+            );
+        }
     }
 }
 

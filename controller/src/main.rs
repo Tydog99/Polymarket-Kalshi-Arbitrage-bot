@@ -738,7 +738,7 @@ async fn main() -> Result<()> {
     // Build global state with arb config loaded from environment
     let arb_config = arb::ArbConfig::from_env();
     info!("   Arb threshold: {}¢ | min contracts: {}",
-          arb_config.threshold_cents, arb_config.min_contracts);
+          arb_config.threshold_cents(), arb_config.min_contracts());
     let state = Arc::new({
         let s = GlobalState::new(arb_config);
         for pair in result.pairs {
@@ -1004,10 +1004,20 @@ async fn main() -> Result<()> {
                                     // Validate arb is still profitable
                                     match confirm_queue_clone.validate_arb_detailed(&arb) {
                                         Some(result) if result.is_valid => {
-                                            log_msg(format!("[{}]  INFO [CONFIRM] ✅ Approved: {} - forwarding to execution",
-                                                chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
-                                            let _ = confirm_exec_tx.try_send(arb.request.clone());
-                                            ConfirmationStatus::Accepted
+                                            match confirm_exec_tx.try_send(arb.request.clone()) {
+                                                Ok(()) => {
+                                                    log_msg(format!("[{}]  INFO [CONFIRM] ✅ Approved: {} - forwarded to execution",
+                                                        chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
+                                                    ConfirmationStatus::Accepted
+                                                }
+                                                Err(e) => {
+                                                    log_msg(format!("[{}] ERROR [CONFIRM] ❌ Approved but FAILED to forward: {} - channel error: {}",
+                                                        chrono::Local::now().format("%H:%M:%S"), arb.pair.description, e));
+                                                    tracing::error!("[CONFIRM] Execution channel send failed for market {}: {}", market_id, e);
+                                                    // Return Accepted so it's logged, but the user will see the error message
+                                                    ConfirmationStatus::Accepted
+                                                }
+                                            }
                                         }
                                         Some(result) => {
                                             // Expired - show how much prices moved
@@ -1082,8 +1092,15 @@ async fn main() -> Result<()> {
     } else {
         // When confirm mode is disabled, drain confirm_rx and forward directly to execution
         Some(tokio::spawn(async move {
-            while let Some((req, _pair)) = confirm_rx.recv().await {
-                let _ = confirm_exec_tx.try_send(req);
+            let mut dropped_count = 0u64;
+            while let Some((req, pair)) = confirm_rx.recv().await {
+                if let Err(e) = confirm_exec_tx.try_send(req) {
+                    dropped_count += 1;
+                    tracing::warn!(
+                        "[CONFIRM] Bypass mode: arb dropped for {} - {} (total dropped: {})",
+                        pair.description, e, dropped_count
+                    );
+                }
             }
         }))
     };
@@ -1302,7 +1319,10 @@ async fn main() -> Result<()> {
             // Helper closure to route log output
             let log_line = |line: String| {
                 if tui_active {
-                    let _ = heartbeat_log_tx.try_send(line);
+                    if heartbeat_log_tx.try_send(line.clone()).is_err() {
+                        // Channel full or closed, fallback to println
+                        println!("{}", line);
+                    }
                 } else {
                     println!("{}", line);
                 }
