@@ -456,7 +456,7 @@ mod fill_accuracy_tests {
 
 mod infra_integration_tests {
     use arb_bot::types::*;
-    use arb_bot::arb::{ArbOpportunity, kalshi_fee};
+    use arb_bot::arb::kalshi_fee;
 
     /// Helper to create market state with prices
     fn setup_market(
@@ -493,7 +493,7 @@ mod infra_integration_tests {
     }
 
     // =========================================================================
-    // Arb Detection Tests (ArbOpportunity)
+    // Arb Detection Tests (FastExecutionRequest::detect)
     // =========================================================================
 
     /// Test: detects clear cross-platform arb (Poly YES + Kalshi NO)
@@ -505,7 +505,7 @@ mod infra_integration_tests {
         let (state, market_id) = setup_market(55, 50, 40, 65);
 
         let market = state.get_by_id(market_id).unwrap();
-        let arb = ArbOpportunity::new(
+        let arb = FastExecutionRequest::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -513,8 +513,8 @@ mod infra_integration_tests {
             0,
         );
 
-        assert!(arb.is_valid(), "Should detect arb");
-        assert_eq!(arb.arb_type(), Some(ArbType::PolyYesKalshiNo), "Should detect Poly YES + Kalshi NO arb");
+        let arb = arb.expect("Should detect arb");
+        assert_eq!(arb.arb_type, ArbType::PolyYesKalshiNo, "Should detect Poly YES + Kalshi NO arb");
     }
 
     /// Test: detects clear cross-platform arb (Kalshi YES + Poly NO)
@@ -526,7 +526,7 @@ mod infra_integration_tests {
         let (state, market_id) = setup_market(40, 65, 55, 50);
 
         let market = state.get_by_id(market_id).unwrap();
-        let arb = ArbOpportunity::new(
+        let arb = FastExecutionRequest::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -534,8 +534,8 @@ mod infra_integration_tests {
             0,
         );
 
-        assert!(arb.is_valid(), "Should detect arb");
-        assert_eq!(arb.arb_type(), Some(ArbType::KalshiYesPolyNo), "Should detect Kalshi YES + Poly NO arb");
+        let arb = arb.expect("Should detect arb");
+        assert_eq!(arb.arb_type, ArbType::KalshiYesPolyNo, "Should detect Kalshi YES + Poly NO arb");
     }
 
     /// Test: detects Polymarket-only arb (no fees)
@@ -545,7 +545,7 @@ mod infra_integration_tests {
         let (state, market_id) = setup_market(60, 60, 48, 50);
 
         let market = state.get_by_id(market_id).unwrap();
-        let arb = ArbOpportunity::new(
+        let arb = FastExecutionRequest::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -553,8 +553,8 @@ mod infra_integration_tests {
             0,
         );
 
-        assert!(arb.is_valid(), "Should detect arb");
-        assert_eq!(arb.arb_type(), Some(ArbType::PolyOnly), "Should detect Poly-only arb");
+        let arb = arb.expect("Should detect arb");
+        assert_eq!(arb.arb_type, ArbType::PolyOnly, "Should detect Poly-only arb");
     }
 
     /// Test: detects Kalshi-only arb (double fees)
@@ -566,7 +566,7 @@ mod infra_integration_tests {
         let (state, market_id) = setup_market(44, 44, 60, 60);
 
         let market = state.get_by_id(market_id).unwrap();
-        let arb = ArbOpportunity::new(
+        let arb = FastExecutionRequest::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -574,8 +574,8 @@ mod infra_integration_tests {
             0,
         );
 
-        assert!(arb.is_valid(), "Should detect arb");
-        assert_eq!(arb.arb_type(), Some(ArbType::KalshiOnly), "Should detect Kalshi-only arb");
+        let arb = arb.expect("Should detect arb");
+        assert_eq!(arb.arb_type, ArbType::KalshiOnly, "Should detect Kalshi-only arb");
     }
 
     /// Test: correctly rejects marginal arb when fees eliminate profit
@@ -587,7 +587,7 @@ mod infra_integration_tests {
         let (state, market_id) = setup_market(55, 50, 49, 55);
 
         let market = state.get_by_id(market_id).unwrap();
-        let arb = ArbOpportunity::new(
+        let arb = FastExecutionRequest::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -597,8 +597,8 @@ mod infra_integration_tests {
 
         // The arb might still be valid (PolyOnly might work), but PolyYesKalshiNo should not
         // If valid, it should NOT be PolyYesKalshiNo since fees eliminate it
-        if arb.is_valid() {
-            assert_ne!(arb.arb_type(), Some(ArbType::PolyYesKalshiNo),
+        if let Some(arb) = arb {
+            assert_ne!(arb.arb_type, ArbType::PolyYesKalshiNo,
                 "Fees should eliminate marginal Poly YES + Kalshi NO arb");
         }
     }
@@ -610,7 +610,7 @@ mod infra_integration_tests {
         let (state, market_id) = setup_market(55, 55, 52, 52);
 
         let market = state.get_by_id(market_id).unwrap();
-        let arb = ArbOpportunity::new(
+        let arb = FastExecutionRequest::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -618,7 +618,7 @@ mod infra_integration_tests {
             0,
         );
 
-        assert!(!arb.is_valid(), "Should detect no arbs in efficient market");
+        assert!(arb.is_none(), "Should detect no arbs in efficient market");
     }
 
     /// Test: handles missing prices correctly
@@ -627,7 +627,7 @@ mod infra_integration_tests {
         let (state, market_id) = setup_market(50, 0, 50, 50);
 
         let market = state.get_by_id(market_id).unwrap();
-        let arb = ArbOpportunity::new(
+        let arb = FastExecutionRequest::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -635,7 +635,7 @@ mod infra_integration_tests {
             0,
         );
 
-        assert!(!arb.is_valid(), "Should return invalid when any price is missing");
+        assert!(arb.is_none(), "Should return None when any price is missing");
     }
 
     // =========================================================================
@@ -797,9 +797,9 @@ mod infra_integration_tests {
         // 1. Setup market with arb opportunity
         let (state, market_id) = setup_market(55, 50, 40, 65);
 
-        // 2. Detect arb using ArbOpportunity
+        // 2. Detect arb using FastExecutionRequest::detect()
         let market = state.get_by_id(market_id).unwrap();
-        let arb = ArbOpportunity::new(
+        let req = FastExecutionRequest::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -807,31 +807,15 @@ mod infra_integration_tests {
             0,
         );
 
-        assert!(arb.is_valid(), "Step 2: Should detect arb");
-        assert_eq!(arb.arb_type(), Some(ArbType::PolyYesKalshiNo), "Should be PolyYesKalshiNo arb");
+        let req = req.expect("Step 2: Should detect arb");
+        assert_eq!(req.arb_type, ArbType::PolyYesKalshiNo, "Should be PolyYesKalshiNo arb");
 
-        // 3. Extract prices for execution
-        let (p_yes, _, p_yes_sz, _) = market.poly.load();
-        let (_, k_no, _, k_no_sz) = market.kalshi.load();
-
-        // 4. Build execution request
-        let req = FastExecutionRequest {
-            market_id,
-            yes_price: p_yes,
-            no_price: k_no,
-            yes_size: p_yes_sz,
-            no_size: k_no_sz,
-            arb_type: ArbType::PolyYesKalshiNo,
-            detected_ns: 0,
-            is_test: false,
-        };
-
-        // 5. Verify request is valid
+        // 3. Verify request is valid
         assert_eq!(req.yes_price, 40, "YES price should be 40¢");
         assert_eq!(req.no_price, 50, "NO price should be 50¢");
         assert!(req.profit_cents() > 0, "Should have positive profit");
 
-        // 6. Verify we can access market pair for execution
+        // 4. Verify we can access market pair for execution
         let pair_opt = market.pair();
         let pair = pair_opt.as_ref().expect("Should have pair");
         assert!(!pair.kalshi_market_ticker.is_empty());
@@ -2144,7 +2128,6 @@ mod process_mock_tests {
 
 mod startup_sweep_tests {
     use arb_bot::types::*;
-    use arb_bot::arb::ArbOpportunity;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -2296,15 +2279,13 @@ mod startup_sweep_tests {
                 continue;
             }
 
-            let arb = ArbOpportunity::new(
+            if FastExecutionRequest::detect(
                 market.market_id,
                 kalshi_data,
                 poly_data,
                 state.arb_config(),
                 0,
-            );
-
-            if arb.is_valid() {
+            ).is_some() {
                 arbs_found += 1;
             }
         }
@@ -2328,7 +2309,7 @@ mod startup_sweep_tests {
         market.kalshi.store(55, 50, 1000, 1000);
         market.poly.store(40, 50, 1000, 1000);
 
-        let arb = ArbOpportunity::new(
+        let arb = FastExecutionRequest::detect(
             id,
             market.kalshi.load(),
             market.poly.load(),
@@ -2336,13 +2317,11 @@ mod startup_sweep_tests {
             0,
         );
 
-        // ArbOpportunity should pick the best arb type with priority
-        assert!(arb.is_valid(), "Should detect arb");
+        // FastExecutionRequest::detect() should pick the best arb type with priority
+        let arb = arb.expect("Should detect arb");
 
         // PolyYesKalshiNo is checked first in priority order
-        let arb_type = arb.arb_type().expect("Should have arb type");
-
-        assert!(matches!(arb_type, ArbType::PolyYesKalshiNo),
+        assert!(matches!(arb.arb_type, ArbType::PolyYesKalshiNo),
             "Cross-platform arb should take priority");
     }
 }

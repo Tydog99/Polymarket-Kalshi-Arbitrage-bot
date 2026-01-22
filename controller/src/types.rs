@@ -77,7 +77,7 @@ pub type SizeCents = u16;
 pub const MAX_MARKETS: usize = 1024;
 
 /// Sentinel value indicating no price is currently available.
-/// Used semantically in price checks (e.g., ArbOpportunity::new checks for 0).
+/// Used semantically in price checks (e.g., FastExecutionRequest::detect checks for 0).
 #[allow(dead_code)]
 pub const NO_PRICE: PriceCents = 0;
 
@@ -1200,11 +1200,11 @@ mod tests {
             state.markets[id as usize].poly.store(40, 65, 700, 800);
         }
 
-        // 3. Check for arbs using ArbOpportunity
+        // 3. Check for arbs using FastExecutionRequest::detect()
         let market = state.get_by_id(market_id).unwrap();
         let kalshi_data = market.kalshi.load();
         let poly_data = market.poly.load();
-        let arb = crate::arb::ArbOpportunity::new(
+        let req = FastExecutionRequest::detect(
             market_id,
             kalshi_data,
             poly_data,
@@ -1213,24 +1213,10 @@ mod tests {
         );
 
         // 4. Verify arb detected
-        assert!(arb.is_valid(), "Should detect arb opportunity");
-        assert_eq!(arb.arb_type(), Some(ArbType::PolyYesKalshiNo), "Should detect Poly YES + Kalshi NO arb");
+        let req = req.expect("Should detect arb opportunity");
+        assert_eq!(req.arb_type, ArbType::PolyYesKalshiNo, "Should detect Poly YES + Kalshi NO arb");
 
-        // 5. Build execution request
-        let (p_yes, _, p_yes_sz, _) = poly_data;
-        let (_, k_no, _, k_no_sz) = kalshi_data;
-
-        let req = FastExecutionRequest {
-            market_id,
-            yes_price: p_yes,
-            no_price: k_no,
-            yes_size: p_yes_sz,
-            no_size: k_no_sz,
-            arb_type: ArbType::PolyYesKalshiNo,
-            detected_ns: 0,
-            is_test: false,
-        };
-
+        // 5. Verify execution request has positive profit
         assert!(req.profit_cents() > 0, "Should have positive profit");
     }
 
@@ -1257,10 +1243,10 @@ mod tests {
                         market.poly.update_no(50 + ((j % 10) as u16), 600 + j as u16);
                     }
 
-                    // Check arbs using ArbOpportunity (should never panic)
+                    // Check arbs using FastExecutionRequest::detect() (should never panic)
                     let kalshi_data = market.kalshi.load();
                     let poly_data = market.poly.load();
-                    let _ = crate::arb::ArbOpportunity::new(
+                    let _ = FastExecutionRequest::detect(
                         market.market_id,
                         kalshi_data,
                         poly_data,
