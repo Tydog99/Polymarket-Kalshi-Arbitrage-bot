@@ -340,6 +340,21 @@ impl FastExecutionRequest {
         }
     }
 
+    /// Calculate max executable contracts (minimum of both sides).
+    ///
+    /// Returns the number of complete contracts that can be bought,
+    /// computed as min(yes_size / yes_price, no_size / no_price).
+    /// Returns 0 if either price is 0 (no price available).
+    #[inline]
+    pub fn max_contracts(&self) -> u16 {
+        if self.yes_price == 0 || self.no_price == 0 {
+            return 0;
+        }
+        let yes_contracts = self.yes_size / self.yes_price;
+        let no_contracts = self.no_size / self.no_price;
+        yes_contracts.min(no_contracts)
+    }
+
     #[inline(always)]
     pub fn profit_cents(&self) -> i16 {
         100 - (self.yes_price as i16 + self.no_price as i16 + self.estimated_fee_cents() as i16)
@@ -1023,6 +1038,137 @@ mod tests {
             is_test: false,
         };
         assert_eq!(req4.estimated_fee_cents(), kalshi_fee(40) + kalshi_fee(50));
+    }
+
+    // =========================================================================
+    // FastExecutionRequest::max_contracts() Tests
+    // =========================================================================
+
+    #[test]
+    fn test_execution_request_max_contracts_basic() {
+        // YES: 1000 cents / 40 cents = 25 contracts
+        // NO: 1000 cents / 50 cents = 20 contracts
+        // max_contracts = min(25, 20) = 20
+        let req = FastExecutionRequest {
+            market_id: 0,
+            yes_price: 40,
+            no_price: 50,
+            yes_size: 1000,
+            no_size: 1000,
+            arb_type: ArbType::PolyYesKalshiNo,
+            detected_ns: 0,
+            is_test: false,
+        };
+
+        assert_eq!(req.max_contracts(), 20);
+    }
+
+    #[test]
+    fn test_execution_request_max_contracts_yes_limited() {
+        // YES: 500 cents / 50 cents = 10 contracts
+        // NO: 1000 cents / 50 cents = 20 contracts
+        // max_contracts = min(10, 20) = 10
+        let req = FastExecutionRequest {
+            market_id: 0,
+            yes_price: 50,
+            no_price: 50,
+            yes_size: 500,
+            no_size: 1000,
+            arb_type: ArbType::PolyYesKalshiNo,
+            detected_ns: 0,
+            is_test: false,
+        };
+
+        assert_eq!(req.max_contracts(), 10);
+    }
+
+    #[test]
+    fn test_execution_request_max_contracts_no_limited() {
+        // YES: 1000 cents / 50 cents = 20 contracts
+        // NO: 500 cents / 50 cents = 10 contracts
+        // max_contracts = min(20, 10) = 10
+        let req = FastExecutionRequest {
+            market_id: 0,
+            yes_price: 50,
+            no_price: 50,
+            yes_size: 1000,
+            no_size: 500,
+            arb_type: ArbType::PolyYesKalshiNo,
+            detected_ns: 0,
+            is_test: false,
+        };
+
+        assert_eq!(req.max_contracts(), 10);
+    }
+
+    #[test]
+    fn test_execution_request_max_contracts_zero_yes_price() {
+        let req = FastExecutionRequest {
+            market_id: 0,
+            yes_price: 0,
+            no_price: 50,
+            yes_size: 1000,
+            no_size: 1000,
+            arb_type: ArbType::PolyYesKalshiNo,
+            detected_ns: 0,
+            is_test: false,
+        };
+
+        assert_eq!(req.max_contracts(), 0, "Should return 0 when yes_price is 0");
+    }
+
+    #[test]
+    fn test_execution_request_max_contracts_zero_no_price() {
+        let req = FastExecutionRequest {
+            market_id: 0,
+            yes_price: 50,
+            no_price: 0,
+            yes_size: 1000,
+            no_size: 1000,
+            arb_type: ArbType::PolyYesKalshiNo,
+            detected_ns: 0,
+            is_test: false,
+        };
+
+        assert_eq!(req.max_contracts(), 0, "Should return 0 when no_price is 0");
+    }
+
+    #[test]
+    fn test_execution_request_max_contracts_integer_division() {
+        // Verify integer division behavior (truncation, not rounding)
+        // YES: 99 cents / 10 cents = 9 contracts (not 10)
+        // NO: 99 cents / 10 cents = 9 contracts
+        let req = FastExecutionRequest {
+            market_id: 0,
+            yes_price: 10,
+            no_price: 10,
+            yes_size: 99,
+            no_size: 99,
+            arb_type: ArbType::PolyYesKalshiNo,
+            detected_ns: 0,
+            is_test: false,
+        };
+
+        assert_eq!(req.max_contracts(), 9);
+    }
+
+    #[test]
+    fn test_execution_request_max_contracts_matches_arb_opportunity() {
+        // Verify FastExecutionRequest::max_contracts matches ArbOpportunity::max_contracts
+        let config = ArbConfig::default();
+        let kalshi = (55u16, 50u16, 1000u16, 800u16);
+        let poly = (40u16, 65u16, 600u16, 1000u16);
+
+        let arb = crate::arb::ArbOpportunity::new(42, kalshi, poly, &config, 12345);
+        assert!(arb.is_valid());
+
+        let req = FastExecutionRequest::from_arb(&arb);
+
+        assert_eq!(
+            req.max_contracts(),
+            arb.max_contracts(),
+            "FastExecutionRequest::max_contracts should match ArbOpportunity::max_contracts"
+        );
     }
 
     // =========================================================================
