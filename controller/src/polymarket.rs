@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 use crate::config::{self, POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS, GAMMA_API_BASE, POLY_MAX_TOKENS_PER_WS};
 use crate::execution::NanoClock;
 use crate::types::{
-    GlobalState, FastExecutionRequest, ArbType, MarketPair, PriceCents, SizeCents,
+    GlobalState, ArbOpportunity, MarketPair, PriceCents, SizeCents,
     parse_price, fxhash_str,
 };
 
@@ -280,8 +280,8 @@ fn parse_size(s: &str) -> SizeCents {
 /// shutdown signal), all connections are aborted to trigger a coordinated reconnect.
 pub async fn run_ws(
     state: Arc<GlobalState>,
-    exec_tx: mpsc::Sender<FastExecutionRequest>,
-    confirm_tx: mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
+    exec_tx: mpsc::Sender<ArbOpportunity>,
+    confirm_tx: mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
     threshold_cents: PriceCents,
     shutdown_rx: watch::Receiver<bool>,
     clock: Arc<NanoClock>,
@@ -388,8 +388,8 @@ async fn run_single_ws(
     conn_id: usize,
     tokens: Vec<String>,
     state: Arc<GlobalState>,
-    exec_tx: mpsc::Sender<FastExecutionRequest>,
-    confirm_tx: mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
+    exec_tx: mpsc::Sender<ArbOpportunity>,
+    confirm_tx: mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
     threshold_cents: PriceCents,
     mut shutdown_rx: watch::Receiver<bool>,
     clock: Arc<NanoClock>,
@@ -518,9 +518,9 @@ async fn run_single_ws(
 async fn process_book(
     state: &GlobalState,
     book: &BookSnapshot,
-    exec_tx: &mpsc::Sender<FastExecutionRequest>,
-    confirm_tx: &mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
-    threshold_cents: PriceCents,
+    exec_tx: &mpsc::Sender<ArbOpportunity>,
+    confirm_tx: &mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
+    _threshold_cents: PriceCents,
     clock: &NanoClock,
 ) {
     let token_hash = fxhash_str(&book.asset_id);
@@ -559,10 +559,15 @@ async fn process_book(
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
 
-        // Check arbs
-        let arb_mask = market.check_arbs(threshold_cents);
-        if arb_mask != 0 {
-            send_arb_request(state, market_id, market, arb_mask, exec_tx, confirm_tx, clock).await;
+        // Check arbs using ArbOpportunity::detect()
+        if let Some(req) = ArbOpportunity::detect(
+            market_id,
+            market.kalshi.load(),
+            market.poly.load(),
+            state.arb_config(),
+            clock.now_ns(),
+        ) {
+            route_arb_to_channel(state, market_id, req, exec_tx, confirm_tx).await;
         }
         matched = true;
     }
@@ -585,10 +590,15 @@ async fn process_book(
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
 
-        // Check arbs
-        let arb_mask = market.check_arbs(threshold_cents);
-        if arb_mask != 0 {
-            send_arb_request(state, market_id, market, arb_mask, exec_tx, confirm_tx, clock).await;
+        // Check arbs using ArbOpportunity::detect()
+        if let Some(req) = ArbOpportunity::detect(
+            market_id,
+            market.kalshi.load(),
+            market.poly.load(),
+            state.arb_config(),
+            clock.now_ns(),
+        ) {
+            route_arb_to_channel(state, market_id, req, exec_tx, confirm_tx).await;
         }
         matched = true;
     }
@@ -607,9 +617,9 @@ async fn process_book(
 async fn process_price_change(
     state: &GlobalState,
     change: &PriceChangeItem,
-    exec_tx: &mpsc::Sender<FastExecutionRequest>,
-    confirm_tx: &mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
-    threshold_cents: PriceCents,
+    exec_tx: &mpsc::Sender<ArbOpportunity>,
+    confirm_tx: &mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
+    _threshold_cents: PriceCents,
     clock: &NanoClock,
 ) {
     // Only process SELL (ask) side updates
@@ -645,9 +655,14 @@ async fn process_price_change(
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_yes || current_yes == 0 {
-            let arb_mask = market.check_arbs(threshold_cents);
-            if arb_mask != 0 {
-                send_arb_request(state, market_id, market, arb_mask, exec_tx, confirm_tx, clock).await;
+            if let Some(req) = ArbOpportunity::detect(
+                market_id,
+                market.kalshi.load(),
+                market.poly.load(),
+                state.arb_config(),
+                clock.now_ns(),
+            ) {
+                route_arb_to_channel(state, market_id, req, exec_tx, confirm_tx).await;
             }
         }
     }
@@ -669,56 +684,30 @@ async fn process_price_change(
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_no || current_no == 0 {
-            let arb_mask = market.check_arbs(threshold_cents);
-            if arb_mask != 0 {
-                send_arb_request(state, market_id, market, arb_mask, exec_tx, confirm_tx, clock).await;
+            if let Some(req) = ArbOpportunity::detect(
+                market_id,
+                market.kalshi.load(),
+                market.poly.load(),
+                state.arb_config(),
+                clock.now_ns(),
+            ) {
+                route_arb_to_channel(state, market_id, req, exec_tx, confirm_tx).await;
             }
         }
     }
 }
 
-/// Send arb request to execution engine, routing to confirm channel if required
+/// Route a detected arbitrage opportunity to the appropriate channel.
+///
+/// Routes to confirm_tx if the league requires confirmation, otherwise to exec_tx.
 #[inline]
-async fn send_arb_request(
+async fn route_arb_to_channel(
     state: &GlobalState,
     market_id: u16,
-    market: &crate::types::AtomicMarketState,
-    arb_mask: u8,
-    exec_tx: &mpsc::Sender<FastExecutionRequest>,
-    confirm_tx: &mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
-    clock: &NanoClock,
+    req: ArbOpportunity,
+    exec_tx: &mpsc::Sender<ArbOpportunity>,
+    confirm_tx: &mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
 ) {
-    let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
-    let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.load();
-
-    // Priority order: cross-platform arbs first (more reliable)
-    let (yes_price, no_price, yes_size, no_size, arb_type) = if arb_mask & 1 != 0 {
-        // Poly YES + Kalshi NO
-        (p_yes, k_no, p_yes_size, k_no_size, ArbType::PolyYesKalshiNo)
-    } else if arb_mask & 2 != 0 {
-        // Kalshi YES + Poly NO
-        (k_yes, p_no, k_yes_size, p_no_size, ArbType::KalshiYesPolyNo)
-    } else if arb_mask & 4 != 0 {
-        // Poly only (both sides)
-        (p_yes, p_no, p_yes_size, p_no_size, ArbType::PolyOnly)
-    } else if arb_mask & 8 != 0 {
-        // Kalshi only (both sides)
-        (k_yes, k_no, k_yes_size, k_no_size, ArbType::KalshiOnly)
-    } else {
-        return;
-    };
-
-    let req = FastExecutionRequest {
-        market_id,
-        yes_price,
-        no_price,
-        yes_size,
-        no_size,
-        arb_type,
-        detected_ns: clock.now_ns(),
-        is_test: false,
-    };
-
     // Get market pair to check if confirmation is required
     let pair = match state.get_by_id(market_id).and_then(|m| m.pair()) {
         Some(p) => p,
@@ -778,7 +767,7 @@ mod tests {
     ///   - YES for Market 2 (Thieves winning)
     ///   - NO for Market 1 (OpTic losing)
     fn create_esports_state_with_shared_tokens() -> (GlobalState, String, String) {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         // Real token IDs from production logs (truncated for readability in tests)
         let token_optic = "43216923243873086858".to_string();  // OpTic Texas wins
@@ -979,7 +968,7 @@ mod tests {
         // With the bug, only YES matches were logged, NO matches never happened.
         // After fix, both YES and NO matches should occur for each book snapshot.
 
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         // Exact token IDs from production
         let token_a = "43216923243873086858".to_string();
@@ -1059,7 +1048,7 @@ mod tests {
     fn test_standard_market_single_token_per_role() {
         // Standard sports markets (NBA, NFL, etc.) don't have shared tokens.
         // Each market has unique YES/NO tokens. Verify this still works.
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         let pair = MarketPair {
             pair_id: "nba-lal-bos".into(),

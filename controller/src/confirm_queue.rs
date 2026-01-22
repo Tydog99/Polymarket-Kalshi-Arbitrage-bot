@@ -7,22 +7,19 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
+use crate::arb::{kalshi_fee, ArbConfig};
 use crate::config::{build_polymarket_url, KALSHI_WEB_BASE};
-use crate::types::{ArbType, FastExecutionRequest, GlobalState, MarketPair, PriceCents, kalshi_fee_cents};
+use crate::types::{ArbType, ArbOpportunity, GlobalState, MarketPair};
 
 /// A pending arbitrage opportunity awaiting confirmation
 #[derive(Debug, Clone)]
 pub struct PendingArb {
     /// Original execution request
-    pub request: FastExecutionRequest,
+    pub request: ArbOpportunity,
     /// Market pair info (for display)
     pub pair: Arc<MarketPair>,
     /// Number of times this arb has been detected while pending
     pub detection_count: u32,
-    /// First detection timestamp
-    pub first_detected: Instant,
-    /// Most recent detection timestamp
-    pub last_detected: Instant,
     /// Kalshi market URL
     pub kalshi_url: String,
     /// Polymarket event URL
@@ -30,27 +27,23 @@ pub struct PendingArb {
 }
 
 impl PendingArb {
-    pub fn new(request: FastExecutionRequest, pair: Arc<MarketPair>) -> Self {
+    pub fn new(request: ArbOpportunity, pair: Arc<MarketPair>) -> Self {
         let kalshi_url = format!("{}/{}", KALSHI_WEB_BASE, pair.kalshi_market_ticker);
         let poly_url = build_polymarket_url(&pair.league, &pair.poly_slug);
-        let now = Instant::now();
 
         Self {
             request,
             pair,
             detection_count: 1,
-            first_detected: now,
-            last_detected: now,
             kalshi_url,
             poly_url,
         }
     }
 
     /// Update with fresher price data
-    pub fn update(&mut self, request: FastExecutionRequest) {
+    pub fn update(&mut self, request: ArbOpportunity) {
         self.request = request;
         self.detection_count += 1;
-        self.last_detected = Instant::now();
     }
 
     /// Calculate profit in cents based on current request prices
@@ -58,9 +51,10 @@ impl PendingArb {
         self.request.profit_cents()
     }
 
-    /// Calculate max contracts from size
-    pub fn max_contracts(&self) -> i64 {
-        (self.request.yes_size.min(self.request.no_size) / 100) as i64
+    /// Calculate max contracts based on available size and prices.
+    /// Delegates to ArbOpportunity::max_contracts().
+    pub fn max_contracts(&self) -> u16 {
+        self.request.max_contracts()
     }
 }
 
@@ -114,7 +108,8 @@ impl ConfirmationQueue {
 
     /// Push a new arb opportunity (or update existing for same market).
     /// Returns `true` if this was a new entry, `false` if updating existing or blacklisted.
-    pub async fn push(&self, request: FastExecutionRequest, pair: Arc<MarketPair>) -> bool {
+    /// Note: Size validation is done upstream in ArbOpportunity::detect()
+    pub async fn push(&self, request: ArbOpportunity, pair: Arc<MarketPair>) -> bool {
         let market_id = request.market_id;
 
         // Check blacklist and clean expired entries in one lock acquisition
@@ -151,7 +146,11 @@ impl ConfirmationQueue {
         // Only notify TUI on new entries to avoid flooding with updates.
         // The TUI re-renders every 100ms anyway, so price updates will still show.
         if is_new {
-            let _ = self.update_tx.try_send(());
+            if self.update_tx.try_send(()).is_err() {
+                // Channel full or closed - TUI may be slow or shut down.
+                // Log at debug level since TUI re-renders periodically anyway.
+                tracing::debug!("[CONFIRM] TUI notification channel full or closed");
+            }
         }
 
         is_new
@@ -195,21 +194,8 @@ impl ConfirmationQueue {
         });
     }
 
-    /// Remove a market from pending (e.g., when prices invalidate it)
-    pub async fn remove(&self, market_id: u16) -> Option<PendingArb> {
-        let mut pending = self.pending.write().await;
-        let mut order = self.order.write().await;
-
-        order.retain(|id| *id != market_id);
-        pending.remove(&market_id)
-    }
-
-    /// Check if arb is still valid (prices haven't moved)
-    pub fn validate_arb(&self, arb: &PendingArb) -> bool {
-        self.validate_arb_detailed(arb).map(|r| r.is_valid).unwrap_or(false)
-    }
-
-    /// Check if arb is still valid with detailed cost info
+    /// Check if arb is still valid with detailed cost info.
+    /// Returns None if the market is no longer in global state (race condition or state inconsistency).
     pub fn validate_arb_detailed(&self, arb: &PendingArb) -> Option<ValidationResult> {
         // Test arbs use synthetic prices, skip validation
         if arb.request.is_test {
@@ -220,7 +206,17 @@ impl ConfirmationQueue {
             });
         }
 
-        let market = self.state.get_by_id(arb.request.market_id)?;
+        let market = match self.state.get_by_id(arb.request.market_id) {
+            Some(m) => m,
+            None => {
+                tracing::warn!(
+                    "[CONFIRM] Market {} not found during validation for {}",
+                    arb.request.market_id,
+                    arb.pair.description
+                );
+                return None;
+            }
+        };
 
         // Get current prices from orderbook
         let (k_yes, k_no, _, _) = market.kalshi.load();
@@ -228,26 +224,26 @@ impl ConfirmationQueue {
 
         // Calculate original cost (from when arb was queued)
         let original_cost = arb.request.yes_price + arb.request.no_price + match arb.request.arb_type {
-            ArbType::PolyYesKalshiNo => kalshi_fee_cents(arb.request.no_price),
-            ArbType::KalshiYesPolyNo => kalshi_fee_cents(arb.request.yes_price),
+            ArbType::PolyYesKalshiNo => kalshi_fee(arb.request.no_price),
+            ArbType::KalshiYesPolyNo => kalshi_fee(arb.request.yes_price),
             ArbType::PolyOnly => 0,
-            ArbType::KalshiOnly => kalshi_fee_cents(arb.request.yes_price) + kalshi_fee_cents(arb.request.no_price),
+            ArbType::KalshiOnly => kalshi_fee(arb.request.yes_price) + kalshi_fee(arb.request.no_price),
         };
 
         // Calculate current cost based on arb type
         let current_cost = match arb.request.arb_type {
             ArbType::PolyYesKalshiNo => {
-                let fee = kalshi_fee_cents(k_no);
+                let fee = kalshi_fee(k_no);
                 p_yes + k_no + fee
             }
             ArbType::KalshiYesPolyNo => {
-                let fee = kalshi_fee_cents(k_yes);
+                let fee = kalshi_fee(k_yes);
                 k_yes + fee + p_no
             }
             ArbType::PolyOnly => p_yes + p_no,
             ArbType::KalshiOnly => {
-                let fee_yes = kalshi_fee_cents(k_yes);
-                let fee_no = kalshi_fee_cents(k_no);
+                let fee_yes = kalshi_fee(k_yes);
+                let fee_no = kalshi_fee(k_no);
                 k_yes + fee_yes + k_no + fee_no
             }
         };
@@ -259,11 +255,150 @@ impl ConfirmationQueue {
         })
     }
 
-    /// Get current prices for an arb (for live display updates)
-    pub fn get_current_prices(&self, market_id: u16) -> Option<(PriceCents, PriceCents, PriceCents, PriceCents)> {
-        let market = self.state.get_by_id(market_id)?;
-        let (k_yes, k_no, _, _) = market.kalshi.load();
-        let (p_yes, p_no, _, _) = market.poly.load();
-        Some((k_yes, k_no, p_yes, p_no))
+    /// Re-validate arb using ArbOpportunity::detect() with current orderbook prices.
+    /// Returns Some(ArbOpportunity) if a valid arb still exists, None otherwise.
+    ///
+    /// This can be used to get a fresh request with current prices for execution,
+    /// rather than using the potentially stale prices from when the arb was queued.
+    #[allow(dead_code)]
+    pub fn validate_arb(&self, arb: &PendingArb, config: &ArbConfig) -> Option<ArbOpportunity> {
+        // Test arbs always pass validation - return a copy of the original request
+        if arb.request.is_test {
+            return Some(arb.request.clone());
+        }
+
+        let market = self.state.get_by_id(arb.request.market_id)?;
+
+        // Get current prices from orderbook
+        let kalshi = market.kalshi.load();
+        let poly = market.poly.load();
+
+        // Use ArbOpportunity::detect() to re-validate with current prices
+        ArbOpportunity::detect(arb.request.market_id, kalshi, poly, config, 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::MarketType;
+
+    /// Create a test MarketPair with minimal fields
+    fn test_market_pair() -> Arc<MarketPair> {
+        Arc::new(MarketPair {
+            pair_id: "test-pair".into(),
+            league: "nba".into(),
+            market_type: MarketType::Moneyline,
+            description: "Test Market".into(),
+            kalshi_event_ticker: "KXNBA-TEST".into(),
+            kalshi_market_ticker: "KXNBA-TEST-MKT".into(),
+            kalshi_event_slug: "test-event".into(),
+            poly_slug: "nba-test-2026-01-01".into(),
+            poly_yes_token: "0x1234".into(),
+            poly_no_token: "0x5678".into(),
+            line_value: None,
+            team_suffix: None,
+        })
+    }
+
+    /// Create a test ArbOpportunity
+    fn test_request(yes_price: u16, no_price: u16, yes_size: u16, no_size: u16) -> ArbOpportunity {
+        ArbOpportunity {
+            market_id: 1,
+            yes_price,
+            no_price,
+            yes_size,
+            no_size,
+            arb_type: ArbType::PolyYesKalshiNo,
+            detected_ns: 0,
+            is_test: false,
+        }
+    }
+
+    // =========================================================================
+    // PendingArb tests
+    // =========================================================================
+
+    #[test]
+    fn test_pending_arb_max_contracts_basic() {
+        // YES: 400/40 = 10 contracts, NO: 600/50 = 12 contracts
+        // max_contracts = min(10, 12) = 10
+        let request = test_request(40, 50, 400, 600);
+        let pending = PendingArb::new(request, test_market_pair());
+
+        assert_eq!(pending.max_contracts(), 10);
+    }
+
+    #[test]
+    fn test_pending_arb_max_contracts_no_side_limiting() {
+        // YES: 800/40 = 20 contracts, NO: 250/50 = 5 contracts
+        // max_contracts = min(20, 5) = 5
+        let request = test_request(40, 50, 800, 250);
+        let pending = PendingArb::new(request, test_market_pair());
+
+        assert_eq!(pending.max_contracts(), 5);
+    }
+
+    #[test]
+    fn test_pending_arb_max_contracts_zero_yes_price() {
+        // Division by zero protection
+        let request = test_request(0, 50, 400, 600);
+        let pending = PendingArb::new(request, test_market_pair());
+
+        assert_eq!(pending.max_contracts(), 0);
+    }
+
+    #[test]
+    fn test_pending_arb_max_contracts_zero_no_price() {
+        // Division by zero protection
+        let request = test_request(40, 0, 400, 600);
+        let pending = PendingArb::new(request, test_market_pair());
+
+        assert_eq!(pending.max_contracts(), 0);
+    }
+
+    #[test]
+    fn test_pending_arb_max_contracts_both_prices_zero() {
+        let request = test_request(0, 0, 400, 600);
+        let pending = PendingArb::new(request, test_market_pair());
+
+        assert_eq!(pending.max_contracts(), 0);
+    }
+
+    #[test]
+    fn test_pending_arb_update_increments_detection_count() {
+        let request1 = test_request(40, 50, 400, 600);
+        let request2 = test_request(41, 51, 500, 700);
+        let mut pending = PendingArb::new(request1, test_market_pair());
+
+        assert_eq!(pending.detection_count, 1);
+
+        pending.update(request2);
+
+        assert_eq!(pending.detection_count, 2);
+        assert_eq!(pending.request.yes_price, 41);
+        assert_eq!(pending.request.no_price, 51);
+    }
+
+    #[test]
+    fn test_pending_arb_profit_cents_delegates_to_request() {
+        // This tests that profit_cents() correctly delegates to request.profit_cents()
+        let request = test_request(40, 50, 400, 600);
+        let pending = PendingArb::new(request.clone(), test_market_pair());
+
+        // profit_cents should match the request's calculation
+        assert_eq!(pending.profit_cents(), request.profit_cents());
+    }
+
+    #[test]
+    fn test_pending_arb_urls_constructed_correctly() {
+        let request = test_request(40, 50, 400, 600);
+        let pending = PendingArb::new(request, test_market_pair());
+
+        // Kalshi URL should contain the market ticker
+        assert!(pending.kalshi_url.contains("KXNBA-TEST-MKT"));
+
+        // Polymarket URL should be built from league and slug
+        assert!(pending.poly_url.contains("nba"));
     }
 }

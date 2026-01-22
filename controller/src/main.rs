@@ -22,6 +22,7 @@
 //! - **Circuit breaker protection** with configurable risk limits
 //! - **Market discovery system** with intelligent caching and incremental updates
 
+mod arb;
 mod cache;
 mod circuit_breaker;
 mod config;
@@ -68,7 +69,7 @@ use crate::remote_execution::{HybridExecutor, run_hybrid_execution_loop};
 use crate::remote_protocol::Platform as WsPlatform;
 use crate::remote_trader::RemoteTraderServer;
 use trading::execution::Platform as TradingPlatform;
-use types::{FastExecutionRequest, GlobalState, MarketPair, MarketType, PriceCents};
+use types::{ArbOpportunity, GlobalState, MarketPair, MarketType, PriceCents};
 
 /// Polymarket CLOB API host
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
@@ -733,9 +734,12 @@ async fn main() -> Result<()> {
     // Create Kalshi API client
     let kalshi_api = Arc::new(KalshiApiClient::new(kalshi_config));
 
-    // Build global state
+    // Build global state with arb config loaded from environment
+    let arb_config = arb::ArbConfig::from_env();
+    info!("   Arb threshold: {}¢ | min contracts: {}",
+          arb_config.threshold_cents(), arb_config.min_contracts());
     let state = Arc::new({
-        let s = GlobalState::new();
+        let s = GlobalState::new(arb_config);
         for pair in result.pairs {
             s.add_pair(pair);
         }
@@ -749,7 +753,7 @@ async fn main() -> Result<()> {
 
     // Confirmation mode setup
     let confirm_enabled = config::any_league_requires_confirmation();
-    let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::channel::<(FastExecutionRequest, Arc<MarketPair>)>(256);
+    let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::channel::<(ArbOpportunity, Arc<MarketPair>)>(256);
     let (tui_update_tx, tui_update_rx) = tokio::sync::mpsc::channel::<()>(16);
     let (tui_action_tx, mut tui_action_rx) = tokio::sync::mpsc::channel::<ConfirmAction>(16);
     let (tui_log_tx, tui_log_rx) = tokio::sync::mpsc::channel::<String>(1024);
@@ -999,10 +1003,20 @@ async fn main() -> Result<()> {
                                     // Validate arb is still profitable
                                     match confirm_queue_clone.validate_arb_detailed(&arb) {
                                         Some(result) if result.is_valid => {
-                                            log_msg(format!("[{}]  INFO [CONFIRM] ✅ Approved: {} - forwarding to execution",
-                                                chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
-                                            let _ = confirm_exec_tx.try_send(arb.request.clone());
-                                            ConfirmationStatus::Accepted
+                                            match confirm_exec_tx.try_send(arb.request.clone()) {
+                                                Ok(()) => {
+                                                    log_msg(format!("[{}]  INFO [CONFIRM] ✅ Approved: {} - forwarded to execution",
+                                                        chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
+                                                    ConfirmationStatus::Accepted
+                                                }
+                                                Err(e) => {
+                                                    log_msg(format!("[{}] ERROR [CONFIRM] ❌ Approved but FAILED to forward: {} - channel error: {}",
+                                                        chrono::Local::now().format("%H:%M:%S"), arb.pair.description, e));
+                                                    tracing::error!("[CONFIRM] Execution channel send failed for market {}: {}", market_id, e);
+                                                    // Return Accepted so it's logged, but the user will see the error message
+                                                    ConfirmationStatus::Accepted
+                                                }
+                                            }
                                         }
                                         Some(result) => {
                                             // Expired - show how much prices moved
@@ -1077,8 +1091,15 @@ async fn main() -> Result<()> {
     } else {
         // When confirm mode is disabled, drain confirm_rx and forward directly to execution
         Some(tokio::spawn(async move {
-            while let Some((req, _pair)) = confirm_rx.recv().await {
-                let _ = confirm_exec_tx.try_send(req);
+            let mut dropped_count = 0u64;
+            while let Some((req, pair)) = confirm_rx.recv().await {
+                if let Err(e) = confirm_exec_tx.try_send(req) {
+                    dropped_count += 1;
+                    tracing::warn!(
+                        "[CONFIRM] Bypass mode: arb dropped for {} - {} (total dropped: {})",
+                        pair.description, e, dropped_count
+                    );
+                }
             }
         }))
     };
@@ -1102,7 +1123,7 @@ async fn main() -> Result<()> {
             .unwrap_or(10);
 
         tokio::spawn(async move {
-            use types::{FastExecutionRequest, ArbType};
+            use types::{ArbOpportunity, ArbType};
 
             // Wait for WebSocket connections to establish and populate orderbooks
             info!("[TEST] Injecting synthetic arbitrage opportunity in {} seconds...", test_arb_delay);
@@ -1135,7 +1156,7 @@ async fn main() -> Result<()> {
                 if let Some(market) = test_state.get_by_id(market_id as u16) {
                     if let Some(pair) = market.pair() {
                         // SIZE: 1000 cents = 10 contracts (Poly $1 min requires ~3 contracts at 40¢)
-                        let fake_req = FastExecutionRequest {
+                        let fake_req = ArbOpportunity {
                             market_id: market_id as u16,
                             yes_price,
                             no_price,
@@ -1227,11 +1248,8 @@ async fn main() -> Result<()> {
     // This catches opportunities that existed before both platforms were fully loaded
     let sweep_state = state.clone();
     let sweep_exec_tx = exec_tx.clone();
-    let sweep_threshold = threshold_cents;
     let sweep_clock = clock.clone();
     tokio::spawn(async move {
-        use crate::types::{FastExecutionRequest, ArbType};
-
         // Wait for WebSockets to connect and receive initial snapshots
         const STARTUP_SWEEP_DELAY_SECS: u64 = 10;
         info!("[SWEEP] Startup sweep scheduled in {}s...", STARTUP_SWEEP_DELAY_SECS);
@@ -1251,44 +1269,22 @@ async fn main() -> Result<()> {
             }
             markets_scanned += 1;
 
-            let arb_mask = market.check_arbs(sweep_threshold);
-            if arb_mask != 0 {
+            // Check for arbs using ArbOpportunity::detect()
+            if let Some(req) = ArbOpportunity::detect(
+                market.market_id,
+                market.kalshi.load(),
+                market.poly.load(),
+                sweep_state.arb_config(),
+                sweep_clock.now_ns(),
+            ) {
                 arbs_found += 1;
-
-                // Build execution request (same logic as send_arb_request)
-                let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
-                let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.load();
-
-                let (yes_price, no_price, yes_size, no_size, arb_type) = if arb_mask & 1 != 0 {
-                    (p_yes, k_no, p_yes_size, k_no_size, ArbType::PolyYesKalshiNo)
-                } else if arb_mask & 2 != 0 {
-                    (k_yes, p_no, k_yes_size, p_no_size, ArbType::KalshiYesPolyNo)
-                } else if arb_mask & 4 != 0 {
-                    (p_yes, p_no, p_yes_size, p_no_size, ArbType::PolyOnly)
-                } else if arb_mask & 8 != 0 {
-                    (k_yes, k_no, k_yes_size, k_no_size, ArbType::KalshiOnly)
-                } else {
-                    continue;
-                };
-
-                let req = FastExecutionRequest {
-                    market_id: market.market_id,
-                    yes_price,
-                    no_price,
-                    yes_size,
-                    no_size,
-                    arb_type,
-                    detected_ns: sweep_clock.now_ns(),
-                    is_test: false,
-                };
-
                 if let Err(e) = sweep_exec_tx.try_send(req) {
                     warn!("[SWEEP] Failed to send arb request: {}", e);
                 }
             }
         }
 
-        info!("[SWEEP] ✅ Startup sweep complete: scanned {} markets, found {} arbs",
+        info!("[SWEEP] Startup sweep complete: scanned {} markets, found {} arbs",
               markets_scanned, arbs_found);
     });
 
@@ -1298,7 +1294,7 @@ async fn main() -> Result<()> {
     let heartbeat_tui_state = tui_state.clone();
     let heartbeat_log_tx = tui_log_tx.clone();
     let heartbeat_handle = tokio::spawn(async move {
-        use crate::types::kalshi_fee_cents;
+        use crate::arb::kalshi_fee;
         use std::collections::HashMap;
 
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
@@ -1320,7 +1316,10 @@ async fn main() -> Result<()> {
             // Helper closure to route log output
             let log_line = |line: String| {
                 if tui_active {
-                    let _ = heartbeat_log_tx.try_send(line);
+                    if heartbeat_log_tx.try_send(line.clone()).is_err() {
+                        // Channel full or closed, fallback to println
+                        println!("{}", line);
+                    }
                 } else {
                     println!("{}", line);
                 }
@@ -1386,9 +1385,9 @@ async fn main() -> Result<()> {
                     if verbose {
                         // Calculate gap and sizes only if both platforms have prices
                         let (gap, yes_size, no_size) = if has_k && has_p {
-                            let fee1 = kalshi_fee_cents(k_no);
+                            let fee1 = kalshi_fee(k_no);
                             let cost1 = p_yes + k_no + fee1;
-                            let fee2 = kalshi_fee_cents(k_yes);
+                            let fee2 = kalshi_fee(k_yes);
                             let cost2 = k_yes + fee2 + p_no;
                             // Determine which arb type is better and use those sizes
                             if cost1 <= cost2 {
@@ -1424,10 +1423,10 @@ async fn main() -> Result<()> {
                 if has_k && has_p {
                     with_both += 1;
 
-                    let fee1 = kalshi_fee_cents(k_no);
+                    let fee1 = kalshi_fee(k_no);
                     let cost1 = p_yes + k_no + fee1;
 
-                    let fee2 = kalshi_fee_cents(k_yes);
+                    let fee2 = kalshi_fee(k_yes);
                     let cost2 = k_yes + fee2 + p_no;
 
                     let (best_cost, best_fee, is_poly_yes, yes_size, no_size) = if cost1 <= cost2 {
