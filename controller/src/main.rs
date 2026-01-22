@@ -70,6 +70,7 @@ use crate::remote_protocol::Platform as WsPlatform;
 use crate::remote_trader::RemoteTraderServer;
 use trading::execution::Platform as TradingPlatform;
 use types::{FastExecutionRequest, GlobalState, MarketPair, MarketType, PriceCents};
+use arb::ArbOpportunity;
 
 /// Polymarket CLOB API host
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
@@ -1231,11 +1232,8 @@ async fn main() -> Result<()> {
     // This catches opportunities that existed before both platforms were fully loaded
     let sweep_state = state.clone();
     let sweep_exec_tx = exec_tx.clone();
-    let sweep_threshold = threshold_cents;
     let sweep_clock = clock.clone();
     tokio::spawn(async move {
-        use crate::types::{FastExecutionRequest, ArbType};
-
         // Wait for WebSockets to connect and receive initial snapshots
         const STARTUP_SWEEP_DELAY_SECS: u64 = 10;
         info!("[SWEEP] Startup sweep scheduled in {}s...", STARTUP_SWEEP_DELAY_SECS);
@@ -1255,44 +1253,24 @@ async fn main() -> Result<()> {
             }
             markets_scanned += 1;
 
-            let arb_mask = market.check_arbs(sweep_threshold);
-            if arb_mask != 0 {
+            // Check for arbs using ArbOpportunity
+            let arb = ArbOpportunity::new(
+                market.market_id,
+                market.kalshi.load(),
+                market.poly.load(),
+                sweep_state.arb_config(),
+                sweep_clock.now_ns(),
+            );
+            if arb.is_valid() {
                 arbs_found += 1;
-
-                // Build execution request (same logic as send_arb_request)
-                let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
-                let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.load();
-
-                let (yes_price, no_price, yes_size, no_size, arb_type) = if arb_mask & 1 != 0 {
-                    (p_yes, k_no, p_yes_size, k_no_size, ArbType::PolyYesKalshiNo)
-                } else if arb_mask & 2 != 0 {
-                    (k_yes, p_no, k_yes_size, p_no_size, ArbType::KalshiYesPolyNo)
-                } else if arb_mask & 4 != 0 {
-                    (p_yes, p_no, p_yes_size, p_no_size, ArbType::PolyOnly)
-                } else if arb_mask & 8 != 0 {
-                    (k_yes, k_no, k_yes_size, k_no_size, ArbType::KalshiOnly)
-                } else {
-                    continue;
-                };
-
-                let req = FastExecutionRequest {
-                    market_id: market.market_id,
-                    yes_price,
-                    no_price,
-                    yes_size,
-                    no_size,
-                    arb_type,
-                    detected_ns: sweep_clock.now_ns(),
-                    is_test: false,
-                };
-
+                let req = FastExecutionRequest::from_arb(&arb);
                 if let Err(e) = sweep_exec_tx.try_send(req) {
                     warn!("[SWEEP] Failed to send arb request: {}", e);
                 }
             }
         }
 
-        info!("[SWEEP] ✅ Startup sweep complete: scanned {} markets, found {} arbs",
+        info!("[SWEEP] Startup sweep complete: scanned {} markets, found {} arbs",
               markets_scanned, arbs_found);
     });
 
