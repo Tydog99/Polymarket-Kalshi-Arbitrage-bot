@@ -52,14 +52,9 @@ impl PendingArb {
     }
 
     /// Calculate max contracts based on available size and prices.
-    /// Returns the minimum of (yes_size / yes_price) and (no_size / no_price).
-    pub fn max_contracts(&self) -> i64 {
-        if self.request.yes_price == 0 || self.request.no_price == 0 {
-            return 0;
-        }
-        let yes_contracts = self.request.yes_size / self.request.yes_price;
-        let no_contracts = self.request.no_size / self.request.no_price;
-        yes_contracts.min(no_contracts) as i64
+    /// Delegates to FastExecutionRequest::max_contracts().
+    pub fn max_contracts(&self) -> u16 {
+        self.request.max_contracts()
     }
 }
 
