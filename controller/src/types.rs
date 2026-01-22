@@ -323,23 +323,6 @@ pub struct FastExecutionRequest {
 }
 
 impl FastExecutionRequest {
-    /// Create from an ArbOpportunity (must be valid).
-    ///
-    /// # Panics
-    /// Panics if `arb.arb_type()` returns None (i.e., arb is not valid).
-    pub fn from_arb(arb: &crate::arb::ArbOpportunity) -> Self {
-        Self {
-            market_id: arb.market_id(),
-            yes_price: arb.yes_price(),
-            no_price: arb.no_price(),
-            yes_size: arb.yes_size(),
-            no_size: arb.no_size(),
-            arb_type: arb.arb_type().expect("from_arb called on invalid arb"),
-            detected_ns: arb.detected_ns(),
-            is_test: false,
-        }
-    }
-
     /// Calculate max executable contracts (minimum of both sides).
     ///
     /// Returns the number of complete contracts that can be bought,
@@ -1154,25 +1137,6 @@ mod tests {
         };
 
         assert_eq!(req.max_contracts(), 9);
-    }
-
-    #[test]
-    fn test_execution_request_max_contracts_matches_arb_opportunity() {
-        // Verify FastExecutionRequest::max_contracts matches ArbOpportunity::max_contracts
-        let config = ArbConfig::default();
-        let kalshi = (55u16, 50u16, 1000u16, 800u16);
-        let poly = (40u16, 65u16, 600u16, 1000u16);
-
-        let arb = crate::arb::ArbOpportunity::new(42, kalshi, poly, &config, 12345);
-        assert!(arb.is_valid());
-
-        let req = FastExecutionRequest::from_arb(&arb);
-
-        assert_eq!(
-            req.max_contracts(),
-            arb.max_contracts(),
-            "FastExecutionRequest::max_contracts should match ArbOpportunity::max_contracts"
-        );
     }
 
     // =========================================================================
