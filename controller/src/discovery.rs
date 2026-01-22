@@ -3212,4 +3212,84 @@ mod tests {
         assert_eq!(no, "WHU_TOKEN");
         assert_eq!(reason, "token2=YES (outcome[1] matched)");
     }
+
+    // === Tests for fast path market grouping ===
+
+    #[test]
+    fn test_group_markets_by_event_ticker() {
+        // Test the grouping logic used in the fast path
+        // We simulate the HashMap grouping without needing actual KalshiMarket structs
+        let market_data = vec![
+            ("KXNBAGAME-26JAN17LALBOS-LAL", Some("KXNBAGAME-26JAN17LALBOS"), None::<&str>),
+            ("KXNBAGAME-26JAN17LALBOS-BOS", Some("KXNBAGAME-26JAN17LALBOS"), None),
+            ("KXNBAGAME-26JAN17MIAOKC-MIA", Some("KXNBAGAME-26JAN17MIAOKC"), None),
+        ];
+
+        // Group by event_ticker (same logic as discover_esports_league fast path)
+        let mut markets_by_event: HashMap<String, Vec<&str>> = HashMap::new();
+        for (ticker, event_ticker, _mve) in &market_data {
+            if let Some(evt) = event_ticker {
+                markets_by_event.entry(evt.to_string()).or_default().push(ticker);
+            }
+        }
+
+        // Verify grouping
+        assert_eq!(markets_by_event.len(), 2, "Should have 2 distinct events");
+        assert_eq!(
+            markets_by_event.get("KXNBAGAME-26JAN17LALBOS").map(|v| v.len()),
+            Some(2),
+            "LAL vs BOS event should have 2 markets"
+        );
+        assert_eq!(
+            markets_by_event.get("KXNBAGAME-26JAN17MIAOKC").map(|v| v.len()),
+            Some(1),
+            "MIA vs OKC event should have 1 market"
+        );
+    }
+
+    #[test]
+    fn test_group_markets_with_mve_collection_ticker() {
+        // MVE markets use mve_collection_ticker as the event key (preferred over event_ticker)
+        let market_data = vec![
+            ("KXMVENFL-KC", Some("KXMVENFL-26JAN19KCBUF"), Some("KXMVENFL-26JAN19KCBUF")),
+            ("KXMVENFL-BUF", Some("KXMVENFL-26JAN19KCBUF"), Some("KXMVENFL-26JAN19KCBUF")),
+        ];
+
+        // In the fast path, we prefer mve_collection_ticker over event_ticker
+        let mut markets_by_event: HashMap<String, Vec<&str>> = HashMap::new();
+        for (ticker, event_ticker, mve_ticker) in &market_data {
+            let event_key = mve_ticker.or(*event_ticker);
+            if let Some(key) = event_key {
+                markets_by_event.entry(key.to_string()).or_default().push(ticker);
+            }
+        }
+
+        assert_eq!(markets_by_event.len(), 1, "Should group under single MVE collection");
+        assert_eq!(
+            markets_by_event.get("KXMVENFL-26JAN19KCBUF").map(|v| v.len()),
+            Some(2),
+            "MVE collection should have 2 markets"
+        );
+    }
+
+    #[test]
+    fn test_group_markets_skips_missing_event_ticker() {
+        let market_data = vec![
+            ("KXNBAGAME-26JAN17LALBOS-LAL", Some("KXNBAGAME-26JAN17LALBOS")),
+            ("KXWEIRD-NOEVT", None),  // Missing event_ticker
+        ];
+
+        let mut markets_by_event: HashMap<String, Vec<&str>> = HashMap::new();
+        for (ticker, event_ticker) in &market_data {
+            if let Some(evt) = event_ticker {
+                markets_by_event.entry(evt.to_string()).or_default().push(ticker);
+            }
+        }
+
+        assert_eq!(markets_by_event.len(), 1, "Should only have 1 event (skipped missing)");
+        assert!(
+            markets_by_event.get("KXNBAGAME-26JAN17LALBOS").is_some(),
+            "Valid market should be grouped"
+        );
+    }
 }

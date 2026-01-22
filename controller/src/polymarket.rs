@@ -1263,4 +1263,101 @@ mod tests {
         assert_eq!(m0_p_upd, 1, "Market 0 should have 1 Poly update from price change");
         assert_eq!(m1_p_upd, 1, "Market 1 should have 1 Poly update from price change");
     }
+
+    // === Tests for increment_date_in_slug ===
+
+    #[test]
+    fn test_increment_date_in_slug_basic() {
+        use super::increment_date_in_slug;
+
+        // Basic case: mid-month
+        assert_eq!(
+            increment_date_in_slug("epl-che-avl-2025-12-08"),
+            Some("epl-che-avl-2025-12-09".to_string())
+        );
+
+        // NBA style slug
+        assert_eq!(
+            increment_date_in_slug("nba-lal-bos-2026-01-17"),
+            Some("nba-lal-bos-2026-01-18".to_string())
+        );
+    }
+
+    #[test]
+    fn test_increment_date_in_slug_month_rollover() {
+        use super::increment_date_in_slug;
+
+        // End of 31-day month
+        assert_eq!(
+            increment_date_in_slug("nba-lal-bos-2026-01-31"),
+            Some("nba-lal-bos-2026-02-01".to_string())
+        );
+
+        // End of 30-day month
+        assert_eq!(
+            increment_date_in_slug("epl-mun-liv-2026-04-30"),
+            Some("epl-mun-liv-2026-05-01".to_string())
+        );
+    }
+
+    #[test]
+    fn test_increment_date_in_slug_year_rollover() {
+        use super::increment_date_in_slug;
+
+        // End of year
+        assert_eq!(
+            increment_date_in_slug("nfl-dal-phi-2025-12-31"),
+            Some("nfl-dal-phi-2026-01-01".to_string())
+        );
+    }
+
+    #[test]
+    fn test_increment_date_in_slug_february() {
+        use super::increment_date_in_slug;
+
+        // Non-leap year February
+        assert_eq!(
+            increment_date_in_slug("nba-lal-bos-2025-02-28"),
+            Some("nba-lal-bos-2025-03-01".to_string())
+        );
+
+        // Leap year February
+        assert_eq!(
+            increment_date_in_slug("nba-lal-bos-2024-02-28"),
+            Some("nba-lal-bos-2024-02-29".to_string())
+        );
+        assert_eq!(
+            increment_date_in_slug("nba-lal-bos-2024-02-29"),
+            Some("nba-lal-bos-2024-03-01".to_string())
+        );
+    }
+
+    #[test]
+    fn test_increment_date_in_slug_with_suffix() {
+        use super::increment_date_in_slug;
+
+        // Spread market with suffix
+        assert_eq!(
+            increment_date_in_slug("nba-lal-bos-2026-01-17-spread-home-5pt5"),
+            Some("nba-lal-bos-2026-01-18-spread-home-5pt5".to_string())
+        );
+
+        // Total market with suffix
+        assert_eq!(
+            increment_date_in_slug("nba-lal-bos-2026-01-31-total-220pt5"),
+            Some("nba-lal-bos-2026-02-01-total-220pt5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_increment_date_in_slug_invalid() {
+        use super::increment_date_in_slug;
+
+        // Too few parts
+        assert_eq!(increment_date_in_slug("nba-lal-bos"), None);
+        assert_eq!(increment_date_in_slug("invalid"), None);
+
+        // Invalid date parts
+        assert_eq!(increment_date_in_slug("nba-lal-bos-abc-01-17"), None);
+    }
 }
