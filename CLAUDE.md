@@ -38,9 +38,7 @@ WebSocket Price Updates (kalshi.rs, polymarket.rs)
     ↓
 Global State with Lock-Free Orderbook Cache (types.rs)
     ↓
-Real-time Arb Detection in WebSocket Handlers (kalshi.rs, polymarket.rs)
-    ↓
-ArbOpportunity Validation (arb.rs) - validates prices, fees, sizes
+ArbOpportunity::detect() in WebSocket Handlers - validates prices, fees, sizes
     ↓
 Confirmation Queue (confirm_queue.rs) or Direct Execution
     ↓
