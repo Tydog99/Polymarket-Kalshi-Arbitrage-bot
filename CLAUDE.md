@@ -134,7 +134,9 @@ CONTROLLER_PLATFORMS=kalshi,polymarket dotenvx run -- cargo run --release
 dotenvx run -- cargo run --release
 ```
 
-**Arbitrage detection:** `ARB_THRESHOLD_CENTS` (default: 99, meaning arb exists when cost < 99 cents), `ARB_MIN_CONTRACTS` (default: 1.0, minimum contracts for valid arb)
+**Arbitrage detection:**
+- `ARB_THRESHOLD_CENTS` (default: 99, valid: 1-100) - arb exists when total cost ≤ threshold. Invalid values logged and replaced with default.
+- `ARB_MIN_CONTRACTS` (default: 1.0, must be > 0) - minimum executable contracts for valid arb. Invalid values logged and replaced with default.
 
 **Circuit breaker:** `CB_ENABLED`, `CB_MAX_POSITION_PER_MARKET`, `CB_MAX_TOTAL_POSITION`, `CB_MAX_DAILY_LOSS`, `CB_MAX_CONSECUTIVE_ERRORS`, `CB_COOLDOWN_SECS`, `CB_MIN_CONTRACTS` (minimum contracts to execute, trades are capped to remaining capacity)
 
