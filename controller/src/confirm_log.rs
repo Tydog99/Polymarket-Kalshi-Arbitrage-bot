@@ -93,7 +93,9 @@ impl ConfirmationLogger {
         &self.file_path
     }
 
-    /// Get the number of records logged
+    /// Get the number of records logged.
+    /// Useful for summary statistics when closing a confirmation session.
+    #[allow(dead_code)]
     pub fn record_count(&self) -> usize {
         self.record_count
     }
