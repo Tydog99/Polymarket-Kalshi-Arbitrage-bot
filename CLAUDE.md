@@ -40,6 +40,8 @@ Global State with Lock-Free Orderbook Cache (types.rs)
     ↓
 Heartbeat Arbitrage Detection (main.rs, every 10s default)
     ↓
+ArbOpportunity Validation (arb.rs) - validates prices, fees, sizes
+    ↓
 Execution Loop (execution.rs)
     ↓
 Platform Orders (kalshi.rs, polymarket_clob.rs)
@@ -50,6 +52,7 @@ Position Tracking (position_tracker.rs)
 ### Key Modules
 
 - **`main.rs`** - Entry point, WebSocket orchestration, heartbeat-based arb detection
+- **`arb.rs`** - Centralized arbitrage opportunity detection (ArbConfig, ArbOpportunity)
 - **`types.rs`** - Core data structures including `AtomicOrderbook` (lock-free using packed u64 with CAS loops)
 - **`execution.rs`** - Concurrent order execution with in-flight deduplication (8-slot bitmask for 512 markets)
 - **`kalshi.rs`** - Kalshi REST/WebSocket client with RSA signature authentication
@@ -59,7 +62,7 @@ Position Tracking (position_tracker.rs)
 - **`circuit_breaker.rs`** - Risk management: position limits, daily loss limits, error tracking, cooldown
 - **`position_tracker.rs`** - Fill recording, P&L calculation, state persistence to `positions.json`
 - **`cache.rs`** - Team code bidirectional mapping between platforms
-- **`config.rs`** - League definitions, API endpoints, thresholds (ARB_THRESHOLD = 0.995)
+- **`config.rs`** - League definitions, API endpoints, platform configuration
 
 ### Arbitrage Types
 
@@ -126,6 +129,8 @@ CONTROLLER_PLATFORMS=kalshi,polymarket dotenvx run -- cargo run --release
 # Pure router mode (no local execution)
 dotenvx run -- cargo run --release
 ```
+
+**Arbitrage detection:** `ARB_THRESHOLD_CENTS` (default: 99, meaning arb exists when cost < 99 cents), `ARB_MIN_CONTRACTS` (default: 1.0, minimum contracts for valid arb)
 
 **Circuit breaker:** `CB_ENABLED`, `CB_MAX_POSITION_PER_MARKET`, `CB_MAX_TOTAL_POSITION`, `CB_MAX_DAILY_LOSS`, `CB_MAX_CONSECUTIVE_ERRORS`, `CB_COOLDOWN_SECS`, `CB_MIN_CONTRACTS` (minimum contracts to execute, trades are capped to remaining capacity)
 
