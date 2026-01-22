@@ -60,6 +60,20 @@ Position Tracking (position_tracker.rs)
 - **`position_tracker.rs`** - Fill recording, P&L calculation, state persistence to `positions.json`
 - **`cache.rs`** - Team code bidirectional mapping between platforms
 - **`config.rs`** - League definitions, API endpoints, thresholds (ARB_THRESHOLD = 0.995)
+- **`confirm_tui.rs`** - Split-pane TUI for manual arb confirmation with TUI-aware log routing
+- **`confirm_queue.rs`** - Queue of pending arbs awaiting user confirmation
+
+### Detailed Documentation
+
+**Read these docs BEFORE modifying the related subsystems:**
+
+| Doc | Read when... |
+|-----|--------------|
+| `controller/docs/EXECUTION.md` | Touching `execution.rs`, in-flight dedup, auto-close logic, fill handling |
+| `controller/docs/ATOMIC_ORDERBOOK.md` | Touching `types.rs`, `AtomicOrderbook`, bit-packing, or lock-free updates |
+| `controller/docs/REMOTE_TRADING.md` | Touching `remote_*.rs`, hybrid executor, controller↔trader protocol |
+| `controller/docs/CONFIRMATION_TUI.md` | Touching TUI, logging, `confirm_*.rs`, or debugging log display issues |
+| `controller/docs/PAIRING_DEBUG_PLAYBOOK.md` | Debugging market pairing between Kalshi/Polymarket |
 
 ### Arbitrage Types
 

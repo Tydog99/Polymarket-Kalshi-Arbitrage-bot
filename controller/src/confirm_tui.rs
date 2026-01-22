@@ -3,9 +3,64 @@
 //! Upper 2/3: scrolling log buffer
 //! Lower 1/3: confirmation panel with pending arb details
 
-use std::io;
+use std::io::{self, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::collections::VecDeque;
+
+/// Global flag indicating whether the TUI is active.
+/// When true, console logging should be suppressed to avoid corrupting the display.
+pub static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Global channel sender for routing logs to the TUI when active.
+static TUI_LOG_TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
+
+/// Initialize the global TUI log channel. Call this once at startup.
+pub fn init_tui_log_channel(tx: mpsc::Sender<String>) {
+    let _ = TUI_LOG_TX.set(tx);
+}
+
+/// A writer that routes output to stdout or the TUI log channel based on TUI state.
+/// When TUI is active, logs are sent to the channel for display in the log pane.
+/// When TUI is inactive, logs go to stdout normally.
+pub struct TuiAwareWriter;
+
+impl Write for TuiAwareWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if TUI_ACTIVE.load(Ordering::Relaxed) {
+            // TUI is active - send to channel for display in log pane
+            if let Some(tx) = TUI_LOG_TX.get() {
+                if let Ok(s) = std::str::from_utf8(buf) {
+                    // Strip trailing newline for cleaner display
+                    let trimmed = s.trim_end_matches('\n');
+                    if !trimmed.is_empty() {
+                        let _ = tx.try_send(trimmed.to_string());
+                    }
+                }
+            }
+            Ok(buf.len())
+        } else {
+            io::stdout().write(buf)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if TUI_ACTIVE.load(Ordering::Relaxed) {
+            Ok(())
+        } else {
+            io::stdout().flush()
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TuiAwareWriter {
+    type Writer = TuiAwareWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TuiAwareWriter
+    }
+}
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -135,6 +190,7 @@ pub async fn run_tui(
     let mut terminal = Terminal::new(backend)?;
 
     state.write().await.active = true;
+    TUI_ACTIVE.store(true, Ordering::Relaxed);
 
     loop {
         // Check if queue is empty - if so, exit TUI
@@ -190,6 +246,7 @@ pub async fn run_tui(
 
     // Cleanup terminal
     state.write().await.active = false;
+    TUI_ACTIVE.store(false, Ordering::Relaxed);
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;

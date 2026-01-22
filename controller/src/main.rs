@@ -418,10 +418,12 @@ fn init_logging() -> (PathBuf, WorkerGuard) {
     // Create timer for consistent formatting
     let timer = tracing_subscriber::fmt::time::ChronoLocal::new("[%H:%M:%S]".to_string());
 
-    // Console layer with color support
+    // Console layer with color support, using TUI-aware writer that routes
+    // logs to the TUI channel when active to avoid corrupting the display
     let console_layer = tracing_subscriber::fmt::layer()
         .with_timer(timer.clone())
-        .with_ansi(true);
+        .with_ansi(true)
+        .with_writer(confirm_tui::TuiAwareWriter);
 
     // File layer without ANSI codes
     let file_layer = tracing_subscriber::fmt::layer()
@@ -767,6 +769,9 @@ async fn main() -> Result<()> {
     let (tui_update_tx, tui_update_rx) = tokio::sync::mpsc::channel::<()>(16);
     let (tui_action_tx, mut tui_action_rx) = tokio::sync::mpsc::channel::<ConfirmAction>(16);
     let (tui_log_tx, tui_log_rx) = tokio::sync::mpsc::channel::<String>(1024);
+
+    // Initialize the global TUI log channel so TuiAwareWriter can route logs
+    confirm_tui::init_tui_log_channel(tui_log_tx.clone());
 
     let confirm_queue = Arc::new(ConfirmationQueue::new(state.clone(), tui_update_tx));
     let tui_state = Arc::new(RwLock::new(TuiState::new()));
