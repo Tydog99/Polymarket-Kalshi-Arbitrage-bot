@@ -112,14 +112,21 @@ pub enum TuiResult {
     Quit,
 }
 
-/// Run the TUI event loop
+/// Receivers returned by TUI for reuse on relaunch
+pub struct TuiReceivers {
+    pub update_rx: mpsc::Receiver<()>,
+    pub log_rx: mpsc::Receiver<String>,
+}
+
+/// Run the TUI event loop.
+/// Returns the receivers so they can be reused on TUI relaunch.
 pub async fn run_tui(
     queue: Arc<ConfirmationQueue>,
     state: Arc<RwLock<TuiState>>,
     mut update_rx: mpsc::Receiver<()>,
     action_tx: mpsc::Sender<ConfirmAction>,
     mut log_rx: mpsc::Receiver<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TuiReceivers> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -143,14 +150,15 @@ pub async fn run_tui(
             }
         }
 
-        // Get current pending arb
+        // Get current pending arb and queue length
         let pending = queue.front().await;
+        let pending_count = queue.len().await;
 
         // Render
         {
             let tui_state = state.read().await;
             terminal.draw(|f| {
-                draw_ui(f, &tui_state, pending.as_ref());
+                draw_ui(f, &tui_state, pending.as_ref(), pending_count);
             })?;
         }
 
@@ -186,19 +194,21 @@ pub async fn run_tui(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    // Dump captured logs to main terminal
+    // Dump captured logs to main terminal and clear buffer
     {
-        let tui_state = state.read().await;
+        let mut tui_state = state.write().await;
         if !tui_state.log_buffer.is_empty() {
             println!("\n--- Logs from confirmation session ---");
             for line in &tui_state.log_buffer {
                 println!("{}", line);
             }
             println!("--- End of confirmation session logs ---\n");
+            tui_state.log_buffer.clear();
         }
     }
 
-    Ok(())
+    // Return receivers for reuse on TUI relaunch
+    Ok(TuiReceivers { update_rx, log_rx })
 }
 
 async fn handle_key(
@@ -270,6 +280,7 @@ fn draw_ui(
     f: &mut Frame,
     state: &TuiState,
     pending: Option<&PendingArb>,
+    pending_count: usize,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -280,7 +291,7 @@ fn draw_ui(
         .split(f.area());
 
     draw_log_pane(f, state, chunks[0]);
-    draw_confirm_pane(f, state, pending, chunks[1]);
+    draw_confirm_pane(f, state, pending, pending_count, chunks[1]);
 }
 
 fn draw_log_pane(f: &mut Frame, state: &TuiState, area: Rect) {
@@ -305,10 +316,15 @@ fn draw_log_pane(f: &mut Frame, state: &TuiState, area: Rect) {
     f.render_widget(list, area);
 }
 
-fn draw_confirm_pane(f: &mut Frame, state: &TuiState, pending: Option<&PendingArb>, area: Rect) {
+fn draw_confirm_pane(f: &mut Frame, state: &TuiState, pending: Option<&PendingArb>, pending_count: usize, area: Rect) {
+    let title = if pending_count > 0 {
+        format!(" Confirmation (1 of {}) ", pending_count)
+    } else {
+        " Confirmation ".to_string()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Confirmation ");
+        .title(title);
 
     if let Some(arb) = pending {
         let inner = block.inner(area);

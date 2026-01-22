@@ -80,6 +80,13 @@ struct BlacklistEntry {
     expires: Instant,
 }
 
+/// Validation result with details about price movement
+pub struct ValidationResult {
+    pub is_valid: bool,
+    pub original_cost: u16,
+    pub current_cost: u16,
+}
+
 /// Queue of pending arbitrage opportunities keyed by market_id
 pub struct ConfirmationQueue {
     /// Global state for price lookups
@@ -105,8 +112,9 @@ impl ConfirmationQueue {
         }
     }
 
-    /// Push a new arb opportunity (or update existing for same market)
-    pub async fn push(&self, request: FastExecutionRequest, pair: Arc<MarketPair>) {
+    /// Push a new arb opportunity (or update existing for same market).
+    /// Returns `true` if this was a new entry, `false` if updating existing or blacklisted.
+    pub async fn push(&self, request: FastExecutionRequest, pair: Arc<MarketPair>) -> bool {
         let market_id = request.market_id;
 
         // Check blacklist and clean expired entries in one lock acquisition
@@ -117,7 +125,7 @@ impl ConfirmationQueue {
             // Check if this market is blacklisted
             if let Some(entry) = blacklist.get(&market_id) {
                 if entry.expires > now {
-                    return; // Still blacklisted
+                    return false; // Still blacklisted
                 }
             }
 
@@ -129,17 +137,24 @@ impl ConfirmationQueue {
         let mut pending = self.pending.write().await;
         let mut order = self.order.write().await;
 
-        if let Some(existing) = pending.get_mut(&market_id) {
+        let is_new = if let Some(existing) = pending.get_mut(&market_id) {
             // Update existing entry with fresh prices
             existing.update(request);
+            false
         } else {
             // New entry
             pending.insert(market_id, PendingArb::new(request, pair));
             order.push_back(market_id);
+            true
+        };
+
+        // Only notify TUI on new entries to avoid flooding with updates.
+        // The TUI re-renders every 100ms anyway, so price updates will still show.
+        if is_new {
+            let _ = self.update_tx.try_send(());
         }
 
-        // Notify TUI
-        let _ = self.update_tx.try_send(());
+        is_new
     }
 
     /// Get the current front pending arb (if any)
@@ -191,19 +206,33 @@ impl ConfirmationQueue {
 
     /// Check if arb is still valid (prices haven't moved)
     pub fn validate_arb(&self, arb: &PendingArb) -> bool {
+        self.validate_arb_detailed(arb).map(|r| r.is_valid).unwrap_or(false)
+    }
+
+    /// Check if arb is still valid with detailed cost info
+    pub fn validate_arb_detailed(&self, arb: &PendingArb) -> Option<ValidationResult> {
         // Test arbs use synthetic prices, skip validation
         if arb.request.is_test {
-            return true;
+            return Some(ValidationResult {
+                is_valid: true,
+                original_cost: arb.request.yes_price + arb.request.no_price,
+                current_cost: arb.request.yes_price + arb.request.no_price,
+            });
         }
 
-        let market = match self.state.get_by_id(arb.request.market_id) {
-            Some(m) => m,
-            None => return false,
-        };
+        let market = self.state.get_by_id(arb.request.market_id)?;
 
         // Get current prices from orderbook
         let (k_yes, k_no, _, _) = market.kalshi.load();
         let (p_yes, p_no, _, _) = market.poly.load();
+
+        // Calculate original cost (from when arb was queued)
+        let original_cost = arb.request.yes_price + arb.request.no_price + match arb.request.arb_type {
+            ArbType::PolyYesKalshiNo => kalshi_fee_cents(arb.request.no_price),
+            ArbType::KalshiYesPolyNo => kalshi_fee_cents(arb.request.yes_price),
+            ArbType::PolyOnly => 0,
+            ArbType::KalshiOnly => kalshi_fee_cents(arb.request.yes_price) + kalshi_fee_cents(arb.request.no_price),
+        };
 
         // Calculate current cost based on arb type
         let current_cost = match arb.request.arb_type {
@@ -223,8 +252,11 @@ impl ConfirmationQueue {
             }
         };
 
-        // Still profitable if total cost < 100 cents
-        current_cost < 100
+        Some(ValidationResult {
+            is_valid: current_cost < 100,
+            original_cost,
+            current_cost,
+        })
     }
 
     /// Get current prices for an arb (for live display updates)

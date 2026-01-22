@@ -913,47 +913,69 @@ async fn main() -> Result<()> {
             };
 
             // Options to hold channels until we need to launch the TUI
+            // These get returned by TUI on exit for reuse
             let mut tui_update_rx_opt = Some(tui_update_rx);
             let mut tui_log_rx_opt = Some(tui_log_rx);
+
+            // Channel to receive TUI receivers back when TUI exits
+            let (tui_done_tx, mut tui_done_rx) = tokio::sync::mpsc::channel::<confirm_tui::TuiReceivers>(1);
 
             loop {
                 tokio::select! {
                     // Receive arbs needing confirmation
                     Some((req, pair)) = confirm_rx.recv() => {
-                        // Push to confirmation queue
-                        confirm_queue_clone.push(req, pair.clone()).await;
-                        let pending_count = confirm_queue_clone.len().await;
+                        // Push to confirmation queue (returns true only for new entries)
+                        let is_new = confirm_queue_clone.push(req, pair.clone()).await;
                         let tui_active = confirm_tui_state.read().await.active;
-                        let msg = format!("[{}]  INFO [CONFIRM] Queued arb for {} ({} pending)",
-                            chrono::Local::now().format("%H:%M:%S"), pair.description, pending_count);
-                        if tui_active {
-                            let _ = confirm_log_tx.try_send(msg);
-                        } else {
-                            println!("{}", msg);
+
+                        // Only log when a new arb is queued (not updates to existing)
+                        if is_new {
+                            let pending_count = confirm_queue_clone.len().await;
+                            let msg = format!("[{}]  INFO [CONFIRM] Queued arb for {} ({} pending)",
+                                chrono::Local::now().format("%H:%M:%S"), pair.description, pending_count);
+                            if tui_active {
+                                let _ = confirm_log_tx.try_send(msg);
+                            } else {
+                                println!("{}", msg);
+                            }
                         }
 
-                        // Launch TUI when first arb arrives (take ownership of channels)
-                        if let Some(update_rx) = tui_update_rx_opt.take() {
+                        // Launch TUI when not active and we have receivers available
+                        if !tui_active && tui_update_rx_opt.is_some() {
+                            let update_rx = tui_update_rx_opt.take().unwrap();
                             let log_rx = tui_log_rx_opt.take().expect("log_rx should exist");
                             let tui_queue = confirm_queue_clone.clone();
                             let tui_state_inner = confirm_tui_state.clone();
                             let tui_action_tx_clone = tui_action_tx.clone();
+                            let done_tx = tui_done_tx.clone();
 
                             // Set TUI active BEFORE spawning to prevent race with heartbeat output
                             confirm_tui_state.write().await.active = true;
 
                             tokio::spawn(async move {
-                                if let Err(e) = confirm_tui::run_tui(
+                                match confirm_tui::run_tui(
                                     tui_queue,
                                     tui_state_inner,
                                     update_rx,
                                     tui_action_tx_clone,
                                     log_rx,
                                 ).await {
-                                    error!("[CONFIRM] TUI error: {}", e);
+                                    Ok(receivers) => {
+                                        // Return receivers for reuse
+                                        let _ = done_tx.send(receivers).await;
+                                    }
+                                    Err(e) => {
+                                        error!("[CONFIRM] TUI error: {}", e);
+                                    }
                                 }
                             });
                         }
+                    }
+
+                    // TUI exited - reclaim receivers for next launch
+                    Some(receivers) = tui_done_rx.recv() => {
+                        tui_update_rx_opt = Some(receivers.update_rx);
+                        tui_log_rx_opt = Some(receivers.log_rx);
                     }
 
                     // Process user actions from TUI
@@ -975,15 +997,31 @@ async fn main() -> Result<()> {
                             let status = match &action {
                                 ConfirmAction::Proceed => {
                                     // Validate arb is still profitable
-                                    if confirm_queue_clone.validate_arb(&arb) {
-                                        log_msg(format!("[{}]  INFO [CONFIRM] ✅ Approved: {} - forwarding to execution",
-                                            chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
-                                        let _ = confirm_exec_tx.try_send(arb.request.clone());
-                                        ConfirmationStatus::Accepted
-                                    } else {
-                                        log_msg(format!("[{}]  WARN [CONFIRM] ⚠️ Approved but EXPIRED: {} - prices moved",
-                                            chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
-                                        ConfirmationStatus::AcceptedExpired
+                                    match confirm_queue_clone.validate_arb_detailed(&arb) {
+                                        Some(result) if result.is_valid => {
+                                            log_msg(format!("[{}]  INFO [CONFIRM] ✅ Approved: {} - forwarding to execution",
+                                                chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
+                                            let _ = confirm_exec_tx.try_send(arb.request.clone());
+                                            ConfirmationStatus::Accepted
+                                        }
+                                        Some(result) => {
+                                            // Expired - show how much prices moved
+                                            let cost_change = result.current_cost as i32 - result.original_cost as i32;
+                                            log_msg(format!(
+                                                "[{}]  WARN [CONFIRM] ⚠️ Approved but EXPIRED: {} - cost {}c → {}c ({:+}c)",
+                                                chrono::Local::now().format("%H:%M:%S"),
+                                                arb.pair.description,
+                                                result.original_cost,
+                                                result.current_cost,
+                                                cost_change
+                                            ));
+                                            ConfirmationStatus::AcceptedExpired
+                                        }
+                                        None => {
+                                            log_msg(format!("[{}]  WARN [CONFIRM] ⚠️ Approved but EXPIRED: {} - market not found",
+                                                chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
+                                            ConfirmationStatus::AcceptedExpired
+                                        }
                                     }
                                 }
                                 ConfirmAction::Reject { note } => {
