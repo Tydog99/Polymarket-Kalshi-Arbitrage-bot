@@ -1249,10 +1249,22 @@ async fn main() -> Result<()> {
     let sweep_state = state.clone();
     let sweep_exec_tx = exec_tx.clone();
     let sweep_clock = clock.clone();
+    let sweep_tui_state = tui_state.clone();
+    let sweep_log_tx = tui_log_tx.clone();
     tokio::spawn(async move {
+        // Helper closure to route log output based on TUI state
+        let log_line = |line: String, tui_active: bool| {
+            if tui_active {
+                let _ = sweep_log_tx.try_send(line);
+            } else {
+                info!("{}", line);
+            }
+        };
+
         // Wait for WebSockets to connect and receive initial snapshots
         const STARTUP_SWEEP_DELAY_SECS: u64 = 10;
-        info!("[SWEEP] Startup sweep scheduled in {}s...", STARTUP_SWEEP_DELAY_SECS);
+        let tui_active = sweep_tui_state.read().await.active;
+        log_line(format!("[SWEEP] Startup sweep scheduled in {}s...", STARTUP_SWEEP_DELAY_SECS), tui_active);
         tokio::time::sleep(tokio::time::Duration::from_secs(STARTUP_SWEEP_DELAY_SECS)).await;
 
         let market_count = sweep_state.market_count();
@@ -1284,8 +1296,9 @@ async fn main() -> Result<()> {
             }
         }
 
-        info!("[SWEEP] Startup sweep complete: scanned {} markets, found {} arbs",
-              markets_scanned, arbs_found);
+        let tui_active = sweep_tui_state.read().await.active;
+        log_line(format!("[SWEEP] Startup sweep complete: scanned {} markets, found {} arbs",
+              markets_scanned, arbs_found), tui_active);
     });
 
     // System health monitoring and arbitrage diagnostics
