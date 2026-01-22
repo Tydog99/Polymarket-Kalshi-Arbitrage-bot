@@ -190,11 +190,9 @@ impl KalshiConfig {
     }
 
     pub fn sign(&self, message: &str) -> Result<String> {
-        tracing::debug!("[KALSHI-DEBUG] Signing message: {}", message);
         let signing_key = SigningKey::<Sha256>::new(self.private_key.clone());
         let signature = signing_key.sign_with_rng(&mut rand::thread_rng(), message.as_bytes());
         let sig_b64 = BASE64.encode(signature.to_bytes());
-        tracing::debug!("[KALSHI-DEBUG] Signature (first 50 chars): {}...", &sig_b64[..50.min(sig_b64.len())]);
         Ok(sig_b64)
     }
 }

@@ -12,7 +12,6 @@ use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
@@ -21,11 +20,11 @@ use crate::cache::{TeamCache, team_search_terms};
 use crate::config;
 use crate::config::{LeagueConfig, get_league_configs, get_league_config};
 use crate::kalshi::KalshiApiClient;
-use crate::polymarket::GammaClient;
+use crate::polymarket::{GammaClient, increment_date_in_slug};
 use crate::types::{MarketPair, MarketType, DiscoveryResult, KalshiMarket, KalshiEvent};
 
-/// Max concurrent Gamma API requests
-const GAMMA_CONCURRENCY: usize = 5;
+/// Max slugs per batch request (avoid URL length limits)
+const GAMMA_BATCH_SIZE: usize = 50;
 
 /// Kalshi rate limit: 2 requests per second (very conservative - they rate limit aggressively)
 /// Must be conservative because discovery runs many leagues/series in parallel
@@ -107,7 +106,7 @@ pub struct DiscoveryClient {
     pub team_cache: Arc<TeamCache>,
     kalshi_limiter: Arc<KalshiRateLimiter>,
     kalshi_semaphore: Arc<Semaphore>,  // Global concurrency limit for Kalshi
-    gamma_semaphore: Arc<Semaphore>,
+    // Note: gamma_semaphore removed - batch lookups don't need per-request limiting
 }
 
 impl DiscoveryClient {
@@ -122,7 +121,6 @@ impl DiscoveryClient {
             team_cache: Arc::new(team_cache),
             kalshi_limiter,
             kalshi_semaphore: Arc::new(Semaphore::new(KALSHI_GLOBAL_CONCURRENCY)),
-            gamma_semaphore: Arc::new(Semaphore::new(GAMMA_CONCURRENCY)),
         }
     }
 
@@ -470,16 +468,14 @@ impl DiscoveryClient {
         let pairing_debug = config::pairing_debug_enabled();
         let pairing_debug_limit = config::pairing_debug_limit();
 
-        // MVE series do not reliably expose the `/events` listing. For those, discover by querying
-        // `/markets?series_ticker=...` and using `mve_collection_ticker` (or `event_ticker`) as the parseable event key.
-        let is_mve = series.starts_with("KXMVE");
-
-        // Output container shared by legacy + MVE paths: (parsed_event, event, market)
+        // Output container: (parsed_event, event, market)
         let mut event_markets: Vec<(ParsedKalshiTicker, Arc<KalshiEvent>, KalshiMarket)> = Vec::new();
         let mut cached_count = 0usize;
         let parsed_events_len: usize;
 
-        if is_mve {
+        // FAST PATH: Query markets directly by series_ticker (1 API call instead of N+1)
+        // This works for ALL series, not just MVE. Much faster than fetching events then markets.
+        {
             // Rate limit (single call)
             {
                 let _permit = self.kalshi_semaphore
@@ -494,7 +490,7 @@ impl DiscoveryClient {
                 return Ok((vec![], 0));
             }
 
-            // Group by parseable "event key" (prefer mve_collection_ticker)
+            // Group by parseable "event key" (prefer mve_collection_ticker, fall back to event_ticker)
             let mut event_cache: HashMap<String, (ParsedKalshiTicker, Arc<KalshiEvent>)> = HashMap::new();
             for market in markets {
                 // Skip if already in cache
@@ -512,7 +508,7 @@ impl DiscoveryClient {
 
                 let Some(event_key) = event_key else {
                     if pairing_debug {
-                        warn!("  ⚠️ [MVE] missing event key for market {}", market.ticker);
+                        warn!("  ⚠️ missing event key for market {}", market.ticker);
                     }
                     continue;
                 };
@@ -523,7 +519,9 @@ impl DiscoveryClient {
                         let parsed = match parse_kalshi_event_ticker(&event_key) {
                             Some(p) => p,
                             None => {
-                                warn!("  ⚠️ [MVE] Could not parse event key {}", event_key);
+                                if pairing_debug {
+                                    warn!("  ⚠️ Could not parse event key {}", event_key);
+                                }
                                 continue;
                             }
                         };
@@ -542,94 +540,12 @@ impl DiscoveryClient {
 
             parsed_events_len = event_cache.len();
             info!(
-                "  📡 {} {}: {} MVE collections from Kalshi ({} markets)",
+                "  📡 {} {}: {} events from Kalshi ({} markets)",
                 config.league_code,
                 market_type,
                 parsed_events_len,
                 event_markets.len() + cached_count
             );
-        } else {
-            // Legacy event-based discovery: /events → /markets?event_ticker=...
-
-            // Fetch Kalshi events
-            {
-                let _permit = self.kalshi_semaphore
-                    .acquire()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("semaphore closed: {}", e))?;
-                self.kalshi_limiter.until_ready().await;
-            }
-            let events = self.kalshi.get_events(series, 50).await?;
-
-            if events.is_empty() {
-                return Ok((vec![], 0));
-            }
-            info!(
-                "  📡 {} {}: {} events from Kalshi",
-                config.league_code, market_type, events.len()
-            );
-
-            // PHASE 2: Parallel market fetching
-            let kalshi = self.kalshi.clone();
-            let limiter = self.kalshi_limiter.clone();
-            let semaphore = self.kalshi_semaphore.clone();
-
-            // Parse events first, filtering out unparseable ones
-            let parsed_events: Vec<_> = events
-                .into_iter()
-                .filter_map(|event| {
-                    let parsed = match parse_kalshi_event_ticker(&event.event_ticker) {
-                        Some(p) => p,
-                        None => {
-                            warn!("  ⚠️ Could not parse event ticker {}", event.event_ticker);
-                            return None;
-                        }
-                    };
-                    Some((parsed, event))
-                })
-                .collect();
-            parsed_events_len = parsed_events.len();
-
-            // Execute market fetches with GLOBAL concurrency limit
-            let market_results: Vec<_> = stream::iter(parsed_events)
-                .map(|(parsed, event)| {
-                    let kalshi = kalshi.clone();
-                    let limiter = limiter.clone();
-                    let semaphore = semaphore.clone();
-                    let event_ticker = event.event_ticker.clone();
-                    async move {
-                        let _permit = semaphore.acquire().await.ok();
-                        // rate limit
-                        limiter.until_ready().await;
-                        let markets_result = kalshi.get_markets(&event_ticker).await;
-                        (parsed, Arc::new(event), markets_result)
-                    }
-                })
-                .buffer_unordered(KALSHI_GLOBAL_CONCURRENCY * 2) // Allow some buffering, semaphore is the real limit
-                .collect()
-                .await;
-
-            // Collect all (event, market) pairs
-            event_markets = Vec::with_capacity(market_results.len() * 3);
-            for (parsed, event, markets_result) in market_results {
-                match markets_result {
-                    Ok(markets) => {
-                        for market in markets {
-                            // Skip if already in cache
-                            if let Some(c) = cache {
-                                if c.has_ticker(&market.ticker) {
-                                    cached_count += 1;
-                                    continue;
-                                }
-                            }
-                            event_markets.push((parsed.clone(), event.clone(), market));
-                        }
-                    }
-                    Err(e) => {
-                        warn!("  ⚠️ Failed to get markets for {}: {}", event.event_ticker, e);
-                    }
-                }
-            }
         }
 
         // Capture kalshi count before event_markets is consumed
@@ -693,221 +609,278 @@ impl DiscoveryClient {
             })
             .collect();
 
-        // Track stats with atomic counters for the async closure
+        // Track stats
         let total_tasks = lookup_futures.len();
-        let miss_slug_not_found = Arc::new(AtomicUsize::new(0));
-        let miss_api_error = Arc::new(AtomicUsize::new(0));
+        let mut miss_slug_not_found = 0usize;
+        let mut miss_api_error = 0usize;
 
-        // Execute lookups in parallel
-        let pairs: Vec<MarketPair> = stream::iter(lookup_futures)
-            .map(|task| {
-                let gamma = self.gamma.clone();
-                let semaphore = self.gamma_semaphore.clone();
-                let miss_slug_not_found = miss_slug_not_found.clone();
-                let miss_api_error = miss_api_error.clone();
-                async move {
-                    let _permit = semaphore.acquire().await.ok()?;
-                    match gamma.lookup_market(&task.poly_slug).await {
-                        Ok(Some((token1, token2, outcomes))) => {
-                            let team_suffix = extract_team_suffix(&task.market.ticker);
+        // ===== BATCH GAMMA LOOKUPS =====
+        // Instead of individual lookups, batch all slugs together for efficiency
+        // This reduces HTTP requests from N to ceil(N/BATCH_SIZE), avoiding Cloudflare throttling
 
-                            // DIAGNOSTIC: Log API response for token-outcome verification
+        // Step 1: Collect all unique slugs
+        let slugs: Vec<String> = lookup_futures.iter()
+            .map(|t| t.poly_slug.clone())
+            .collect();
+
+        let gamma_start = std::time::Instant::now();
+        let num_batches = (slugs.len() + GAMMA_BATCH_SIZE - 1) / GAMMA_BATCH_SIZE;
+        debug!(
+            "  ⏳ {} {}: batch Gamma lookup for {} slugs ({} batches of {})...",
+            config.league_code, market_type, slugs.len(), num_batches, GAMMA_BATCH_SIZE
+        );
+
+        // Step 2: Batch lookup all slugs (in chunks to avoid URL length limits)
+        let mut slug_results: HashMap<String, (String, String, Vec<String>)> = HashMap::new();
+        for chunk in slugs.chunks(GAMMA_BATCH_SIZE) {
+            let chunk_vec: Vec<String> = chunk.to_vec();
+            match self.gamma.lookup_markets_batch(&chunk_vec).await {
+                Ok(batch_results) => {
+                    slug_results.extend(batch_results);
+                }
+                Err(e) => {
+                    warn!("  ⚠️ Gamma batch lookup failed: {}", e);
+                    miss_api_error += chunk.len();
+                }
+            }
+        }
+
+        // Step 3: Try next-day slugs for any missing (timezone handling)
+        let missing_slugs: Vec<(String, String)> = slugs.iter()
+            .filter(|s| !slug_results.contains_key(*s))
+            .filter_map(|s| increment_date_in_slug(s).map(|next_day| (s.clone(), next_day)))
+            .collect();
+
+        if !missing_slugs.is_empty() {
+            debug!(
+                "  ⏳ {} {}: trying next-day slugs for {} missing markets...",
+                config.league_code, market_type, missing_slugs.len()
+            );
+            let next_day_slugs: Vec<String> = missing_slugs.iter()
+                .map(|(_, next)| next.clone())
+                .collect();
+
+            for chunk in next_day_slugs.chunks(GAMMA_BATCH_SIZE) {
+                let chunk_vec: Vec<String> = chunk.to_vec();
+                if let Ok(batch_results) = self.gamma.lookup_markets_batch(&chunk_vec).await {
+                    // Map next-day results back to original slugs
+                    for (original, next_day) in &missing_slugs {
+                        if let Some(result) = batch_results.get(next_day) {
+                            if pairing_debug {
+                                info!("  📅 Found with next-day slug: {} -> {}", original, next_day);
+                            }
+                            slug_results.insert(original.clone(), result.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!(
+            "  ✓ {} {}: Gamma batch lookup completed in {:.1}ms (found {}/{})",
+            config.league_code, market_type, gamma_start.elapsed().as_millis(),
+            slug_results.len(), slugs.len()
+        );
+
+        // Step 4: Process tasks using pre-fetched results
+        let mut pairs: Vec<MarketPair> = Vec::with_capacity(total_tasks);
+
+        for task in lookup_futures {
+            let lookup_result = slug_results.get(&task.poly_slug);
+
+            match lookup_result {
+                Some((token1, token2, outcomes)) => {
+                    let token1 = token1.clone();
+                    let token2 = token2.clone();
+                    let outcomes = outcomes.clone();
+                    let team_suffix = extract_team_suffix(&task.market.ticker);
+
+                    // DIAGNOSTIC: Log API response for token-outcome verification
+                    if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                        info!(
+                            "🔍 [PAIR] API response: slug={} token1={}... token2={}... outcomes={:?}",
+                            task.poly_slug,
+                            &token1[..token1.len().min(12)],
+                            &token2[..token2.len().min(12)],
+                            outcomes
+                        );
+                    }
+
+                    // Use outcomes to determine which token is YES for this Kalshi market
+                    // outcomes[i] corresponds to token[i] from Gamma API
+                    let (yes_token, no_token) = if let Some(suffix) = &team_suffix {
+                        // First check: Is this a Yes/No or Over/Under market?
+                        // These are team-specific markets where API order is always correct:
+                        // - Moneyline: "Will MUN win?" → outcomes=["Yes", "No"]
+                        // - Spread: "Will MUN cover -1.5?" → outcomes=["Yes", "No"]
+                        // - Total: "Will game go over 2.5?" → outcomes=["Over", "Under"]
+                        let is_yes_no_market = outcomes.iter().any(|o| {
+                            let lower = o.to_lowercase();
+                            lower == "yes" || lower == "no" || lower == "over" || lower == "under"
+                        });
+
+                        if is_yes_no_market {
+                            // For Yes/No markets, API order is: [Yes token, No token]
+                            // This is correct - token1 is always the "Yes" outcome
                             if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
                                 info!(
-                                    "🔍 [PAIR] API response: slug={} token1={}... token2={}... outcomes={:?}",
-                                    task.poly_slug,
-                                    &token1[..token1.len().min(12)],
-                                    &token2[..token2.len().min(12)],
-                                    outcomes
+                                    "✅ [PAIR] Yes/No market, using API order: league={} type={:?} slug={} suffix={} outcomes={:?}",
+                                    task.league, task.market_type, task.poly_slug, suffix, outcomes
                                 );
                             }
+                            (token1, token2)
+                        } else {
+                            // Outcomes contain team names (e.g., ["Manchester United FC", "Everton FC"])
+                            // Need to match Kalshi suffix to determine which token is YES
 
-                            // Use outcomes to determine which token is YES for this Kalshi market
-                            // outcomes[i] corresponds to token[i] from Gamma API
-                            let (yes_token, no_token) = if let Some(suffix) = &team_suffix {
-                                // First check: Is this a Yes/No or Over/Under market?
-                                // These are team-specific markets where API order is always correct:
-                                // - Moneyline: "Will MUN win?" → outcomes=["Yes", "No"]
-                                // - Spread: "Will MUN cover -1.5?" → outcomes=["Yes", "No"]
-                                // - Total: "Will game go over 2.5?" → outcomes=["Over", "Under"]
-                                let is_yes_no_market = outcomes.iter().any(|o| {
-                                    let lower = o.to_lowercase();
-                                    lower == "yes" || lower == "no" || lower == "over" || lower == "under"
-                                });
+                            // Strip numeric suffix for spread/total markets (e.g., "LEE1" -> "LEE")
+                            let team_code: String = suffix.chars()
+                                .take_while(|c| c.is_alphabetic())
+                                .collect::<String>()
+                                .to_lowercase();
 
-                                if is_yes_no_market {
-                                    // For Yes/No markets, API order is: [Yes token, No token]
-                                    // This is correct - token1 is always the "Yes" outcome
-                                    if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
-                                        info!(
-                                            "✅ [PAIR] Yes/No market, using API order: league={} type={:?} slug={} suffix={} outcomes={:?}",
-                                            task.league, task.market_type, task.poly_slug, suffix, outcomes
-                                        );
-                                    }
-                                    (token1, token2)
-                                } else {
-                                    // Outcomes contain team names (e.g., ["Manchester United FC", "Everton FC"])
-                                    // Need to match Kalshi suffix to determine which token is YES
+                            // Check if outcome[0] contains the team code (team we're betting YES on)
+                            let outcome0_matches = outcomes.get(0)
+                                .map(|o| o.to_lowercase().contains(&team_code))
+                                .unwrap_or(false);
+                            let outcome1_matches = outcomes.get(1)
+                                .map(|o| o.to_lowercase().contains(&team_code))
+                                .unwrap_or(false);
 
-                                    // Strip numeric suffix for spread/total markets (e.g., "LEE1" -> "LEE")
-                                    let team_code: String = suffix.chars()
-                                        .take_while(|c| c.is_alphabetic())
-                                        .collect::<String>()
-                                        .to_lowercase();
+                            if outcome0_matches && !outcome1_matches {
+                                // token1 is YES for this team (outcome[0] contains team code)
+                                if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                                    info!(
+                                        "✅ [PAIR] league={} type={:?} slug={} suffix={} team_code={} → token1=YES (matched outcome[0]) outcomes={:?}",
+                                        task.league, task.market_type, task.poly_slug, suffix, team_code, outcomes
+                                    );
+                                }
+                                (token1, token2)
+                            } else if outcome1_matches && !outcome0_matches {
+                                // token2 is YES for this team (outcome[1] contains team code)
+                                if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                                    info!(
+                                        "✅ [PAIR] league={} type={:?} slug={} suffix={} team_code={} → token2=YES (matched outcome[1]) outcomes={:?}",
+                                        task.league, task.market_type, task.poly_slug, suffix, team_code, outcomes
+                                    );
+                                }
+                                (token2, token1)
+                            } else {
+                                // Direct substring match failed, try team_search_terms lookup
+                                let search_terms = team_search_terms(&task.league, &team_code);
 
-                                    // Check if outcome[0] contains the team code (team we're betting YES on)
-                                    let outcome0_matches = outcomes.get(0)
-                                        .map(|o| o.to_lowercase().contains(&team_code))
-                                        .unwrap_or(false);
-                                    let outcome1_matches = outcomes.get(1)
-                                        .map(|o| o.to_lowercase().contains(&team_code))
-                                        .unwrap_or(false);
+                                if let Some(terms) = search_terms {
+                                    // Check if any search term matches in outcomes
+                                    let outcome0_lower = outcomes.get(0).map(|o| o.to_lowercase()).unwrap_or_default();
+                                    let outcome1_lower = outcomes.get(1).map(|o| o.to_lowercase()).unwrap_or_default();
 
-                                    if outcome0_matches && !outcome1_matches {
-                                        // token1 is YES for this team (outcome[0] contains team code)
+                                    let term_matches_0 = terms.iter().any(|term| outcome0_lower.contains(term));
+                                    let term_matches_1 = terms.iter().any(|term| outcome1_lower.contains(term));
+
+                                    if term_matches_0 && !term_matches_1 {
+                                        // token1 is YES (search terms matched outcome[0])
                                         if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
                                             info!(
-                                                "✅ [PAIR] league={} type={:?} slug={} suffix={} team_code={} → token1=YES (matched outcome[0]) outcomes={:?}",
-                                                task.league, task.market_type, task.poly_slug, suffix, team_code, outcomes
+                                                "✅ [PAIR] league={} type={:?} slug={} suffix={} team_code={} → token1=YES (matched via search terms {:?}) outcomes={:?}",
+                                                task.league, task.market_type, task.poly_slug, suffix, team_code, terms, outcomes
                                             );
                                         }
                                         (token1, token2)
-                                    } else if outcome1_matches && !outcome0_matches {
-                                        // token2 is YES for this team (outcome[1] contains team code)
+                                    } else if term_matches_1 && !term_matches_0 {
+                                        // token2 is YES (search terms matched outcome[1])
                                         if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
                                             info!(
-                                                "✅ [PAIR] league={} type={:?} slug={} suffix={} team_code={} → token2=YES (matched outcome[1]) outcomes={:?}",
-                                                task.league, task.market_type, task.poly_slug, suffix, team_code, outcomes
+                                                "✅ [PAIR] league={} type={:?} slug={} suffix={} team_code={} → token2=YES (matched via search terms {:?}) outcomes={:?}",
+                                                task.league, task.market_type, task.poly_slug, suffix, team_code, terms, outcomes
                                             );
                                         }
                                         (token2, token1)
                                     } else {
-                                        // Direct substring match failed, try team_search_terms lookup
-                                        let search_terms = team_search_terms(&task.league, &team_code);
-
-                                        if let Some(terms) = search_terms {
-                                            // Check if any search term matches in outcomes
-                                            let outcome0_lower = outcomes.get(0).map(|o| o.to_lowercase()).unwrap_or_default();
-                                            let outcome1_lower = outcomes.get(1).map(|o| o.to_lowercase()).unwrap_or_default();
-
-                                            let term_matches_0 = terms.iter().any(|term| outcome0_lower.contains(term));
-                                            let term_matches_1 = terms.iter().any(|term| outcome1_lower.contains(term));
-
-                                            if term_matches_0 && !term_matches_1 {
-                                                // token1 is YES (search terms matched outcome[0])
-                                                if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
-                                                    info!(
-                                                        "✅ [PAIR] league={} type={:?} slug={} suffix={} team_code={} → token1=YES (matched via search terms {:?}) outcomes={:?}",
-                                                        task.league, task.market_type, task.poly_slug, suffix, team_code, terms, outcomes
-                                                    );
-                                                }
-                                                (token1, token2)
-                                            } else if term_matches_1 && !term_matches_0 {
-                                                // token2 is YES (search terms matched outcome[1])
-                                                if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
-                                                    info!(
-                                                        "✅ [PAIR] league={} type={:?} slug={} suffix={} team_code={} → token2=YES (matched via search terms {:?}) outcomes={:?}",
-                                                        task.league, task.market_type, task.poly_slug, suffix, team_code, terms, outcomes
-                                                    );
-                                                }
-                                                (token2, token1)
-                                            } else {
-                                                // Still ambiguous even with search terms
-                                                warn!(
-                                                    "⚠️ [PAIR] AMBIGUOUS after search terms! league={} type={:?} slug={} suffix={} team_code={} terms={:?} outcomes={:?} → using API order (may be wrong!)",
-                                                    task.league, task.market_type, task.poly_slug, suffix, team_code, terms, outcomes
-                                                );
-                                                (token1, token2)
-                                            }
-                                        } else {
-                                            // No search terms available - THIS IS A BUG for team-name outcomes
-                                            warn!(
-                                                "⚠️ [PAIR] AMBIGUOUS TOKEN ASSIGNMENT! league={} type={:?} slug={} suffix={} team_code={} outcomes={:?} → using API order (may be wrong!)",
-                                                task.league, task.market_type, task.poly_slug, suffix, team_code, outcomes
-                                            );
-                                            (token1, token2)
-                                        }
+                                        // Still ambiguous even with search terms
+                                        warn!(
+                                            "⚠️ [PAIR] AMBIGUOUS after search terms! league={} type={:?} slug={} suffix={} team_code={} terms={:?} outcomes={:?} → using API order (may be wrong!)",
+                                            task.league, task.market_type, task.poly_slug, suffix, team_code, terms, outcomes
+                                        );
+                                        (token1, token2)
                                     }
-                                }
-                            } else {
-                                // No team suffix (shouldn't happen for moneyline), use API order
-                                if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
-                                    warn!(
-                                        "⚠️ [PAIR] league={} type={:?} series={} slug={} no team_suffix → using API order outcomes={:?}",
-                                        task.league, task.market_type, task.debug_series, task.poly_slug, outcomes
-                                    );
-                                }
-                                (token1, token2)
-                            };
-
-                            if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
-                                info!(
-                                    "🎯 [PAIR] MATCH league={} type={:?} kalshi_market={} poly_slug={} yes_token={} no_token={}",
-                                    task.league,
-                                    task.market_type,
-                                    task.market.ticker,
-                                    task.poly_slug,
-                                    yes_token,
-                                    no_token
-                                );
-                            }
-
-                            // Build description with outcome/line info
-                            let desc = if task.market_type == MarketType::Moneyline {
-                                // For moneyline, use yes_sub_title to show outcome
-                                if let Some(ref sub) = task.market.yes_sub_title {
-                                    format!("{} ({})", task.event.title, sub)
                                 } else {
-                                    format!("{} - {}", task.event.title, task.market.title)
+                                    // No search terms available - THIS IS A BUG for team-name outcomes
+                                    warn!(
+                                        "⚠️ [PAIR] AMBIGUOUS TOKEN ASSIGNMENT! league={} type={:?} slug={} suffix={} team_code={} outcomes={:?} → using API order (may be wrong!)",
+                                        task.league, task.market_type, task.poly_slug, suffix, team_code, outcomes
+                                    );
+                                    (token1, token2)
                                 }
-                            } else if let Some(line) = task.market.floor_strike {
-                                format!("{} - {} {}", task.event.title, task.market.title, line)
-                            } else {
-                                format!("{} - {}", task.event.title, task.market.title)
-                            };
-
-                            Some(MarketPair {
-                                pair_id: format!("{}-{}", task.poly_slug, task.market.ticker).into(),
-                                league: task.league.into(),
-                                market_type: task.market_type,
-                                description: desc.into(),
-                                kalshi_event_ticker: task.event.event_ticker.clone().into(),
-                                kalshi_market_ticker: task.market.ticker.into(),
-                                kalshi_event_slug: task.kalshi_web_slug.into(),
-                                poly_slug: task.poly_slug.into(),
-                                poly_yes_token: yes_token.into(),
-                                poly_no_token: no_token.into(),
-                                line_value: task.market.floor_strike,
-                                team_suffix: team_suffix.map(|s| s.into()),
-                            })
-                        }
-                        Ok(None) => {
-                            miss_slug_not_found.fetch_add(1, Ordering::Relaxed);
-                            if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
-                                info!(
-                                    "❌ [PAIR] NO_MATCH league={} type={:?} series={} kalshi_market={} poly_slug={}",
-                                    task.league, task.market_type, task.debug_series, task.market.ticker, task.poly_slug
-                                );
                             }
-                            None
                         }
-                        Err(e) => {
-                            miss_api_error.fetch_add(1, Ordering::Relaxed);
-                            warn!("  ⚠️ Gamma lookup failed for {}: {}", task.poly_slug, e);
-                            None
+                    } else {
+                        // No team suffix (shouldn't happen for moneyline), use API order
+                        if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                            warn!(
+                                "⚠️ [PAIR] league={} type={:?} series={} slug={} no team_suffix → using API order outcomes={:?}",
+                                task.league, task.market_type, task.debug_series, task.poly_slug, outcomes
+                            );
                         }
+                        (token1, token2)
+                    };
+
+                    if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                        info!(
+                            "🎯 [PAIR] MATCH league={} type={:?} kalshi_market={} poly_slug={} yes_token={} no_token={}",
+                            task.league,
+                            task.market_type,
+                            task.market.ticker,
+                            task.poly_slug,
+                            yes_token,
+                            no_token
+                        );
+                    }
+
+                    // Build description with outcome/line info
+                    let desc = if task.market_type == MarketType::Moneyline {
+                        // For moneyline, use yes_sub_title to show outcome
+                        if let Some(ref sub) = task.market.yes_sub_title {
+                            format!("{} ({})", task.event.title, sub)
+                        } else {
+                            format!("{} - {}", task.event.title, task.market.title)
+                        }
+                    } else if let Some(line) = task.market.floor_strike {
+                        format!("{} - {} {}", task.event.title, task.market.title, line)
+                    } else {
+                        format!("{} - {}", task.event.title, task.market.title)
+                    };
+
+                    pairs.push(MarketPair {
+                        pair_id: format!("{}-{}", task.poly_slug, task.market.ticker).into(),
+                        league: task.league.into(),
+                        market_type: task.market_type,
+                        description: desc.into(),
+                        kalshi_event_ticker: task.event.event_ticker.clone().into(),
+                        kalshi_market_ticker: task.market.ticker.into(),
+                        kalshi_event_slug: task.kalshi_web_slug.into(),
+                        poly_slug: task.poly_slug.into(),
+                        poly_yes_token: yes_token.into(),
+                        poly_no_token: no_token.into(),
+                        line_value: task.market.floor_strike,
+                        team_suffix: team_suffix.map(|s| s.into()),
+                    });
+                }
+                None => {
+                    miss_slug_not_found += 1;
+                    if config::pairing_debug_enabled() && task.debug_idx < config::pairing_debug_limit() {
+                        info!(
+                            "❌ [PAIR] NO_MATCH league={} type={:?} series={} kalshi_market={} poly_slug={}",
+                            task.league, task.market_type, task.debug_series, task.market.ticker, task.poly_slug
+                        );
                     }
                 }
-            })
-            .buffer_unordered(GAMMA_CONCURRENCY)
-            .filter_map(|x| async { x })
-            .collect()
-            .await;
+            }
+        }
 
         // Log summary stats when pairing_debug is enabled
         let matched = pairs.len();
-        let slug_misses = miss_slug_not_found.load(Ordering::Relaxed);
-        let api_errors = miss_api_error.load(Ordering::Relaxed);
+        let slug_misses = miss_slug_not_found;
+        let api_errors = miss_api_error;
 
         if pairing_debug && total_tasks > 0 {
             let match_rate = (matched as f64 / total_tasks as f64 * 100.0).round() as u32;
@@ -1105,6 +1078,10 @@ impl DiscoveryClient {
 
         for series in series_list {
             // Rate limit
+            debug!(
+                "  ⏳ {} {}: fetching markets from Kalshi (waiting for rate limit)...",
+                config.league_code, series
+            );
             {
                 let _permit = self.kalshi_semaphore.acquire().await
                     .map_err(|e| anyhow::anyhow!("semaphore closed: {}", e))?;
@@ -1125,10 +1102,11 @@ impl DiscoveryClient {
                 .collect();
 
             if new_markets.is_empty() {
+                debug!("  ✓ {} {}: no new markets", config.league_code, series);
                 continue;
             }
 
-            // Look up on Polymarket in parallel
+            // Look up on Polymarket using batch lookups
             let market_type = if series.contains("SPREAD") {
                 MarketType::Spread
             } else if series.contains("TOTAL") {
@@ -1139,200 +1117,228 @@ impl DiscoveryClient {
                 MarketType::Moneyline
             };
             let series_string = series.to_string();
+            let pairing_debug = config::pairing_debug_enabled();
 
-            let pairs: Vec<MarketPair> = stream::iter(new_markets)
-                .map(|market| {
-                    let series_string = series_string.clone();
-                    async move {
-                        self.try_match_market(config, &market, market_type, &series_string).await
+            // Step 1: Build tasks with pre-computed slugs
+            let tasks: Vec<_> = new_markets
+                .into_iter()
+                .filter_map(|market| {
+                    // Prefer a parseable event key from the API (supports MVE markets)
+                    let event_ticker = if let Some(t) = market.mve_collection_ticker.as_ref() {
+                        t.clone()
+                    } else if let Some(t) = market.event_ticker.as_ref() {
+                        t.clone()
+                    } else {
+                        // Fallback: reconstruct event ticker from market ticker
+                        let parts: Vec<&str> = market.ticker.split('-').collect();
+                        if parts.len() < 2 {
+                            if pairing_debug {
+                                info!("❌ [PAIR] cannot split market ticker: {}", market.ticker);
+                            }
+                            return None;
+                        }
+                        format!("{}-{}", parts[0], parts[1])
+                    };
+
+                    // Parse event ticker to get teams and date
+                    let parsed = match parse_kalshi_event_ticker(&event_ticker) {
+                        Some(p) => p,
+                        None => {
+                            if pairing_debug {
+                                info!(
+                                    "❌ [PAIR] cannot parse event_ticker={} (market={} series={} type={:?})",
+                                    event_ticker, market.ticker, series_string, market_type
+                                );
+                            }
+                            return None;
+                        }
+                    };
+
+                    // Build poly slug
+                    let poly_slug = self.build_poly_slug(config.poly_prefix, &parsed, market_type, &market, config.has_draws(), config.home_team_first);
+                    if pairing_debug {
+                        info!(
+                            "🧩 [PAIR] league={} type={:?} event={} market={} parsed=({},{},{}) slug={}",
+                            config.league_code, market_type, event_ticker, market.ticker,
+                            parsed.date, parsed.team1, parsed.team2, poly_slug
+                        );
                     }
-                })
-                .buffer_unordered(GAMMA_CONCURRENCY)
-                .filter_map(|x| async { x })
-                .collect()
-                .await;
 
-            all_pairs.extend(pairs);
+                    Some((market, poly_slug))
+                })
+                .collect();
+
+            if tasks.is_empty() {
+                continue;
+            }
+
+            // Step 2: Batch lookup all slugs
+            let slugs: Vec<String> = tasks.iter().map(|(_, slug)| slug.clone()).collect();
+            let mut slug_results: HashMap<String, (String, String, Vec<String>)> = HashMap::new();
+
+            for chunk in slugs.chunks(GAMMA_BATCH_SIZE) {
+                let chunk_vec: Vec<String> = chunk.to_vec();
+                if let Ok(batch_results) = self.gamma.lookup_markets_batch(&chunk_vec).await {
+                    slug_results.extend(batch_results);
+                }
+            }
+
+            // Step 3: Try next-day slugs for any missing
+            let missing_slugs: Vec<(String, String)> = slugs.iter()
+                .filter(|s| !slug_results.contains_key(*s))
+                .filter_map(|s| increment_date_in_slug(s).map(|next_day| (s.clone(), next_day)))
+                .collect();
+
+            if !missing_slugs.is_empty() {
+                let next_day_slugs: Vec<String> = missing_slugs.iter()
+                    .map(|(_, next)| next.clone())
+                    .collect();
+
+                for chunk in next_day_slugs.chunks(GAMMA_BATCH_SIZE) {
+                    let chunk_vec: Vec<String> = chunk.to_vec();
+                    if let Ok(batch_results) = self.gamma.lookup_markets_batch(&chunk_vec).await {
+                        for (original, next_day) in &missing_slugs {
+                            if let Some(result) = batch_results.get(next_day) {
+                                if pairing_debug {
+                                    info!("  📅 Found with next-day slug: {} -> {}", original, next_day);
+                                }
+                                slug_results.insert(original.clone(), result.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Step 4: Process results
+            for (market, poly_slug) in tasks {
+                let Some((token1, token2, outcomes)) = slug_results.get(&poly_slug) else {
+                    if pairing_debug {
+                        info!(
+                            "❌ [PAIR] NO_MATCH league={} type={:?} market={} poly_slug={}",
+                            config.league_code, market_type, market.ticker, poly_slug
+                        );
+                    }
+                    continue;
+                };
+
+                let token1 = token1.clone();
+                let token2 = token2.clone();
+                let outcomes = outcomes.clone();
+                let team_suffix = extract_team_suffix(&market.ticker);
+
+                // Use outcomes to determine which token is YES for this Kalshi market
+                let (yes_token, no_token) = if let Some(ref suffix) = team_suffix {
+                    let suffix_lower = suffix.to_lowercase();
+                    let outcome0_matches = outcomes.get(0)
+                        .map(|o| o.to_lowercase().contains(&suffix_lower))
+                        .unwrap_or(false);
+                    let outcome1_matches = outcomes.get(1)
+                        .map(|o| o.to_lowercase().contains(&suffix_lower))
+                        .unwrap_or(false);
+
+                    if outcome0_matches && !outcome1_matches {
+                        if pairing_debug {
+                            info!(
+                                "✅ [PAIR] slug={} suffix={} → token1=YES outcomes={:?}",
+                                poly_slug, suffix, outcomes
+                            );
+                        } else {
+                            debug!("  🎯 {} | outcomes={:?} | suffix={} matches outcome[0] → token1=YES",
+                                   poly_slug, outcomes, suffix);
+                        }
+                        (token1, token2)
+                    } else if outcome1_matches && !outcome0_matches {
+                        if pairing_debug {
+                            info!(
+                                "✅ [PAIR] slug={} suffix={} → token2=YES outcomes={:?}",
+                                poly_slug, suffix, outcomes
+                            );
+                        } else {
+                            debug!("  🎯 {} | outcomes={:?} | suffix={} matches outcome[1] → token2=YES",
+                                   poly_slug, outcomes, suffix);
+                        }
+                        (token2, token1)
+                    } else {
+                        if pairing_debug {
+                            warn!(
+                                "⚠️ [PAIR] slug={} suffix={} ambiguous outcomes={:?} → using API order",
+                                poly_slug, suffix, outcomes
+                            );
+                        } else {
+                            warn!("  ⚠️ {} | outcomes={:?} | suffix={} - ambiguous match, using API order",
+                                  poly_slug, outcomes, suffix);
+                        }
+                        (token1, token2)
+                    }
+                } else {
+                    if pairing_debug {
+                        warn!(
+                            "⚠️ [PAIR] slug={} no team_suffix → using API order outcomes={:?}",
+                            poly_slug, outcomes
+                        );
+                    } else {
+                        warn!("  ⚠️ {} | no team_suffix extracted, using API order", poly_slug);
+                    }
+                    (token1, token2)
+                };
+
+                if pairing_debug {
+                    info!(
+                        "🎯 [PAIR] MATCH league={} type={:?} kalshi_market={} poly_slug={} yes_token={} no_token={}",
+                        config.league_code,
+                        market_type,
+                        market.ticker,
+                        poly_slug,
+                        yes_token,
+                        no_token
+                    );
+                }
+
+                // Build description with outcome/line info
+                let desc = if market_type == MarketType::Moneyline {
+                    if let Some(ref sub) = market.yes_sub_title {
+                        format!("{} ({})", market.title.replace(" Winner?", "").replace(" Winner", ""), sub)
+                    } else {
+                        market.title.to_string()
+                    }
+                } else if let Some(line) = market.floor_strike {
+                    format!("{} {}", market.title, line)
+                } else {
+                    market.title.to_string()
+                };
+
+                // Get event ticker for this market
+                let event_ticker = if let Some(t) = market.mve_collection_ticker.as_ref() {
+                    t.clone()
+                } else if let Some(t) = market.event_ticker.as_ref() {
+                    t.clone()
+                } else {
+                    let parts: Vec<&str> = market.ticker.split('-').collect();
+                    if parts.len() >= 2 {
+                        format!("{}-{}", parts[0], parts[1])
+                    } else {
+                        market.ticker.clone()
+                    }
+                };
+
+                all_pairs.push(MarketPair {
+                    pair_id: format!("{}-{}", poly_slug, market.ticker).into(),
+                    league: config.league_code.into(),
+                    market_type,
+                    description: desc.into(),
+                    kalshi_event_ticker: event_ticker.into(),
+                    kalshi_market_ticker: market.ticker.clone().into(),
+                    kalshi_event_slug: config.kalshi_web_slug.into(),
+                    poly_slug: poly_slug.into(),
+                    poly_yes_token: yes_token.into(),
+                    poly_no_token: no_token.into(),
+                    line_value: market.floor_strike,
+                    team_suffix: team_suffix.map(|s| s.into()),
+                });
+            }
         }
 
         Ok(all_pairs)
-    }
-
-    /// Try to match a single Kalshi market to Polymarket
-    async fn try_match_market(
-        &self,
-        config: &LeagueConfig,
-        market: &KalshiMarket,
-        market_type: MarketType,
-        series: &str,
-    ) -> Option<MarketPair> {
-        let pairing_debug = config::pairing_debug_enabled();
-
-        // Prefer a parseable event key from the API (supports MVE markets).
-        // - MVE: `mve_collection_ticker` is like "KXMVENFLSINGLEGAME-26JAN18LACHI" (date+teams embedded)
-        // - Legacy list endpoints may also include `event_ticker`
-        let event_ticker = if let Some(t) = market.mve_collection_ticker.as_ref() {
-            t.clone()
-        } else if let Some(t) = market.event_ticker.as_ref() {
-            t.clone()
-        } else {
-            // Fallback: reconstruct event ticker from market ticker (format: SERIES-EVENTID-SUFFIX)
-            let parts: Vec<&str> = market.ticker.split('-').collect();
-            if parts.len() < 2 {
-                if pairing_debug {
-                    info!("❌ [PAIR] cannot split market ticker: {}", market.ticker);
-                }
-                return None;
-            }
-            format!("{}-{}", parts[0], parts[1])
-        };
-
-        // Parse event ticker to get teams and date
-        let parsed = match parse_kalshi_event_ticker(&event_ticker) {
-            Some(p) => p,
-            None => {
-                if pairing_debug {
-                    info!(
-                        "❌ [PAIR] cannot parse event_ticker={} (market={} series={} type={:?})",
-                        event_ticker, market.ticker, series, market_type
-                    );
-                }
-                return None;
-            }
-        };
-
-        // Build poly slug
-        let poly_slug = self.build_poly_slug(config.poly_prefix, &parsed, market_type, market, config.has_draws(), config.home_team_first);
-        if pairing_debug {
-            info!(
-                "🧩 [PAIR] league={} type={:?} event={} market={} parsed=({},{},{}) slug={}",
-                config.league_code,
-                market_type,
-                event_ticker,
-                market.ticker,
-                parsed.date,
-                parsed.team1,
-                parsed.team2,
-                poly_slug
-            );
-        }
-
-        // Look up on Polymarket
-        let _permit = self.gamma_semaphore.acquire().await.ok()?;
-        let (token1, token2, outcomes) = match self.gamma.lookup_market(&poly_slug).await {
-            Ok(Some(result)) => result,
-            Ok(None) => {
-                if pairing_debug {
-                    info!(
-                        "❌ [PAIR] NO_MATCH league={} type={:?} market={} poly_slug={}",
-                        config.league_code, market_type, market.ticker, poly_slug
-                    );
-                }
-                return None;
-            }
-            Err(e) => {
-                tracing::warn!("  ⚠️ Gamma lookup failed for {}: {}", poly_slug, e);
-                return None;
-            }
-        };
-
-        let team_suffix = extract_team_suffix(&market.ticker);
-
-        // Use outcomes to determine which token is YES for this Kalshi market
-        let (yes_token, no_token) = if let Some(ref suffix) = team_suffix {
-            let suffix_lower = suffix.to_lowercase();
-            let outcome0_matches = outcomes.get(0)
-                .map(|o| o.to_lowercase().contains(&suffix_lower))
-                .unwrap_or(false);
-            let outcome1_matches = outcomes.get(1)
-                .map(|o| o.to_lowercase().contains(&suffix_lower))
-                .unwrap_or(false);
-
-            if outcome0_matches && !outcome1_matches {
-                if pairing_debug {
-                    info!(
-                        "✅ [PAIR] slug={} suffix={} → token1=YES outcomes={:?}",
-                        poly_slug, suffix, outcomes
-                    );
-                } else {
-                    debug!("  🎯 {} | outcomes={:?} | suffix={} matches outcome[0] → token1=YES",
-                           poly_slug, outcomes, suffix);
-                }
-                (token1, token2)
-            } else if outcome1_matches && !outcome0_matches {
-                if pairing_debug {
-                    info!(
-                        "✅ [PAIR] slug={} suffix={} → token2=YES outcomes={:?}",
-                        poly_slug, suffix, outcomes
-                    );
-                } else {
-                    debug!("  🎯 {} | outcomes={:?} | suffix={} matches outcome[1] → token2=YES",
-                           poly_slug, outcomes, suffix);
-                }
-                (token2, token1)
-            } else {
-                if pairing_debug {
-                    warn!(
-                        "⚠️ [PAIR] slug={} suffix={} ambiguous outcomes={:?} → using API order",
-                        poly_slug, suffix, outcomes
-                    );
-                } else {
-                    warn!("  ⚠️ {} | outcomes={:?} | suffix={} - ambiguous match, using API order",
-                          poly_slug, outcomes, suffix);
-                }
-                (token1, token2)
-            }
-        } else {
-            if pairing_debug {
-                warn!(
-                    "⚠️ [PAIR] slug={} no team_suffix → using API order outcomes={:?}",
-                    poly_slug, outcomes
-                );
-            } else {
-                warn!("  ⚠️ {} | no team_suffix extracted, using API order", poly_slug);
-            }
-            (token1, token2)
-        };
-
-        if pairing_debug {
-            info!(
-                "🎯 [PAIR] MATCH league={} type={:?} kalshi_market={} poly_slug={} yes_token={} no_token={}",
-                config.league_code,
-                market_type,
-                market.ticker,
-                poly_slug,
-                yes_token,
-                no_token
-            );
-        }
-
-        // Build description with outcome/line info
-        let desc = if market_type == MarketType::Moneyline {
-            if let Some(ref sub) = market.yes_sub_title {
-                format!("{} ({})", market.title.replace(" Winner?", "").replace(" Winner", ""), sub)
-            } else {
-                market.title.to_string()
-            }
-        } else if let Some(line) = market.floor_strike {
-            format!("{} {}", market.title, line)
-        } else {
-            market.title.to_string()
-        };
-
-        Some(MarketPair {
-            pair_id: format!("{}-{}", poly_slug, market.ticker).into(),
-            league: config.league_code.into(),
-            market_type,
-            description: desc.into(),
-            kalshi_event_ticker: event_ticker.into(),
-            kalshi_market_ticker: market.ticker.clone().into(),
-            kalshi_event_slug: config.kalshi_web_slug.into(),
-            poly_slug: poly_slug.into(),
-            poly_yes_token: yes_token.into(),
-            poly_no_token: no_token.into(),
-            line_value: market.floor_strike,
-            team_suffix: team_suffix.map(|s| s.into()),
-        })
     }
 
     /// Discover esports market pairs using series-based name matching

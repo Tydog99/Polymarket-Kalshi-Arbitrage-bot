@@ -176,6 +176,112 @@ impl GammaClient {
         }
     }
 
+    /// Batch lookup multiple Polymarket markets by slug.
+    /// Returns HashMap keyed by slug with (token1, token2, outcomes) values.
+    /// Slugs not found or inactive are simply not included in the result.
+    ///
+    /// This is much more efficient than individual lookups:
+    /// - 100 slugs = 1-2 HTTP requests instead of 100
+    /// - Reduces Cloudflare rate limiting triggers
+    pub async fn lookup_markets_batch(
+        &self,
+        slugs: &[String],
+    ) -> Result<std::collections::HashMap<String, (String, String, Vec<String>)>> {
+        use std::collections::HashMap;
+
+        if slugs.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Build URL with multiple slug parameters: /markets?slug=x&slug=y&slug=z
+        let query_params: Vec<String> = slugs.iter()
+            .map(|s| format!("slug={}", s))
+            .collect();
+        let url = format!("{}/markets?{}", GAMMA_API_BASE, query_params.join("&"));
+
+        // Retry logic for transient failures (Cloudflare throttling, network issues)
+        let mut last_error = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                // Exponential backoff: 100ms, 200ms
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * (1 << (attempt - 1)))).await;
+            }
+
+            match self.http.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<Vec<GammaMarket>>().await {
+                        Ok(markets) => {
+                            return Ok(self.parse_gamma_batch_response(markets));
+                        }
+                        Err(e) => {
+                            last_error = Some(format!("JSON parse error: {}", e));
+                            continue;
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    // Non-success status - log and return empty (404 means no markets found)
+                    let status = resp.status();
+                    if status.as_u16() != 404 {
+                        tracing::warn!("Gamma batch lookup got status {}", status);
+                    }
+                    return Ok(HashMap::new());
+                }
+                Err(e) => {
+                    last_error = Some(format!("Request error: {}", e));
+                    continue;
+                }
+            }
+        }
+
+        // All retries exhausted
+        if let Some(err) = last_error {
+            tracing::warn!("Gamma batch lookup failed after 3 attempts: {}", err);
+            anyhow::bail!("Gamma API batch failed after 3 retries: {}", err);
+        }
+        Ok(HashMap::new())
+    }
+
+    /// Parse batch response into HashMap keyed by slug
+    fn parse_gamma_batch_response(
+        &self,
+        markets: Vec<GammaMarket>,
+    ) -> std::collections::HashMap<String, (String, String, Vec<String>)> {
+        use std::collections::HashMap;
+
+        let mut results = HashMap::new();
+
+        for market in markets {
+            // Skip inactive/closed markets
+            if market.closed == Some(true) || market.active == Some(false) {
+                continue;
+            }
+
+            // Need slug to key the result
+            let Some(slug) = market.slug else {
+                continue;
+            };
+
+            // Parse clobTokenIds JSON array
+            let token_ids: Vec<String> = market.clob_token_ids
+                .as_ref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+
+            // Parse outcomes JSON array
+            let outcomes: Vec<String> = market.outcomes
+                .as_ref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+
+            if token_ids.len() >= 2 {
+                results.insert(slug, (token_ids[0].clone(), token_ids[1].clone(), outcomes));
+            }
+        }
+
+        results
+    }
+
     /// Fetch events by Polymarket series ID (for esports discovery)
     pub async fn fetch_events_by_series(&self, series_id: &str) -> Result<Vec<PolyEvent>> {
         let url = format!(
@@ -196,6 +302,8 @@ impl GammaClient {
 
 #[derive(Debug, Deserialize)]
 struct GammaMarket {
+    /// Market slug, used for matching in batch lookups
+    slug: Option<String>,
     #[serde(rename = "clobTokenIds")]
     clob_token_ids: Option<String>,
     /// JSON array of outcome names, e.g. '["Team A", "Team B"]'
@@ -226,7 +334,7 @@ pub struct PolyEventMarket {
 
 /// Increment the date in a Polymarket slug by 1 day
 /// e.g., "epl-che-avl-2025-12-08" -> "epl-che-avl-2025-12-09"
-fn increment_date_in_slug(slug: &str) -> Option<String> {
+pub fn increment_date_in_slug(slug: &str) -> Option<String> {
     let parts: Vec<&str> = slug.split('-').collect();
     if parts.len() < 6 {
         return None;
