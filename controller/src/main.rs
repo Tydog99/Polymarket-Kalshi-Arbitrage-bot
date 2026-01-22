@@ -199,15 +199,27 @@ async fn discovery_refresh_task(
     shutdown_tx: watch::Sender<bool>,
     interval_mins: u64,
     leagues: Vec<String>,
+    tui_state: Arc<tokio::sync::RwLock<crate::confirm_tui::TuiState>>,
+    log_tx: tokio::sync::mpsc::Sender<String>,
 ) {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // Helper to route log output based on TUI state
+    let log_line = |msg: String, tui_active: bool| {
+        if tui_active {
+            let _ = log_tx.try_send(format!("[{}]  INFO {}", chrono::Local::now().format("%H:%M:%S"), msg));
+        } else {
+            info!("{}", msg);
+        }
+    };
+
+    let tui_active = tui_state.read().await.active;
     if interval_mins == 0 {
-        info!("[DISCOVERY] Runtime discovery disabled (DISCOVERY_INTERVAL_MINS=0)");
+        log_line("[DISCOVERY] Runtime discovery disabled (DISCOVERY_INTERVAL_MINS=0)".to_string(), tui_active);
         return;
     }
 
-    info!("[DISCOVERY] Runtime discovery enabled (interval: {}m)", interval_mins);
+    log_line(format!("[DISCOVERY] Runtime discovery enabled (interval: {}m)", interval_mins), tui_active);
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_mins * 60));
     interval.tick().await; // Skip immediate first tick
@@ -221,7 +233,8 @@ async fn discovery_refresh_task(
     loop {
         interval.tick().await;
 
-        info!("[DISCOVERY] Running scheduled discovery...");
+        let tui_active = tui_state.read().await.active;
+        log_line("[DISCOVERY] Running scheduled discovery...".to_string(), tui_active);
 
         // Build set of known tickers
         let known_tickers: HashSet<String> = state.markets.iter()
@@ -243,20 +256,21 @@ async fn discovery_refresh_task(
             .as_secs();
 
         // Log errors but continue
+        let tui_active = tui_state.read().await.active;
         for err in &result.errors {
-            warn!("[DISCOVERY] {}", err);
+            log_line(format!("[DISCOVERY] {}", err), tui_active);
         }
 
         if result.pairs.is_empty() {
-            info!("[DISCOVERY] No new markets found");
+            log_line("[DISCOVERY] No new markets found".to_string(), tui_active);
             continue;
         }
 
         // Log new markets with highlighted formatting
-        info!("[DISCOVERY] NEW MARKETS DISCOVERED: {}", result.pairs.len());
+        log_line(format!("[DISCOVERY] NEW MARKETS DISCOVERED: {}", result.pairs.len()), tui_active);
         for pair in &result.pairs {
-            info!("[DISCOVERY]   -> {} | {} | {}",
-                pair.league, pair.description, pair.kalshi_market_ticker);
+            log_line(format!("[DISCOVERY]   -> {} | {} | {}",
+                pair.league, pair.description, pair.kalshi_market_ticker), tui_active);
         }
 
         // Add new pairs to global state (thread-safe via interior mutability)
@@ -264,17 +278,17 @@ async fn discovery_refresh_task(
         for pair in result.pairs {
             if let Some(market_id) = state.add_pair(pair) {
                 added_count += 1;
-                info!("[DISCOVERY] Added market_id {} to state", market_id);
+                log_line(format!("[DISCOVERY] Added market_id {} to state", market_id), tui_active);
             } else {
-                warn!("[DISCOVERY] Failed to add pair - state full (MAX_MARKETS reached)");
+                log_line("[DISCOVERY] Failed to add pair - state full (MAX_MARKETS reached)".to_string(), tui_active);
             }
         }
-        info!("[DISCOVERY] Added {} new markets to state (total: {})", added_count, state.market_count());
+        log_line(format!("[DISCOVERY] Added {} new markets to state (total: {})", added_count, state.market_count()), tui_active);
 
         // Signal WebSockets to reconnect with updated subscriptions
-        info!("[DISCOVERY] Signaling WebSocket reconnect for {} new markets...", added_count);
+        log_line(format!("[DISCOVERY] Signaling WebSocket reconnect for {} new markets...", added_count), tui_active);
         if shutdown_tx.send(true).is_err() {
-            warn!("[DISCOVERY] Failed to signal WebSocket reconnect - receivers dropped");
+            log_line("[DISCOVERY] Failed to signal WebSocket reconnect - receivers dropped".to_string(), tui_active);
         }
 
         // Give WebSockets time to shut down gracefully
@@ -282,7 +296,7 @@ async fn discovery_refresh_task(
 
         // Reset shutdown signal for next cycle
         if shutdown_tx.send(false).is_err() {
-            warn!("[DISCOVERY] Failed to reset shutdown signal - receivers dropped");
+            log_line("[DISCOVERY] Failed to reset shutdown signal - receivers dropped".to_string(), tui_active);
         }
     }
 }
@@ -888,7 +902,9 @@ async fn main() -> Result<()> {
             dry_run,
             clock.clone(),
         ));
-        tokio::spawn(run_execution_loop(exec_rx, engine))
+        let exec_tui_state = tui_state.clone();
+        let exec_log_tx = tui_log_tx.clone();
+        tokio::spawn(run_execution_loop(exec_rx, engine, Some(exec_tui_state), Some(exec_log_tx)))
     };
 
     // Confirmation handler task: receives arbs needing confirmation, manages queue and TUI
@@ -999,9 +1015,13 @@ async fn main() -> Result<()> {
                                     // Validate arb is still profitable
                                     match confirm_queue_clone.validate_arb_detailed(&arb) {
                                         Some(result) if result.is_valid => {
-                                            log_msg(format!("[{}]  INFO [CONFIRM] ✅ Approved: {} - forwarding to execution",
-                                                chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
-                                            let _ = confirm_exec_tx.try_send(arb.request.clone());
+                                            if let Err(e) = confirm_exec_tx.try_send(arb.request.clone()) {
+                                                log_msg(format!("[{}] ERROR [CONFIRM] ❌ FAILED to forward approved arb to execution: {} - {}",
+                                                    chrono::Local::now().format("%H:%M:%S"), arb.pair.description, e));
+                                            } else {
+                                                log_msg(format!("[{}]  INFO [CONFIRM] ✅ Approved: {} - forwarding to execution",
+                                                    chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
+                                            }
                                             ConfirmationStatus::Accepted
                                         }
                                         Some(result) => {
@@ -1077,8 +1097,10 @@ async fn main() -> Result<()> {
     } else {
         // When confirm mode is disabled, drain confirm_rx and forward directly to execution
         Some(tokio::spawn(async move {
-            while let Some((req, _pair)) = confirm_rx.recv().await {
-                let _ = confirm_exec_tx.try_send(req);
+            while let Some((req, pair)) = confirm_rx.recv().await {
+                if let Err(e) = confirm_exec_tx.try_send(req) {
+                    warn!("[CONFIRM] Failed to forward arb to execution: {} - {}", pair.description, e);
+                }
             }
         }))
     };
@@ -1177,6 +1199,8 @@ async fn main() -> Result<()> {
     let kalshi_ws_config = KalshiConfig::from_env()?;
     let kalshi_shutdown_rx = shutdown_rx.clone();
     let kalshi_clock = clock.clone();
+    let kalshi_tui_state = tui_state.clone();
+    let kalshi_log_tx = tui_log_tx.clone();
     let kalshi_handle = tokio::spawn(async move {
         loop {
             let shutdown_rx = kalshi_shutdown_rx.clone();
@@ -1188,10 +1212,18 @@ async fn main() -> Result<()> {
                 kalshi_threshold,
                 shutdown_rx,
                 kalshi_clock.clone(),
+                kalshi_tui_state.clone(),
+                kalshi_log_tx.clone(),
             )
             .await
             {
-                error!("[KALSHI] WebSocket disconnected: {} - reconnecting...", e);
+                let tui_active = kalshi_tui_state.read().await.active;
+                if tui_active {
+                    let _ = kalshi_log_tx.try_send(format!("[{}] ERROR [KALSHI] WebSocket disconnected: {} - reconnecting...",
+                        chrono::Local::now().format("%H:%M:%S"), e));
+                } else {
+                    error!("[KALSHI] WebSocket disconnected: {} - reconnecting...", e);
+                }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
         }
@@ -1204,6 +1236,8 @@ async fn main() -> Result<()> {
     let poly_threshold = threshold_cents;
     let poly_shutdown_rx = shutdown_rx.clone();
     let poly_clock = clock.clone();
+    let poly_tui_state = tui_state.clone();
+    let poly_log_tx = tui_log_tx.clone();
     let poly_handle = tokio::spawn(async move {
         loop {
             let shutdown_rx = poly_shutdown_rx.clone();
@@ -1214,10 +1248,18 @@ async fn main() -> Result<()> {
                 poly_threshold,
                 shutdown_rx,
                 poly_clock.clone(),
+                poly_tui_state.clone(),
+                poly_log_tx.clone(),
             )
             .await
             {
-                error!("[POLYMARKET] WebSocket disconnected: {} - reconnecting...", e);
+                let tui_active = poly_tui_state.read().await.active;
+                if tui_active {
+                    let _ = poly_log_tx.try_send(format!("[{}] ERROR [POLYMARKET] WebSocket disconnected: {} - reconnecting...",
+                        chrono::Local::now().format("%H:%M:%S"), e));
+                } else {
+                    error!("[POLYMARKET] WebSocket disconnected: {} - reconnecting...", e);
+                }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
         }
@@ -1229,12 +1271,24 @@ async fn main() -> Result<()> {
     let sweep_exec_tx = exec_tx.clone();
     let sweep_threshold = threshold_cents;
     let sweep_clock = clock.clone();
+    let sweep_tui_state = tui_state.clone();
+    let sweep_log_tx = tui_log_tx.clone();
     tokio::spawn(async move {
         use crate::types::{FastExecutionRequest, ArbType};
 
+        // Helper closure to route log output based on TUI state
+        let log_line = |line: String, tui_active: bool| {
+            if tui_active {
+                let _ = sweep_log_tx.try_send(format!("[{}]  INFO {}", chrono::Local::now().format("%H:%M:%S"), line));
+            } else {
+                info!("{}", line);
+            }
+        };
+
         // Wait for WebSockets to connect and receive initial snapshots
         const STARTUP_SWEEP_DELAY_SECS: u64 = 10;
-        info!("[SWEEP] Startup sweep scheduled in {}s...", STARTUP_SWEEP_DELAY_SECS);
+        let tui_active = sweep_tui_state.read().await.active;
+        log_line(format!("[SWEEP] Startup sweep scheduled in {}s...", STARTUP_SWEEP_DELAY_SECS), tui_active);
         tokio::time::sleep(tokio::time::Duration::from_secs(STARTUP_SWEEP_DELAY_SECS)).await;
 
         let market_count = sweep_state.market_count();
@@ -1283,13 +1337,15 @@ async fn main() -> Result<()> {
                 };
 
                 if let Err(e) = sweep_exec_tx.try_send(req) {
-                    warn!("[SWEEP] Failed to send arb request: {}", e);
+                    let tui_active = sweep_tui_state.read().await.active;
+                    log_line(format!("[SWEEP] Failed to send arb request: {}", e), tui_active);
                 }
             }
         }
 
-        info!("[SWEEP] ✅ Startup sweep complete: scanned {} markets, found {} arbs",
-              markets_scanned, arbs_found);
+        let tui_active = sweep_tui_state.read().await.active;
+        log_line(format!("[SWEEP] Startup sweep complete: scanned {} markets, found {} arbs",
+              markets_scanned, arbs_found), tui_active);
     });
 
     // System health monitoring and arbitrage diagnostics
@@ -1317,10 +1373,10 @@ async fn main() -> Result<()> {
             // Check TUI state once per iteration for efficient log routing
             let tui_active = heartbeat_tui_state.read().await.active;
 
-            // Helper closure to route log output
+            // Helper closure to route log output based on TUI state
             let log_line = |line: String| {
                 if tui_active {
-                    let _ = heartbeat_log_tx.try_send(line);
+                    let _ = heartbeat_log_tx.try_send(format!("[{}]  INFO {}", chrono::Local::now().format("%H:%M:%S"), line));
                 } else {
                     println!("{}", line);
                 }
@@ -1683,6 +1739,8 @@ async fn main() -> Result<()> {
     let discovery_client = Arc::new(discovery);
     let discovery_state = state.clone();
     let refresh_leagues = leagues_owned.clone();
+    let discovery_tui_state = tui_state.clone();
+    let discovery_log_tx = tui_log_tx.clone();
     let discovery_handle = tokio::spawn(async move {
         discovery_refresh_task(
             discovery_client,
@@ -1690,6 +1748,8 @@ async fn main() -> Result<()> {
             shutdown_tx,
             discovery_interval,
             refresh_leagues,
+            discovery_tui_state,
+            discovery_log_tx,
         ).await;
     });
 

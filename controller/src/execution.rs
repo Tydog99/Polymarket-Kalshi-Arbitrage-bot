@@ -965,23 +965,80 @@ pub fn create_execution_channel() -> (mpsc::Sender<FastExecutionRequest>, mpsc::
 }
 
 /// Main execution event loop - processes arbitrage opportunities as they arrive
+///
+/// When `log_tx` is provided and TUI is active, logs are routed through the channel
+/// instead of going to stdout (which would corrupt the TUI display).
 pub async fn run_execution_loop(
     mut rx: mpsc::Receiver<FastExecutionRequest>,
     engine: Arc<ExecutionEngine>,
+    tui_state: Option<Arc<tokio::sync::RwLock<crate::confirm_tui::TuiState>>>,
+    log_tx: Option<mpsc::Sender<String>>,
 ) {
-    info!("[EXEC] Execution engine started (dry_run={})", engine.dry_run);
+    // Check TUI state and log startup message
+    let tui_active = if let Some(ref state) = tui_state {
+        state.read().await.active
+    } else {
+        false
+    };
+
+    let startup_msg = format!("[EXEC] Execution engine started (dry_run={})", engine.dry_run);
+    if tui_active {
+        if let Some(ref tx) = log_tx {
+            let _ = tx.try_send(format!("[{}]  INFO {}", chrono::Local::now().format("%H:%M:%S"), startup_msg));
+        }
+    } else {
+        info!("{}", startup_msg);
+    }
 
     while let Some(req) = rx.recv().await {
         let engine = engine.clone();
+        let tui_state_clone = tui_state.clone();
+        let log_tx_clone = log_tx.clone();
 
         // Process immediately in spawned task
         tokio::spawn(async move {
+            let tui_active = if let Some(ref state) = tui_state_clone {
+                state.read().await.active
+            } else {
+                false
+            };
+
+            // Local log helpers for spawned task
+            let log_info = |msg: String| {
+                if tui_active {
+                    if let Some(ref tx) = log_tx_clone {
+                        let _ = tx.try_send(format!("[{}]  INFO {}", chrono::Local::now().format("%H:%M:%S"), msg));
+                    }
+                } else {
+                    info!("{}", msg);
+                }
+            };
+            let log_warn = |msg: String| {
+                if tui_active {
+                    if let Some(ref tx) = log_tx_clone {
+                        let _ = tx.try_send(format!("[{}]  WARN {}", chrono::Local::now().format("%H:%M:%S"), msg));
+                    }
+                } else {
+                    warn!("{}", msg);
+                }
+            };
+            let log_error = |msg: String| {
+                // Always log errors to tracing for persistence/Sentry
+                error!("{}", msg);
+                // Also send to TUI if active
+                if tui_active {
+                    if let Some(ref tx) = log_tx_clone {
+                        let _ = tx.try_send(format!("[{}] ERROR {}", chrono::Local::now().format("%H:%M:%S"), msg));
+                    }
+                }
+            };
+
             match engine.process(req).await {
                 Ok(result) if result.success => {
-                    info!(
+                    log_info(format!(
                         "[EXEC] ✅ market_id={} profit={}¢ latency={}µs",
                         result.market_id, result.profit_cents, result.latency_ns / 1000
-                    );
+                    ));
                 }
                 Ok(result) => {
                     // Skip logging for errors that already have detailed logs
@@ -994,20 +1051,34 @@ pub async fn run_execution_loop(
                             .and_then(|m| m.pair())
                             .map(|p| p.description.to_string())
                             .unwrap_or_else(|| format!("market_id={}", result.market_id));
-                        warn!(
+                        log_warn(format!(
                             "[EXEC] ⚠️ {}: {:?}",
                             detail, result.error
-                        );
+                        ));
                     }
                 }
                 Err(e) => {
-                    error!("[EXEC] ❌ Error: {}", e);
+                    log_error(format!("[EXEC] ❌ Error: {}", e));
                 }
             }
         });
     }
 
-    info!("[EXEC] Execution engine stopped");
+    // Log shutdown message
+    let tui_active = if let Some(ref state) = tui_state {
+        state.read().await.active
+    } else {
+        false
+    };
+
+    let shutdown_msg = "[EXEC] Execution engine stopped";
+    if tui_active {
+        if let Some(ref tx) = log_tx {
+            let _ = tx.try_send(format!("[{}]  INFO {}", chrono::Local::now().format("%H:%M:%S"), shutdown_msg));
+        }
+    } else {
+        info!("{}", shutdown_msg);
+    }
 }
 
 #[cfg(test)]

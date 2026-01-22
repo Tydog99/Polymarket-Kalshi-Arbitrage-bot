@@ -285,7 +285,18 @@ pub async fn run_ws(
     threshold_cents: PriceCents,
     shutdown_rx: watch::Receiver<bool>,
     clock: Arc<NanoClock>,
+    tui_state: Arc<tokio::sync::RwLock<crate::confirm_tui::TuiState>>,
+    log_tx: mpsc::Sender<String>,
 ) -> Result<()> {
+    // Helper to route logs based on TUI state
+    let log_info = |msg: &str, tui_active: bool| {
+        if tui_active {
+            let _ = log_tx.try_send(format!("[{}]  INFO {}", chrono::Local::now().format("%H:%M:%S"), msg));
+        } else {
+            info!("{}", msg);
+        }
+    };
+
     // Collect all tokens from markets
     let tokens: Vec<String> = state.markets.iter()
         .take(state.market_count())
@@ -301,8 +312,9 @@ pub async fn run_ws(
         })
         .collect();
 
+    let tui_active = tui_state.read().await.active;
     if tokens.is_empty() {
-        info!("[POLY] No markets to monitor");
+        log_info("[POLY] No markets to monitor", tui_active);
         tokio::time::sleep(Duration::from_secs(u64::MAX)).await;
         return Ok(());
     }
@@ -321,14 +333,17 @@ pub async fn run_ws(
             threshold_cents,
             shutdown_rx,
             clock,
+            tui_state,
+            log_tx,
         ).await;
     }
 
-    info!(
-        "[POLY] Splitting {} tokens across {} connections (max {} per connection)",
-        tokens.len(),
-        num_connections,
-        POLY_MAX_TOKENS_PER_WS
+    log_info(
+        &format!("[POLY] Splitting {} tokens across {} connections (max {} per connection)",
+            tokens.len(),
+            num_connections,
+            POLY_MAX_TOKENS_PER_WS),
+        tui_active,
     );
 
     // Spawn tasks for each chunk
@@ -337,12 +352,13 @@ pub async fn run_ws(
     for (conn_id, chunk) in tokens.chunks(POLY_MAX_TOKENS_PER_WS).enumerate() {
         let token_start = conn_id * POLY_MAX_TOKENS_PER_WS;
         let token_end = token_start + chunk.len().saturating_sub(1);
-        info!(
-            "[POLY:{}] Assigned tokens {}-{} ({} tokens)",
-            conn_id,
-            token_start,
-            token_end,
-            chunk.len()
+        log_info(
+            &format!("[POLY:{}] Assigned tokens {}-{} ({} tokens)",
+                conn_id,
+                token_start,
+                token_end,
+                chunk.len()),
+            tui_active,
         );
 
         let chunk_tokens = chunk.to_vec();
@@ -351,6 +367,8 @@ pub async fn run_ws(
         let confirm_tx = confirm_tx.clone();
         let shutdown_rx = shutdown_rx.clone();
         let clock = Arc::clone(&clock);
+        let tui_state = Arc::clone(&tui_state);
+        let log_tx = log_tx.clone();
 
         let handle = tokio::spawn(async move {
             run_single_ws(
@@ -362,6 +380,8 @@ pub async fn run_ws(
                 threshold_cents,
                 shutdown_rx,
                 clock,
+                tui_state,
+                log_tx,
             ).await
         });
 
@@ -393,6 +413,8 @@ async fn run_single_ws(
     threshold_cents: PriceCents,
     mut shutdown_rx: watch::Receiver<bool>,
     clock: Arc<NanoClock>,
+    tui_state: Arc<tokio::sync::RwLock<crate::confirm_tui::TuiState>>,
+    log_tx: mpsc::Sender<String>,
 ) -> Result<()> {
     let log_prefix = if conn_id == 0 && tokens.len() <= POLY_MAX_TOKENS_PER_WS {
         "[POLY]".to_string()
@@ -400,11 +422,35 @@ async fn run_single_ws(
         format!("[POLY:{}]", conn_id)
     };
 
+    // Helper to route logs based on TUI state
+    let log_info = |msg: &str, tui_active: bool| {
+        if tui_active {
+            let _ = log_tx.try_send(format!("[{}]  INFO {}", chrono::Local::now().format("%H:%M:%S"), msg));
+        } else {
+            info!("{}", msg);
+        }
+    };
+    let log_warn = |msg: &str, tui_active: bool| {
+        if tui_active {
+            let _ = log_tx.try_send(format!("[{}]  WARN {}", chrono::Local::now().format("%H:%M:%S"), msg));
+        } else {
+            warn!("{}", msg);
+        }
+    };
+    let log_error = |msg: &str, tui_active: bool| {
+        if tui_active {
+            let _ = log_tx.try_send(format!("[{}] ERROR {}", chrono::Local::now().format("%H:%M:%S"), msg));
+        } else {
+            error!("{}", msg);
+        }
+    };
+
     let (ws_stream, _) = connect_async(POLYMARKET_WS_URL)
         .await
         .context("Failed to connect to Polymarket")?;
 
-    info!("{} Connected", log_prefix);
+    let tui_active = tui_state.read().await.active;
+    log_info(&format!("{} Connected", log_prefix), tui_active);
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -415,7 +461,8 @@ async fn run_single_ws(
     };
 
     write.send(Message::Text(serde_json::to_string(&subscribe_msg)?)).await?;
-    info!("{} Subscribed to {} tokens", log_prefix, tokens.len());
+    let tui_active = tui_state.read().await.active;
+    log_info(&format!("{} Subscribed to {} tokens", log_prefix, tokens.len()), tui_active);
 
     let mut ping_interval = interval(Duration::from_secs(POLY_PING_INTERVAL_SECS));
     let mut last_message = Instant::now();
@@ -427,14 +474,16 @@ async fn run_single_ws(
             // Check shutdown signal first
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
-                    info!("{} Shutdown signal received, disconnecting...", log_prefix);
+                    let tui_active = tui_state.read().await.active;
+                    log_info(&format!("{} Shutdown signal received, disconnecting...", log_prefix), tui_active);
                     break;
                 }
             }
 
             _ = ping_interval.tick() => {
                 if let Err(e) = write.send(Message::Ping(vec![])).await {
-                    error!("{} Failed to send ping: {}", log_prefix, e);
+                    let tui_active = tui_state.read().await.active;
+                    log_error(&format!("{} Failed to send ping: {}", log_prefix, e), tui_active);
                     break;
                 }
             }
@@ -480,7 +529,8 @@ async fn run_single_ws(
                     }
                     Some(Ok(Message::Ping(data))) => {
                         if let Err(e) = write.send(Message::Pong(data)).await {
-                            warn!("{} Failed to send pong: {} (connection may be degraded)", log_prefix, e);
+                            let tui_active = tui_state.read().await.active;
+                            log_warn(&format!("{} Failed to send pong: {} (connection may be degraded)", log_prefix, e), tui_active);
                         }
                         last_message = Instant::now();
                     }
@@ -488,15 +538,18 @@ async fn run_single_ws(
                         last_message = Instant::now();
                     }
                     Some(Ok(Message::Close(frame))) => {
-                        warn!("{} Server closed: {:?}", log_prefix, frame);
+                        let tui_active = tui_state.read().await.active;
+                        log_warn(&format!("{} Server closed: {:?}", log_prefix, frame), tui_active);
                         break;
                     }
                     Some(Err(e)) => {
-                        error!("{} WebSocket error: {}", log_prefix, e);
+                        let tui_active = tui_state.read().await.active;
+                        log_error(&format!("{} WebSocket error: {}", log_prefix, e), tui_active);
                         break;
                     }
                     None => {
-                        warn!("{} Stream ended", log_prefix);
+                        let tui_active = tui_state.read().await.active;
+                        log_warn(&format!("{} Stream ended", log_prefix), tui_active);
                         break;
                     }
                     _ => {}
@@ -505,7 +558,8 @@ async fn run_single_ws(
         }
 
         if last_message.elapsed() > Duration::from_secs(120) {
-            warn!("{} Stale connection, reconnecting...", log_prefix);
+            let tui_active = tui_state.read().await.active;
+            log_warn(&format!("{} Stale connection, reconnecting...", log_prefix), tui_active);
             break;
         }
     }
