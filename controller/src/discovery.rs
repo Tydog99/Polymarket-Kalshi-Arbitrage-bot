@@ -4,7 +4,6 @@
 //! with support for caching, incremental updates, and parallel processing.
 
 use anyhow::Result;
-use futures_util::{stream, StreamExt};
 use governor::{Quota, RateLimiter, state::NotKeyed, clock::DefaultClock, middleware::NoOpMiddleware};
 use regex::Regex;
 use std::sync::LazyLock;
