@@ -9,7 +9,7 @@ use crate::types::{ArbType, PriceCents, SizeCents};
 /// Formula: ceil(0.07 * price * (1 - price/100)) in cents
 /// Using integer math: (7 * p * (100 - p) + 9999) / 10000
 #[inline]
-fn kalshi_fee(price_cents: PriceCents) -> PriceCents {
+pub fn kalshi_fee(price_cents: PriceCents) -> PriceCents {
     if price_cents == 0 || price_cents >= 100 {
         return 0;
     }
