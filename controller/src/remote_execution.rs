@@ -71,11 +71,15 @@ impl HybridExecutor {
         }
     }
 
-    /// Log a message - sends to TUI channel if available, otherwise uses tracing
+    /// Log a message - sends to TUI channel if available, otherwise uses tracing.
+    /// Falls back to tracing if TUI channel is full or closed.
     fn log_info(&self, msg: String) {
         let formatted = format!("[{}]  INFO {}", Local::now().format("%H:%M:%S"), msg);
         if let Some(tx) = &self.log_tx {
-            let _ = tx.try_send(formatted);
+            if tx.try_send(formatted).is_err() {
+                // Channel full or closed, fallback to tracing
+                info!("{}", msg);
+            }
         } else {
             info!("{}", msg);
         }
@@ -84,7 +88,9 @@ impl HybridExecutor {
     fn log_warn(&self, msg: String) {
         let formatted = format!("[{}]  WARN {}", Local::now().format("%H:%M:%S"), msg);
         if let Some(tx) = &self.log_tx {
-            let _ = tx.try_send(formatted);
+            if tx.try_send(formatted).is_err() {
+                warn!("{}", msg);
+            }
         } else {
             warn!("{}", msg);
         }
@@ -93,7 +99,9 @@ impl HybridExecutor {
     fn log_error(&self, msg: String) {
         let formatted = format!("[{}] ERROR {}", Local::now().format("%H:%M:%S"), msg);
         if let Some(tx) = &self.log_tx {
-            let _ = tx.try_send(formatted);
+            if tx.try_send(formatted).is_err() {
+                error!("{}", msg);
+            }
         } else {
             error!("{}", msg);
         }

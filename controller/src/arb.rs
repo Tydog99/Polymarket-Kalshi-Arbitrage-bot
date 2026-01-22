@@ -246,49 +246,100 @@ impl ArbOpportunity {
 /// Configuration for arbitrage detection.
 ///
 /// Loaded from environment variables at startup with sensible defaults.
+/// Fields are private to enforce invariants; use getter methods for access.
 #[derive(Debug, Clone)]
 pub struct ArbConfig {
     /// Threshold in cents below which an arb is considered profitable.
-    /// Default: 99 (i.e., combined cost must be <= 99 cents for a 1+ cent profit)
-    pub threshold_cents: PriceCents,
+    /// Valid range: 1-100 (default: 99)
+    threshold_cents: PriceCents,
     /// Minimum number of contracts to execute.
-    /// Default: 1.0
-    pub min_contracts: f64,
-    /// Kalshi fee rate (7% of notional).
-    /// Default: 0.07
-    /// Reserved for future configurability; currently using kalshi_fee() function.
-    #[allow(dead_code)]
-    pub kalshi_fee_rate: f64,
-    /// Polymarket fee rate (currently 0%).
-    /// Default: 0.0
-    /// Reserved for future configurability when Polymarket adds fees.
-    #[allow(dead_code)]
-    pub poly_fee_rate: f64,
+    /// Must be > 0 (default: 1.0)
+    min_contracts: f64,
 }
 
 impl ArbConfig {
-    /// Load configuration from environment variables.
+    /// Create a new ArbConfig with validation.
+    ///
+    /// # Arguments
+    /// * `threshold_cents` - Maximum cost for a profitable arb (1-100)
+    /// * `min_contracts` - Minimum contracts to execute (must be > 0)
+    ///
+    /// # Panics
+    /// Panics in debug mode if values are out of valid range.
+    pub fn new(threshold_cents: PriceCents, min_contracts: f64) -> Self {
+        debug_assert!(
+            threshold_cents > 0 && threshold_cents <= 100,
+            "threshold_cents must be in range 1-100, got {}",
+            threshold_cents
+        );
+        debug_assert!(
+            min_contracts > 0.0,
+            "min_contracts must be > 0, got {}",
+            min_contracts
+        );
+
+        Self {
+            threshold_cents,
+            min_contracts,
+        }
+    }
+
+    /// Load configuration from environment variables with validation.
     ///
     /// Reads:
-    /// - `ARB_THRESHOLD_CENTS`: Threshold in cents (default: 99)
-    /// - `ARB_MIN_CONTRACTS`: Minimum contracts to execute (default: 1.0)
+    /// - `ARB_THRESHOLD_CENTS`: Threshold in cents (default: 99, valid: 1-100)
+    /// - `ARB_MIN_CONTRACTS`: Minimum contracts to execute (default: 1.0, must be > 0)
+    ///
+    /// Invalid values are logged and replaced with defaults.
     pub fn from_env() -> Self {
         let threshold_cents = std::env::var("ARB_THRESHOLD_CENTS")
             .ok()
             .and_then(|s| s.parse::<PriceCents>().ok())
+            .map(|v| {
+                if v == 0 || v > 100 {
+                    tracing::warn!(
+                        "[ARB] ARB_THRESHOLD_CENTS={} out of range (1-100), using default 99",
+                        v
+                    );
+                    99
+                } else {
+                    v
+                }
+            })
             .unwrap_or(99);
 
         let min_contracts = std::env::var("ARB_MIN_CONTRACTS")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
+            .map(|v| {
+                if v <= 0.0 {
+                    tracing::warn!(
+                        "[ARB] ARB_MIN_CONTRACTS={} must be > 0, using default 1.0",
+                        v
+                    );
+                    1.0
+                } else {
+                    v
+                }
+            })
             .unwrap_or(1.0);
 
         Self {
             threshold_cents,
             min_contracts,
-            kalshi_fee_rate: 0.07,
-            poly_fee_rate: 0.0,
         }
+    }
+
+    /// Returns the threshold in cents for profitable arbs.
+    #[inline]
+    pub fn threshold_cents(&self) -> PriceCents {
+        self.threshold_cents
+    }
+
+    /// Returns the minimum number of contracts required.
+    #[inline]
+    pub fn min_contracts(&self) -> f64 {
+        self.min_contracts
     }
 }
 
@@ -297,8 +348,6 @@ impl Default for ArbConfig {
         Self {
             threshold_cents: 99,
             min_contracts: 1.0,
-            kalshi_fee_rate: 0.07,
-            poly_fee_rate: 0.0,
         }
     }
 }
@@ -312,10 +361,8 @@ mod tests {
     fn test_arb_config_defaults() {
         let config = ArbConfig::default();
 
-        assert_eq!(config.threshold_cents, 99);
-        assert_eq!(config.min_contracts, 1.0);
-        assert_eq!(config.kalshi_fee_rate, 0.07);
-        assert_eq!(config.poly_fee_rate, 0.0);
+        assert_eq!(config.threshold_cents(), 99);
+        assert_eq!(config.min_contracts(), 1.0);
     }
 
     #[test]
@@ -326,14 +373,49 @@ mod tests {
 
         let config = ArbConfig::from_env();
 
-        assert_eq!(config.threshold_cents, 95);
-        assert_eq!(config.min_contracts, 5.0);
-        // Fee rates should still be defaults
-        assert_eq!(config.kalshi_fee_rate, 0.07);
-        assert_eq!(config.poly_fee_rate, 0.0);
+        assert_eq!(config.threshold_cents(), 95);
+        assert_eq!(config.min_contracts(), 5.0);
 
         // Clean up environment variables
         std::env::remove_var("ARB_THRESHOLD_CENTS");
+        std::env::remove_var("ARB_MIN_CONTRACTS");
+    }
+
+    #[test]
+    fn test_arb_config_new_with_valid_values() {
+        let config = ArbConfig::new(95, 2.5);
+
+        assert_eq!(config.threshold_cents(), 95);
+        assert_eq!(config.min_contracts(), 2.5);
+    }
+
+    #[test]
+    fn test_arb_config_from_env_validates_threshold() {
+        // Set invalid threshold (0)
+        std::env::set_var("ARB_THRESHOLD_CENTS", "0");
+        std::env::remove_var("ARB_MIN_CONTRACTS");
+
+        let config = ArbConfig::from_env();
+
+        // Should fall back to default 99
+        assert_eq!(config.threshold_cents(), 99);
+
+        // Clean up
+        std::env::remove_var("ARB_THRESHOLD_CENTS");
+    }
+
+    #[test]
+    fn test_arb_config_from_env_validates_min_contracts() {
+        // Set invalid min_contracts (negative)
+        std::env::remove_var("ARB_THRESHOLD_CENTS");
+        std::env::set_var("ARB_MIN_CONTRACTS", "-1.0");
+
+        let config = ArbConfig::from_env();
+
+        // Should fall back to default 1.0
+        assert_eq!(config.min_contracts(), 1.0);
+
+        // Clean up
         std::env::remove_var("ARB_MIN_CONTRACTS");
     }
 
@@ -490,5 +572,167 @@ mod tests {
         assert!(opp.is_valid());
         // Priority: PolyYesKalshiNo first
         assert_eq!(opp.arb_type(), Some(ArbType::PolyYesKalshiNo));
+    }
+
+    // =========================================================================
+    // min_contracts filtering tests
+    // =========================================================================
+
+    #[test]
+    fn test_arb_opportunity_rejected_when_below_min_contracts() {
+        // Config with min_contracts = 5
+        let config = ArbConfig {
+            min_contracts: 5.0,
+            ..ArbConfig::default()
+        };
+        // Prices create valid arb (40 + 50 + 2 fee = 92 < 99)
+        // But sizes only allow 3 contracts: min(150/40=3, 150/50=3) = 3
+        let kalshi = (55u16, 50u16, 150u16, 150u16);
+        let poly = (40u16, 65u16, 150u16, 150u16);
+
+        let opp = ArbOpportunity::new(0, kalshi, poly, &config, 0);
+
+        assert!(!opp.is_valid(), "Should reject arb below min_contracts threshold");
+    }
+
+    #[test]
+    fn test_arb_opportunity_accepted_when_at_min_contracts() {
+        // Config with min_contracts = 5
+        let config = ArbConfig {
+            min_contracts: 5.0,
+            ..ArbConfig::default()
+        };
+        // Prices create valid arb, sizes allow exactly 5 contracts: min(200/40=5, 250/50=5) = 5
+        let kalshi = (55u16, 50u16, 250u16, 250u16);
+        let poly = (40u16, 65u16, 200u16, 250u16);
+
+        let opp = ArbOpportunity::new(0, kalshi, poly, &config, 0);
+
+        assert!(opp.is_valid(), "Should accept arb at exactly min_contracts threshold");
+    }
+
+    #[test]
+    fn test_arb_opportunity_accepted_when_above_min_contracts() {
+        // Config with min_contracts = 5
+        let config = ArbConfig {
+            min_contracts: 5.0,
+            ..ArbConfig::default()
+        };
+        // Sizes allow 10 contracts: min(400/40=10, 500/50=10) = 10
+        let kalshi = (55u16, 50u16, 500u16, 500u16);
+        let poly = (40u16, 65u16, 400u16, 500u16);
+
+        let opp = ArbOpportunity::new(0, kalshi, poly, &config, 0);
+
+        assert!(opp.is_valid(), "Should accept arb above min_contracts threshold");
+    }
+
+    // =========================================================================
+    // kalshi_fee edge case tests
+    // =========================================================================
+
+    #[test]
+    fn test_kalshi_fee_zero_price() {
+        assert_eq!(kalshi_fee(0), 0, "Fee should be 0 for price 0");
+    }
+
+    #[test]
+    fn test_kalshi_fee_price_100() {
+        assert_eq!(kalshi_fee(100), 0, "Fee should be 0 for price 100 (no risk)");
+    }
+
+    #[test]
+    fn test_kalshi_fee_price_above_100() {
+        // Prices above 100 are invalid but should still be handled gracefully
+        assert_eq!(kalshi_fee(101), 0, "Fee should be 0 for price > 100");
+        assert_eq!(kalshi_fee(u16::MAX), 0, "Fee should be 0 for extreme price");
+    }
+
+    #[test]
+    fn test_kalshi_fee_known_values() {
+        // Fee formula: ceil(7 * p * (100 - p) / 10000)
+        // At p=50: 7 * 50 * 50 / 10000 = 17500 / 10000 = 1.75 -> ceil = 2
+        assert_eq!(kalshi_fee(50), 2);
+        // At p=10: 7 * 10 * 90 / 10000 = 6300 / 10000 = 0.63 -> ceil = 1
+        assert_eq!(kalshi_fee(10), 1);
+        // At p=90: 7 * 90 * 10 / 10000 = 6300 / 10000 = 0.63 -> ceil = 1
+        assert_eq!(kalshi_fee(90), 1);
+        // At p=1: 7 * 1 * 99 / 10000 = 693 / 10000 = 0.0693 -> ceil = 1
+        assert_eq!(kalshi_fee(1), 1);
+        // At p=99: 7 * 99 * 1 / 10000 = 693 / 10000 = 0.0693 -> ceil = 1
+        assert_eq!(kalshi_fee(99), 1);
+    }
+
+    // =========================================================================
+    // Boundary threshold tests
+    // =========================================================================
+
+    #[test]
+    fn test_arb_opportunity_at_exact_threshold_invalid() {
+        // With threshold=99, cost must be <= 99 to be valid (< 100 profit threshold)
+        // Poly YES 40 + Kalshi NO 57 = 97 raw
+        // Kalshi fee on 57c = ceil(7 * 57 * 43 / 10000) = ceil(17157/10000) = 2
+        // Total = 99c = threshold -> should be valid (99 <= 99)
+        let config = ArbConfig::default(); // threshold = 99
+        let kalshi = (55u16, 57u16, 1000u16, 1000u16);
+        let poly = (40u16, 65u16, 1000u16, 1000u16);
+
+        let opp = ArbOpportunity::new(0, kalshi, poly, &config, 0);
+
+        // Cost = 40 + 57 + 2 = 99, which equals threshold of 99
+        // The check is `cost <= threshold`, so this should be valid
+        assert!(opp.is_valid(), "Should be valid when cost equals threshold");
+    }
+
+    #[test]
+    fn test_arb_opportunity_one_cent_above_threshold() {
+        // Cost of 100c should be invalid (100 > 99)
+        let config = ArbConfig::default(); // threshold = 99
+        // Need: poly_yes + kalshi_no + fee = 100
+        // If poly_yes=40, kalshi_no=58: fee = ceil(7*58*42/10000) = ceil(17052/10000) = 2
+        // Total = 40 + 58 + 2 = 100 > 99
+        let kalshi = (55u16, 58u16, 1000u16, 1000u16);
+        let poly = (40u16, 65u16, 1000u16, 1000u16);
+
+        let opp = ArbOpportunity::new(0, kalshi, poly, &config, 0);
+
+        assert!(!opp.is_valid(), "Should be invalid when cost exceeds threshold by 1 cent");
+    }
+
+    #[test]
+    fn test_arb_opportunity_one_cent_below_threshold() {
+        // Cost of 98c should be valid (98 < 99)
+        let config = ArbConfig::default(); // threshold = 99
+        // If poly_yes=40, kalshi_no=56: fee = ceil(7*56*44/10000) = ceil(17248/10000) = 2
+        // Total = 40 + 56 + 2 = 98 < 99
+        let kalshi = (55u16, 56u16, 1000u16, 1000u16);
+        let poly = (40u16, 65u16, 1000u16, 1000u16);
+
+        let opp = ArbOpportunity::new(0, kalshi, poly, &config, 0);
+
+        assert!(opp.is_valid(), "Should be valid when cost is one cent below threshold");
+    }
+
+    #[test]
+    fn test_arb_opportunity_custom_threshold() {
+        // Test with custom threshold of 95
+        let config = ArbConfig {
+            threshold_cents: 95,
+            ..ArbConfig::default()
+        };
+        // Poly YES 40 + Kalshi NO 50 = 90 raw + 2 fee = 92 <= 95
+        let kalshi = (55u16, 50u16, 1000u16, 1000u16);
+        let poly = (40u16, 65u16, 1000u16, 1000u16);
+
+        let opp = ArbOpportunity::new(0, kalshi, poly, &config, 0);
+
+        assert!(opp.is_valid(), "Should be valid with custom threshold");
+
+        // Now with cost = 96 > 95: poly_yes=44, kalshi_no=50, fee=2
+        // 44 + 50 + 2 = 96 > 95
+        let poly2 = (44u16, 65u16, 1000u16, 1000u16);
+        let opp2 = ArbOpportunity::new(0, kalshi, poly2, &config, 0);
+
+        assert!(!opp2.is_valid(), "Should be invalid when cost exceeds custom threshold");
     }
 }

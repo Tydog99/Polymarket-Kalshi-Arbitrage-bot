@@ -151,7 +151,11 @@ impl ConfirmationQueue {
         // Only notify TUI on new entries to avoid flooding with updates.
         // The TUI re-renders every 100ms anyway, so price updates will still show.
         if is_new {
-            let _ = self.update_tx.try_send(());
+            if self.update_tx.try_send(()).is_err() {
+                // Channel full or closed - TUI may be slow or shut down.
+                // Log at debug level since TUI re-renders periodically anyway.
+                tracing::debug!("[CONFIRM] TUI notification channel full or closed");
+            }
         }
 
         is_new
@@ -195,7 +199,8 @@ impl ConfirmationQueue {
         });
     }
 
-    /// Check if arb is still valid with detailed cost info
+    /// Check if arb is still valid with detailed cost info.
+    /// Returns None if the market is no longer in global state (race condition or state inconsistency).
     pub fn validate_arb_detailed(&self, arb: &PendingArb) -> Option<ValidationResult> {
         // Test arbs use synthetic prices, skip validation
         if arb.request.is_test {
@@ -206,7 +211,17 @@ impl ConfirmationQueue {
             });
         }
 
-        let market = self.state.get_by_id(arb.request.market_id)?;
+        let market = match self.state.get_by_id(arb.request.market_id) {
+            Some(m) => m,
+            None => {
+                tracing::warn!(
+                    "[CONFIRM] Market {} not found during validation for {}",
+                    arb.request.market_id,
+                    arb.pair.description
+                );
+                return None;
+            }
+        };
 
         // Get current prices from orderbook
         let (k_yes, k_no, _, _) = market.kalshi.load();
@@ -277,5 +292,130 @@ impl ConfirmationQueue {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::MarketType;
+
+    /// Create a test MarketPair with minimal fields
+    fn test_market_pair() -> Arc<MarketPair> {
+        Arc::new(MarketPair {
+            pair_id: "test-pair".into(),
+            league: "nba".into(),
+            market_type: MarketType::Moneyline,
+            description: "Test Market".into(),
+            kalshi_event_ticker: "KXNBA-TEST".into(),
+            kalshi_market_ticker: "KXNBA-TEST-MKT".into(),
+            kalshi_event_slug: "test-event".into(),
+            poly_slug: "nba-test-2026-01-01".into(),
+            poly_yes_token: "0x1234".into(),
+            poly_no_token: "0x5678".into(),
+            line_value: None,
+            team_suffix: None,
+        })
+    }
+
+    /// Create a test FastExecutionRequest
+    fn test_request(yes_price: u16, no_price: u16, yes_size: u16, no_size: u16) -> FastExecutionRequest {
+        FastExecutionRequest {
+            market_id: 1,
+            yes_price,
+            no_price,
+            yes_size,
+            no_size,
+            arb_type: ArbType::PolyYesKalshiNo,
+            detected_ns: 0,
+            is_test: false,
+        }
+    }
+
+    // =========================================================================
+    // PendingArb tests
+    // =========================================================================
+
+    #[test]
+    fn test_pending_arb_max_contracts_basic() {
+        // YES: 400/40 = 10 contracts, NO: 600/50 = 12 contracts
+        // max_contracts = min(10, 12) = 10
+        let request = test_request(40, 50, 400, 600);
+        let pending = PendingArb::new(request, test_market_pair());
+
+        assert_eq!(pending.max_contracts(), 10);
+    }
+
+    #[test]
+    fn test_pending_arb_max_contracts_no_side_limiting() {
+        // YES: 800/40 = 20 contracts, NO: 250/50 = 5 contracts
+        // max_contracts = min(20, 5) = 5
+        let request = test_request(40, 50, 800, 250);
+        let pending = PendingArb::new(request, test_market_pair());
+
+        assert_eq!(pending.max_contracts(), 5);
+    }
+
+    #[test]
+    fn test_pending_arb_max_contracts_zero_yes_price() {
+        // Division by zero protection
+        let request = test_request(0, 50, 400, 600);
+        let pending = PendingArb::new(request, test_market_pair());
+
+        assert_eq!(pending.max_contracts(), 0);
+    }
+
+    #[test]
+    fn test_pending_arb_max_contracts_zero_no_price() {
+        // Division by zero protection
+        let request = test_request(40, 0, 400, 600);
+        let pending = PendingArb::new(request, test_market_pair());
+
+        assert_eq!(pending.max_contracts(), 0);
+    }
+
+    #[test]
+    fn test_pending_arb_max_contracts_both_prices_zero() {
+        let request = test_request(0, 0, 400, 600);
+        let pending = PendingArb::new(request, test_market_pair());
+
+        assert_eq!(pending.max_contracts(), 0);
+    }
+
+    #[test]
+    fn test_pending_arb_update_increments_detection_count() {
+        let request1 = test_request(40, 50, 400, 600);
+        let request2 = test_request(41, 51, 500, 700);
+        let mut pending = PendingArb::new(request1, test_market_pair());
+
+        assert_eq!(pending.detection_count, 1);
+
+        pending.update(request2);
+
+        assert_eq!(pending.detection_count, 2);
+        assert_eq!(pending.request.yes_price, 41);
+        assert_eq!(pending.request.no_price, 51);
+    }
+
+    #[test]
+    fn test_pending_arb_profit_cents_delegates_to_request() {
+        // This tests that profit_cents() correctly delegates to request.profit_cents()
+        let request = test_request(40, 50, 400, 600);
+        let pending = PendingArb::new(request.clone(), test_market_pair());
+
+        // profit_cents should match the request's calculation
+        assert_eq!(pending.profit_cents(), request.profit_cents());
+    }
+
+    #[test]
+    fn test_pending_arb_urls_constructed_correctly() {
+        let request = test_request(40, 50, 400, 600);
+        let pending = PendingArb::new(request, test_market_pair());
+
+        // Kalshi URL should contain the market ticker
+        assert!(pending.kalshi_url.contains("KXNBA-TEST-MKT"));
+
+        // Polymarket URL should be built from league and slug
+        assert!(pending.poly_url.contains("nba"));
     }
 }
