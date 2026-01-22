@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
-use crate::arb::{kalshi_fee, ArbConfig, ArbOpportunity};
+use crate::arb::{kalshi_fee, ArbConfig};
 use crate::config::{build_polymarket_url, KALSHI_WEB_BASE};
 use crate::types::{ArbType, FastExecutionRequest, GlobalState, MarketPair};
 
@@ -113,7 +113,7 @@ impl ConfirmationQueue {
 
     /// Push a new arb opportunity (or update existing for same market).
     /// Returns `true` if this was a new entry, `false` if updating existing or blacklisted.
-    /// Note: Size validation is done upstream in ArbOpportunity::new()
+    /// Note: Size validation is done upstream in FastExecutionRequest::detect()
     pub async fn push(&self, request: FastExecutionRequest, pair: Arc<MarketPair>) -> bool {
         let market_id = request.market_id;
 
@@ -260,22 +260,16 @@ impl ConfirmationQueue {
         })
     }
 
-    /// Re-validate arb using ArbOpportunity with current orderbook prices.
-    /// Returns Some(ArbOpportunity) if a valid arb still exists, None otherwise.
+    /// Re-validate arb using FastExecutionRequest::detect() with current orderbook prices.
+    /// Returns Some(FastExecutionRequest) if a valid arb still exists, None otherwise.
     ///
-    /// This can be used to get a fresh ArbOpportunity with current prices for execution,
+    /// This can be used to get a fresh request with current prices for execution,
     /// rather than using the potentially stale prices from when the arb was queued.
     #[allow(dead_code)]
-    pub fn validate_arb(&self, arb: &PendingArb, config: &ArbConfig) -> Option<ArbOpportunity> {
-        // Test arbs always pass validation
+    pub fn validate_arb(&self, arb: &PendingArb, config: &ArbConfig) -> Option<FastExecutionRequest> {
+        // Test arbs always pass validation - return a copy of the original request
         if arb.request.is_test {
-            return Some(ArbOpportunity::new(
-                arb.request.market_id,
-                (arb.request.yes_price, arb.request.no_price, arb.request.yes_size, arb.request.no_size),
-                (arb.request.yes_price, arb.request.no_price, arb.request.yes_size, arb.request.no_size),
-                config,
-                0,
-            ));
+            return Some(arb.request.clone());
         }
 
         let market = self.state.get_by_id(arb.request.market_id)?;
@@ -284,14 +278,8 @@ impl ConfirmationQueue {
         let kalshi = market.kalshi.load();
         let poly = market.poly.load();
 
-        // Use ArbOpportunity to re-validate with current prices
-        let opp = ArbOpportunity::new(arb.request.market_id, kalshi, poly, config, 0);
-
-        if opp.is_valid() {
-            Some(opp)
-        } else {
-            None
-        }
+        // Use FastExecutionRequest::detect() to re-validate with current prices
+        FastExecutionRequest::detect(arb.request.market_id, kalshi, poly, config, 0)
     }
 }
 

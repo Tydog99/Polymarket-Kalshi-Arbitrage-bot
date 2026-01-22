@@ -21,7 +21,6 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{connect_async, tungstenite::{http::Request, Message}};
 use tracing::{debug, error, info};
 
-use crate::arb::ArbOpportunity;
 use crate::config::{self, KALSHI_WS_URL, KALSHI_API_BASE, KALSHI_API_DELAY_MS};
 use crate::execution::NanoClock;
 use crate::types::{
@@ -550,16 +549,15 @@ pub async fn run_ws(
                                             process_kalshi_snapshot(market, body);
                                             market.mark_kalshi_update_unix_ms(now_ms);
 
-                                            // Check for arbs using ArbOpportunity
-                                            let arb = ArbOpportunity::new(
+                                            // Check for arbs using FastExecutionRequest::detect()
+                                            if let Some(req) = FastExecutionRequest::detect(
                                                 market_id,
                                                 market.kalshi.load(),
                                                 market.poly.load(),
                                                 state.arb_config(),
                                                 clock.now_ns(),
-                                            );
-                                            if arb.is_valid() {
-                                                route_arb_to_channel(&state, market_id, &arb, &exec_tx, &confirm_tx).await;
+                                            ) {
+                                                route_arb_to_channel(&state, market_id, req, &exec_tx, &confirm_tx).await;
                                             }
                                         }
                                     }
@@ -572,16 +570,15 @@ pub async fn run_ws(
                                             process_kalshi_delta(market, body);
                                             market.mark_kalshi_update_unix_ms(now_ms);
 
-                                            // Check for arbs using ArbOpportunity
-                                            let arb = ArbOpportunity::new(
+                                            // Check for arbs using FastExecutionRequest::detect()
+                                            if let Some(req) = FastExecutionRequest::detect(
                                                 market_id,
                                                 market.kalshi.load(),
                                                 market.poly.load(),
                                                 state.arb_config(),
                                                 clock.now_ns(),
-                                            );
-                                            if arb.is_valid() {
-                                                route_arb_to_channel(&state, market_id, &arb, &exec_tx, &confirm_tx).await;
+                                            ) {
+                                                route_arb_to_channel(&state, market_id, req, &exec_tx, &confirm_tx).await;
                                             }
                                         }
                                     }
@@ -726,12 +723,10 @@ fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiW
 async fn route_arb_to_channel(
     state: &GlobalState,
     market_id: u16,
-    arb: &ArbOpportunity,
+    req: FastExecutionRequest,
     exec_tx: &mpsc::Sender<FastExecutionRequest>,
     confirm_tx: &mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
 ) {
-    let req = FastExecutionRequest::from_arb(arb);
-
     // Get market pair to check if confirmation is required
     let pair = match state.get_by_id(market_id).and_then(|m| m.pair()) {
         Some(p) => p,

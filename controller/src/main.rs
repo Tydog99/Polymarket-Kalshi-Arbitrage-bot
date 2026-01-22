@@ -70,7 +70,6 @@ use crate::remote_protocol::Platform as WsPlatform;
 use crate::remote_trader::RemoteTraderServer;
 use trading::execution::Platform as TradingPlatform;
 use types::{FastExecutionRequest, GlobalState, MarketPair, MarketType, PriceCents};
-use arb::ArbOpportunity;
 
 /// Polymarket CLOB API host
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
@@ -1270,17 +1269,15 @@ async fn main() -> Result<()> {
             }
             markets_scanned += 1;
 
-            // Check for arbs using ArbOpportunity
-            let arb = ArbOpportunity::new(
+            // Check for arbs using FastExecutionRequest::detect()
+            if let Some(req) = FastExecutionRequest::detect(
                 market.market_id,
                 market.kalshi.load(),
                 market.poly.load(),
                 sweep_state.arb_config(),
                 sweep_clock.now_ns(),
-            );
-            if arb.is_valid() {
+            ) {
                 arbs_found += 1;
-                let req = FastExecutionRequest::from_arb(&arb);
                 if let Err(e) = sweep_exec_tx.try_send(req) {
                     warn!("[SWEEP] Failed to send arb request: {}", e);
                 }

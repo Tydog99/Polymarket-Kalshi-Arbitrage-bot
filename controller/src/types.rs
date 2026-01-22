@@ -407,9 +407,13 @@ impl FastExecutionRequest {
         // Find first valid arb (lowest cost that beats threshold)
         for (arb_type, cost, yes_price, no_price, yes_size, no_size) in candidates {
             if cost <= config.threshold_cents() {
-                let max_contracts = (yes_size.min(no_size) as f64) / 100.0;
+                // Calculate max contracts: min of contracts purchasable on each side
+                // Contracts = size (cents) / price (cents per contract)
+                let yes_contracts = if yes_price > 0 { yes_size / yes_price } else { 0 };
+                let no_contracts = if no_price > 0 { no_size / no_price } else { 0 };
+                let max_contracts = yes_contracts.min(no_contracts);
 
-                if max_contracts >= config.min_contracts() {
+                if max_contracts as f64 >= config.min_contracts() {
                     return Some(Self {
                         market_id,
                         arb_type,
@@ -1510,27 +1514,32 @@ mod tests {
         // Require at least 5 contracts
         let config = ArbConfig::new(99, 5.0);
 
-        // Good prices but only 400 cents of size = 4 contracts (400/100 = 4)
+        // Good arb prices: poly_yes=45, kalshi_no=52, cost=97 + ~1c fee = 98 < 99
+        // Size 180 cents at 45c/contract = 4 contracts (180/45 = 4)
+        // Size 200 cents at 52c/contract = 3 contracts (200/52 = 3)
+        // max_contracts = min(4, 3) = 3 < 5 (should reject)
         let result = FastExecutionRequest::detect(
             1,
-            (55, 52, 400, 400),
-            (45, 58, 400, 400),
+            (55, 52, 500, 200),        // kalshi: yes=55, no=52, yes_size=500, no_size=200
+            (45, 58, 180, 500),        // poly: yes=45, no=58, yes_size=180, no_size=500
             &config,
             12345,
         );
 
-        assert!(result.is_none(), "Should reject when size < min_contracts");
+        assert!(result.is_none(), "Should reject when max_contracts < min_contracts");
 
-        // Now with 500 cents = 5 contracts (exactly at threshold)
+        // Now with enough size:
+        // poly_yes: 250/45 = 5 contracts, kalshi_no: 260/52 = 5 contracts
+        // max_contracts = min(5, 5) = 5 >= 5 (should accept)
         let result2 = FastExecutionRequest::detect(
             1,
-            (55, 52, 500, 500),
-            (45, 58, 500, 500),
+            (55, 52, 500, 260),        // kalshi: no_size=260 -> 5 contracts
+            (45, 58, 250, 500),        // poly: yes_size=250 -> 5 contracts
             &config,
             12345,
         );
 
-        assert!(result2.is_some(), "Should accept when size >= min_contracts");
+        assert!(result2.is_some(), "Should accept when max_contracts >= min_contracts");
     }
 
     #[test]
