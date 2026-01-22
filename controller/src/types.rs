@@ -10,6 +10,8 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 use parking_lot::RwLock;
 
+use crate::arb::{ArbConfig, kalshi_fee};
+
 // === Market Types ===
 
 /// Market category for a matched trading pair
@@ -74,7 +76,9 @@ pub type SizeCents = u16;
 /// Maximum number of concurrently tracked markets
 pub const MAX_MARKETS: usize = 1024;
 
-/// Sentinel value indicating no price is currently available
+/// Sentinel value indicating no price is currently available.
+/// Used semantically in price checks (e.g., ArbOpportunity::detect checks for 0).
+#[allow(dead_code)]
 pub const NO_PRICE: PriceCents = 0;
 
 /// Pack orderbook state into a single u64 for atomic operations.
@@ -243,63 +247,6 @@ impl AtomicMarketState {
             self.poly_updates.load(Ordering::Relaxed),
         )
     }
-
-    #[inline(always)]
-    pub fn check_arbs(&self, threshold_cents: PriceCents) -> u8 {
-        use wide::{i16x8, CmpLt};
-
-        let (k_yes, k_no, _, _) = self.kalshi.load();
-        let (p_yes, p_no, _, _) = self.poly.load();
-
-        if k_yes == NO_PRICE || k_no == NO_PRICE || p_yes == NO_PRICE || p_no == NO_PRICE {
-            return 0;
-        }
-
-        let k_yes_fee = KALSHI_FEE_TABLE[k_yes as usize];
-        let k_no_fee = KALSHI_FEE_TABLE[k_no as usize];
-
-        let costs = i16x8::new([
-            (p_yes + k_no + k_no_fee) as i16,
-            (k_yes + k_yes_fee + p_no) as i16,
-            (p_yes + p_no) as i16,
-            (k_yes + k_yes_fee + k_no + k_no_fee) as i16,
-            i16::MAX, i16::MAX, i16::MAX, i16::MAX,
-        ]);
-
-        let cmp = costs.cmp_lt(i16x8::splat(threshold_cents as i16));
-        let arr = cmp.to_array();
-
-        let mut mask = 0u8;
-        if arr[0] != 0 { mask |= 1; }
-        if arr[1] != 0 { mask |= 2; }
-        if arr[2] != 0 { mask |= 4; }
-        if arr[3] != 0 { mask |= 8; }
-        mask
-    }
-}
-
-/// Precomputed Kalshi trading fee lookup table (101 entries for prices 0-100 cents).
-/// Fee formula: ceil(0.07 × P × (1-P)) in cents, where P is price in cents.
-static KALSHI_FEE_TABLE: [u16; 101] = {
-    let mut table = [0u16; 101];
-    let mut p = 1u32;
-    while p < 100 {
-        // fee = ceil(7 × p × (100-p) / 10000)
-        let numerator = 7 * p * (100 - p) + 9999;
-        table[p as usize] = (numerator / 10000) as u16;
-        p += 1;
-    }
-    table
-};
-
-/// Calculate Kalshi trading fee in cents for a single contract at the given price.
-/// For typical prices (10-90 cents), fees are usually 1-2 cents per contract.
-#[inline(always)]
-pub fn kalshi_fee_cents(price_cents: PriceCents) -> PriceCents {
-    if price_cents > 100 {
-        return 0;
-    }
-    KALSHI_FEE_TABLE[price_cents as usize]
 }
 
 /// Convert f64 price (0.01-0.99) to PriceCents (1-99)
@@ -356,7 +303,7 @@ pub enum ArbType {
 
 /// High-priority execution request for an arbitrage opportunity
 #[derive(Debug, Clone, Copy)]
-pub struct FastExecutionRequest {
+pub struct ArbOpportunity {
     /// Market identifier (index into GlobalState.markets array)
     pub market_id: u16,
     /// YES outcome ask price in cents
@@ -375,7 +322,22 @@ pub struct FastExecutionRequest {
     pub is_test: bool,
 }
 
-impl FastExecutionRequest {
+impl ArbOpportunity {
+    /// Calculate max executable contracts (minimum of both sides).
+    ///
+    /// Returns the number of complete contracts that can be bought,
+    /// computed as min(yes_size / yes_price, no_size / no_price).
+    /// Returns 0 if either price is 0 (no price available).
+    #[inline]
+    pub fn max_contracts(&self) -> u16 {
+        if self.yes_price == 0 || self.no_price == 0 {
+            return 0;
+        }
+        let yes_contracts = self.yes_size / self.yes_price;
+        let no_contracts = self.no_size / self.no_price;
+        yes_contracts.min(no_contracts)
+    }
+
     #[inline(always)]
     pub fn profit_cents(&self) -> i16 {
         100 - (self.yes_price as i16 + self.no_price as i16 + self.estimated_fee_cents() as i16)
@@ -385,13 +347,71 @@ impl FastExecutionRequest {
     pub fn estimated_fee_cents(&self) -> PriceCents {
         match self.arb_type {
             // Cross-platform: fee on the Kalshi side only
-            ArbType::PolyYesKalshiNo => kalshi_fee_cents(self.no_price),
-            ArbType::KalshiYesPolyNo => kalshi_fee_cents(self.yes_price),
+            ArbType::PolyYesKalshiNo => kalshi_fee(self.no_price),
+            ArbType::KalshiYesPolyNo => kalshi_fee(self.yes_price),
             // Poly-only: no fees
             ArbType::PolyOnly => 0,
             // Kalshi-only: fees on both sides
-            ArbType::KalshiOnly => kalshi_fee_cents(self.yes_price) + kalshi_fee_cents(self.no_price),
+            ArbType::KalshiOnly => kalshi_fee(self.yes_price) + kalshi_fee(self.no_price),
         }
+    }
+
+    /// Detect arbitrage opportunity from orderbook data.
+    /// Returns Some if a valid arb exists, None otherwise.
+    ///
+    /// This is the single source of truth for arb detection logic.
+    pub fn detect(
+        market_id: u16,
+        kalshi: (PriceCents, PriceCents, SizeCents, SizeCents),
+        poly: (PriceCents, PriceCents, SizeCents, SizeCents),
+        config: &ArbConfig,
+        detected_ns: u64,
+    ) -> Option<Self> {
+        let (k_yes, k_no, k_yes_size, k_no_size) = kalshi;
+        let (p_yes, p_no, p_yes_size, p_no_size) = poly;
+
+        // Check for invalid prices (0 = no price available)
+        if k_yes == 0 || k_no == 0 || p_yes == 0 || p_no == 0 {
+            return None;
+        }
+
+        // Calculate Kalshi fees
+        let k_yes_fee = kalshi_fee(k_yes);
+        let k_no_fee = kalshi_fee(k_no);
+
+        // Arb candidates in priority order
+        let candidates = [
+            (ArbType::PolyYesKalshiNo, p_yes + k_no + k_no_fee, p_yes, k_no, p_yes_size, k_no_size),
+            (ArbType::KalshiYesPolyNo, k_yes + k_yes_fee + p_no, k_yes, p_no, k_yes_size, p_no_size),
+            (ArbType::PolyOnly, p_yes + p_no, p_yes, p_no, p_yes_size, p_no_size),
+            (ArbType::KalshiOnly, k_yes + k_yes_fee + k_no + k_no_fee, k_yes, k_no, k_yes_size, k_no_size),
+        ];
+
+        // Find first valid arb (lowest cost that beats threshold)
+        for (arb_type, cost, yes_price, no_price, yes_size, no_size) in candidates {
+            if cost <= config.threshold_cents() {
+                // Calculate max contracts: min of contracts purchasable on each side
+                // Contracts = size (cents) / price (cents per contract)
+                let yes_contracts = if yes_price > 0 { yes_size / yes_price } else { 0 };
+                let no_contracts = if no_price > 0 { no_size / no_price } else { 0 };
+                let max_contracts = yes_contracts.min(no_contracts);
+
+                if max_contracts as f64 >= config.min_contracts() {
+                    return Some(Self {
+                        market_id,
+                        arb_type,
+                        yes_price,
+                        no_price,
+                        yes_size,
+                        no_size,
+                        detected_ns,
+                        is_test: false,
+                    });
+                }
+            }
+        }
+
+        None
     }
 }
 
@@ -412,10 +432,13 @@ pub struct GlobalState {
 
     /// O(1) lookup map: pre-hashed Polymarket NO token → market_id (RwLock for runtime updates)
     pub poly_no_to_id: RwLock<FxHashMap<u64, u16>>,
+
+    /// Arbitrage detection configuration
+    arb_config: ArbConfig,
 }
 
 impl GlobalState {
-    pub fn new() -> Self {
+    pub fn new(arb_config: ArbConfig) -> Self {
         // Allocate market slots
         let markets: Vec<AtomicMarketState> = (0..MAX_MARKETS)
             .map(|i| AtomicMarketState::new(i as u16))
@@ -427,7 +450,13 @@ impl GlobalState {
             kalshi_to_id: RwLock::new(FxHashMap::default()),
             poly_yes_to_id: RwLock::new(FxHashMap::default()),
             poly_no_to_id: RwLock::new(FxHashMap::default()),
+            arb_config,
         }
+    }
+
+    /// Returns a reference to the arbitrage configuration.
+    pub fn arb_config(&self) -> &ArbConfig {
+        &self.arb_config
     }
 
     /// Add a market pair, returns market_id.
@@ -529,7 +558,7 @@ impl GlobalState {
 
 impl Default for GlobalState {
     fn default() -> Self {
-        Self::new()
+        Self::new(ArbConfig::default())
     }
 }
 
@@ -688,56 +717,6 @@ mod tests {
     }
 
     // =========================================================================
-    // kalshi_fee_cents Tests - Integer fee calculation
-    // =========================================================================
-
-    #[test]
-    fn test_kalshi_fee_cents_formula() {
-        // fee = ceil(7 × P × (100-P) / 10000) cents
-
-        // At 50 cents: ceil(7 * 50 * 50 / 10000) = ceil(1.75) = 2
-        assert_eq!(kalshi_fee_cents(50), 2);
-
-        // At 10 cents: ceil(7 * 10 * 90 / 10000) = ceil(0.63) = 1
-        assert_eq!(kalshi_fee_cents(10), 1);
-
-        // At 90 cents: ceil(7 * 90 * 10 / 10000) = ceil(0.63) = 1
-        assert_eq!(kalshi_fee_cents(90), 1);
-
-        // At 1 cent: ceil(7 * 1 * 99 / 10000) = ceil(0.0693) = 1
-        assert_eq!(kalshi_fee_cents(1), 1);
-
-        // At 99 cents: ceil(7 * 99 * 1 / 10000) = ceil(0.0693) = 1
-        assert_eq!(kalshi_fee_cents(99), 1);
-    }
-
-    #[test]
-    fn test_kalshi_fee_cents_edge_cases() {
-        // 0 and 100 should have no fee
-        assert_eq!(kalshi_fee_cents(0), 0);
-        assert_eq!(kalshi_fee_cents(100), 0);
-
-        // Values > 100 should also return 0
-        assert_eq!(kalshi_fee_cents(150), 0);
-    }
-
-    #[test]
-    fn test_kalshi_fee_cents_matches_float_formula() {
-        // Verify integer formula matches float formula for all valid prices
-        for price_cents in 1..100u16 {
-            let p = price_cents as f64 / 100.0;
-            let float_fee = (0.07 * p * (1.0 - p) * 100.0).ceil() as u16;
-            let int_fee = kalshi_fee_cents(price_cents);
-
-            // Allow 1 cent difference due to rounding differences
-            assert!(
-                (int_fee as i16 - float_fee as i16).abs() <= 1,
-                "Fee mismatch at {}¢: int={}, float={}", price_cents, int_fee, float_fee
-            );
-        }
-    }
-
-    // =========================================================================
     // Price Conversion Tests
     // =========================================================================
 
@@ -779,122 +758,6 @@ mod tests {
     }
 
     // =========================================================================
-    // check_arbs Tests
-    // =========================================================================
-
-    fn make_market_state(
-        kalshi_yes: PriceCents,
-        kalshi_no: PriceCents,
-        poly_yes: PriceCents,
-        poly_no: PriceCents,
-    ) -> AtomicMarketState {
-        let state = AtomicMarketState::new(0);
-        state.kalshi.store(kalshi_yes, kalshi_no, 1000, 1000);
-        state.poly.store(poly_yes, poly_no, 1000, 1000);
-        state
-    }
-
-    #[test]
-    fn test_check_arbs_poly_yes_kalshi_no() {
-        // Poly YES 40¢ + Kalshi NO 50¢ = 90¢ raw
-        // Kalshi fee on 50¢ = 2¢
-        // Effective = 92¢ → ARB (< 100¢ threshold)
-        let state = make_market_state(55, 50, 40, 65);
-
-        // threshold_cents is in cents, so 100 = $1.00
-        let mask = state.check_arbs(100);
-
-        assert!(mask & 1 != 0, "Should detect Poly YES + Kalshi NO arb (bit 0)");
-    }
-
-    #[test]
-    fn test_check_arbs_kalshi_yes_poly_no() {
-        // Kalshi YES 40¢ + Poly NO 50¢ = 90¢ raw
-        // Kalshi fee on 40¢ = 2¢
-        // Effective = 92¢ → ARB
-        let state = make_market_state(40, 65, 55, 50);
-
-        let mask = state.check_arbs(100);
-
-        assert!(mask & 2 != 0, "Should detect Kalshi YES + Poly NO arb (bit 1)");
-    }
-
-    #[test]
-    fn test_check_arbs_poly_only() {
-        // Poly YES 48¢ + Poly NO 50¢ = 98¢ → ARB (no fees!)
-        let state = make_market_state(60, 60, 48, 50);
-
-        let mask = state.check_arbs(100);
-
-        assert!(mask & 4 != 0, "Should detect Poly-only arb (bit 2)");
-    }
-
-    #[test]
-    fn test_check_arbs_kalshi_only() {
-        // Kalshi YES 44¢ + Kalshi NO 44¢ = 88¢ raw
-        // Double fee: 2¢ + 2¢ = 4¢
-        // Effective = 92¢ → ARB
-        let state = make_market_state(44, 44, 60, 60);
-
-        let mask = state.check_arbs(100);
-
-        assert!(mask & 8 != 0, "Should detect Kalshi-only arb (bit 3)");
-    }
-
-    #[test]
-    fn test_check_arbs_no_arbs() {
-        // All prices efficient - no arbs
-        // Cross: 55 + 55 + 2 fee = 112 > 100
-        // Cross: 52 + 52 + 2 fee = 106 > 100
-        // Poly: 52 + 52 = 104 > 100
-        // Kalshi: 55 + 55 + 4 fee = 114 > 100
-        let state = make_market_state(55, 55, 52, 52);
-
-        let mask = state.check_arbs(100);
-
-        assert_eq!(mask, 0, "Should detect no arbs in efficient market");
-    }
-
-    #[test]
-    fn test_check_arbs_missing_prices() {
-        // Missing price should return no arbs
-        let state = make_market_state(50, NO_PRICE, 50, 50);
-
-        let mask = state.check_arbs(100);
-
-        assert_eq!(mask, 0, "Should return 0 when any price is missing");
-    }
-
-    #[test]
-    fn test_check_arbs_fees_eliminate_marginal() {
-        // Poly YES 49¢ + Kalshi NO 50¢ = 99¢ raw
-        // Kalshi fee on 50¢ = 2¢
-        // Effective = 101¢ → NO ARB (> 100¢ threshold)
-        let state = make_market_state(55, 50, 49, 55);
-
-        let mask = state.check_arbs(100);
-
-        // Bit 0 should NOT be set (Poly YES + Kalshi NO = 101¢ > 100¢)
-        assert!(mask & 1 == 0, "Fees should eliminate marginal arb");
-    }
-
-    #[test]
-    fn test_check_arbs_multiple_arbs() {
-        // Scenario where multiple arbs exist
-        // Kalshi: YES=40, NO=40 (sum=80+4fee=84)
-        // Poly: YES=40, NO=40 (sum=80, no fees)
-        let state = make_market_state(40, 40, 40, 40);
-
-        let mask = state.check_arbs(100);
-
-        // Should detect all 4 combinations
-        assert!(mask & 1 != 0, "Should detect Poly YES + Kalshi NO");
-        assert!(mask & 2 != 0, "Should detect Kalshi YES + Poly NO");
-        assert!(mask & 4 != 0, "Should detect Poly-only");
-        assert!(mask & 8 != 0, "Should detect Kalshi-only");
-    }
-
-    // =========================================================================
     // GlobalState Tests
     // =========================================================================
 
@@ -917,7 +780,7 @@ mod tests {
 
     #[test]
     fn test_global_state_add_pair() {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         let pair = make_test_pair("001");
         let kalshi_ticker = pair.kalshi_market_ticker.clone();
@@ -941,7 +804,7 @@ mod tests {
 
     #[test]
     fn test_global_state_lookups() {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         let pair = make_test_pair("002");
         let kalshi_ticker = pair.kalshi_market_ticker.clone();
@@ -970,7 +833,7 @@ mod tests {
 
     #[test]
     fn test_global_state_multiple_markets() {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         // Add multiple markets
         for i in 0..10 {
@@ -990,7 +853,7 @@ mod tests {
 
     #[test]
     fn test_global_state_update_prices() {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         let pair = make_test_pair("003");
         let id = state.add_pair(pair).unwrap();
@@ -1011,7 +874,7 @@ mod tests {
     }
 
     // =========================================================================
-    // FastExecutionRequest Tests
+    // ArbOpportunity Tests
     // =========================================================================
 
     #[test]
@@ -1019,7 +882,7 @@ mod tests {
         // Poly YES 40¢ + Kalshi NO 50¢ = 90¢
         // Kalshi fee on 50¢ = 2¢
         // Profit = 100 - 90 - 2 = 8¢
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1038,7 +901,7 @@ mod tests {
         // Kalshi YES 40¢ + Poly NO 50¢ = 90¢
         // Kalshi fee on 40¢ = 2¢
         // Profit = 100 - 90 - 2 = 8¢
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1057,7 +920,7 @@ mod tests {
         // Poly YES 40¢ + Poly NO 48¢ = 88¢
         // No fees on Polymarket
         // Profit = 100 - 88 - 0 = 12¢
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 48,
@@ -1077,7 +940,7 @@ mod tests {
         // Kalshi YES 40¢ + Kalshi NO 44¢ = 84¢
         // Kalshi fee on both: 2¢ + 2¢ = 4¢
         // Profit = 100 - 84 - 4 = 12¢
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 44,
@@ -1089,13 +952,13 @@ mod tests {
         };
 
         assert_eq!(req.profit_cents(), 12);
-        assert_eq!(req.estimated_fee_cents(), kalshi_fee_cents(40) + kalshi_fee_cents(44));
+        assert_eq!(req.estimated_fee_cents(), kalshi_fee(40) + kalshi_fee(44));
     }
 
     #[test]
     fn test_execution_request_negative_profit() {
         // Prices too high - no profit
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 52,
             no_price: 52,
@@ -1112,7 +975,7 @@ mod tests {
     #[test]
     fn test_execution_request_estimated_fee() {
         // PolyYesKalshiNo → fee on Kalshi NO
-        let req1 = FastExecutionRequest {
+        let req1 = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1122,10 +985,10 @@ mod tests {
             detected_ns: 0,
             is_test: false,
         };
-        assert_eq!(req1.estimated_fee_cents(), kalshi_fee_cents(50));
+        assert_eq!(req1.estimated_fee_cents(), kalshi_fee(50));
 
         // KalshiYesPolyNo → fee on Kalshi YES
-        let req2 = FastExecutionRequest {
+        let req2 = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1135,10 +998,10 @@ mod tests {
             detected_ns: 0,
             is_test: false,
         };
-        assert_eq!(req2.estimated_fee_cents(), kalshi_fee_cents(40));
+        assert_eq!(req2.estimated_fee_cents(), kalshi_fee(40));
 
         // PolyOnly → no fees
-        let req3 = FastExecutionRequest {
+        let req3 = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1151,7 +1014,7 @@ mod tests {
         assert_eq!(req3.estimated_fee_cents(), 0);
 
         // KalshiOnly → fees on both sides
-        let req4 = FastExecutionRequest {
+        let req4 = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1161,7 +1024,119 @@ mod tests {
             detected_ns: 0,
             is_test: false,
         };
-        assert_eq!(req4.estimated_fee_cents(), kalshi_fee_cents(40) + kalshi_fee_cents(50));
+        assert_eq!(req4.estimated_fee_cents(), kalshi_fee(40) + kalshi_fee(50));
+    }
+
+    // =========================================================================
+    // ArbOpportunity::max_contracts() Tests
+    // =========================================================================
+
+    #[test]
+    fn test_execution_request_max_contracts_basic() {
+        // YES: 1000 cents / 40 cents = 25 contracts
+        // NO: 1000 cents / 50 cents = 20 contracts
+        // max_contracts = min(25, 20) = 20
+        let req = ArbOpportunity {
+            market_id: 0,
+            yes_price: 40,
+            no_price: 50,
+            yes_size: 1000,
+            no_size: 1000,
+            arb_type: ArbType::PolyYesKalshiNo,
+            detected_ns: 0,
+            is_test: false,
+        };
+
+        assert_eq!(req.max_contracts(), 20);
+    }
+
+    #[test]
+    fn test_execution_request_max_contracts_yes_limited() {
+        // YES: 500 cents / 50 cents = 10 contracts
+        // NO: 1000 cents / 50 cents = 20 contracts
+        // max_contracts = min(10, 20) = 10
+        let req = ArbOpportunity {
+            market_id: 0,
+            yes_price: 50,
+            no_price: 50,
+            yes_size: 500,
+            no_size: 1000,
+            arb_type: ArbType::PolyYesKalshiNo,
+            detected_ns: 0,
+            is_test: false,
+        };
+
+        assert_eq!(req.max_contracts(), 10);
+    }
+
+    #[test]
+    fn test_execution_request_max_contracts_no_limited() {
+        // YES: 1000 cents / 50 cents = 20 contracts
+        // NO: 500 cents / 50 cents = 10 contracts
+        // max_contracts = min(20, 10) = 10
+        let req = ArbOpportunity {
+            market_id: 0,
+            yes_price: 50,
+            no_price: 50,
+            yes_size: 1000,
+            no_size: 500,
+            arb_type: ArbType::PolyYesKalshiNo,
+            detected_ns: 0,
+            is_test: false,
+        };
+
+        assert_eq!(req.max_contracts(), 10);
+    }
+
+    #[test]
+    fn test_execution_request_max_contracts_zero_yes_price() {
+        let req = ArbOpportunity {
+            market_id: 0,
+            yes_price: 0,
+            no_price: 50,
+            yes_size: 1000,
+            no_size: 1000,
+            arb_type: ArbType::PolyYesKalshiNo,
+            detected_ns: 0,
+            is_test: false,
+        };
+
+        assert_eq!(req.max_contracts(), 0, "Should return 0 when yes_price is 0");
+    }
+
+    #[test]
+    fn test_execution_request_max_contracts_zero_no_price() {
+        let req = ArbOpportunity {
+            market_id: 0,
+            yes_price: 50,
+            no_price: 0,
+            yes_size: 1000,
+            no_size: 1000,
+            arb_type: ArbType::PolyYesKalshiNo,
+            detected_ns: 0,
+            is_test: false,
+        };
+
+        assert_eq!(req.max_contracts(), 0, "Should return 0 when no_price is 0");
+    }
+
+    #[test]
+    fn test_execution_request_max_contracts_integer_division() {
+        // Verify integer division behavior (truncation, not rounding)
+        // YES: 99 cents / 10 cents = 9 contracts (not 10)
+        // NO: 99 cents / 10 cents = 9 contracts
+        let req = ArbOpportunity {
+            market_id: 0,
+            yes_price: 10,
+            no_price: 10,
+            yes_size: 99,
+            no_size: 99,
+            arb_type: ArbType::PolyYesKalshiNo,
+            detected_ns: 0,
+            is_test: false,
+        };
+
+        assert_eq!(req.max_contracts(), 9);
     }
 
     // =========================================================================
@@ -1189,7 +1164,7 @@ mod tests {
     #[test]
     fn test_full_arb_flow() {
         // Simulate the full flow: add market, update prices, detect arb
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         // 1. Add market during discovery
         let pair = MarketPair {
@@ -1225,28 +1200,23 @@ mod tests {
             state.markets[id as usize].poly.store(40, 65, 700, 800);
         }
 
-        // 3. Check for arbs (threshold = 100 cents = $1.00)
+        // 3. Check for arbs using ArbOpportunity::detect()
         let market = state.get_by_id(market_id).unwrap();
-        let arb_mask = market.check_arbs(100);
+        let kalshi_data = market.kalshi.load();
+        let poly_data = market.poly.load();
+        let req = ArbOpportunity::detect(
+            market_id,
+            kalshi_data,
+            poly_data,
+            state.arb_config(),
+            0,
+        );
 
         // 4. Verify arb detected
-        assert!(arb_mask & 1 != 0, "Should detect Poly YES + Kalshi NO arb");
+        let req = req.expect("Should detect arb opportunity");
+        assert_eq!(req.arb_type, ArbType::PolyYesKalshiNo, "Should detect Poly YES + Kalshi NO arb");
 
-        // 5. Build execution request
-        let (p_yes, _, p_yes_sz, _) = market.poly.load();
-        let (_, k_no, _, k_no_sz) = market.kalshi.load();
-
-        let req = FastExecutionRequest {
-            market_id,
-            yes_price: p_yes,
-            no_price: k_no,
-            yes_size: p_yes_sz,
-            no_size: k_no_sz,
-            arb_type: ArbType::PolyYesKalshiNo,
-            detected_ns: 0,
-            is_test: false,
-        };
-
+        // 5. Verify execution request has positive profit
         assert!(req.profit_cents() > 0, "Should have positive profit");
     }
 
@@ -1273,8 +1243,16 @@ mod tests {
                         market.poly.update_no(50 + ((j % 10) as u16), 600 + j as u16);
                     }
 
-                    // Check arbs (should never panic) - threshold = 100 cents
-                    let _ = market.check_arbs(100);
+                    // Check arbs using ArbOpportunity::detect() (should never panic)
+                    let kalshi_data = market.kalshi.load();
+                    let poly_data = market.poly.load();
+                    let _ = ArbOpportunity::detect(
+                        market.market_id,
+                        kalshi_data,
+                        poly_data,
+                        state.arb_config(),
+                        0,
+                    );
                 }
             })
         }).collect();
@@ -1292,6 +1270,282 @@ mod tests {
         assert!(k_no > 0 && k_no < 100);
         assert!(p_yes > 0 && p_yes < 100);
         assert!(p_no > 0 && p_no < 100);
+    }
+
+    // =========================================================================
+    // GlobalState ArbConfig Integration Tests
+    // =========================================================================
+
+    #[test]
+    fn test_global_state_has_arb_config() {
+        use crate::arb::ArbConfig;
+
+        // Create GlobalState with default ArbConfig
+        let config = ArbConfig::default();
+        let state = GlobalState::new(config);
+
+        // Verify arb_config() returns the correct threshold
+        assert_eq!(state.arb_config().threshold_cents(), 99);
+        assert_eq!(state.arb_config().min_contracts(), 1.0);
+    }
+
+    #[test]
+    fn test_global_state_arb_config_custom_threshold() {
+        use crate::arb::ArbConfig;
+
+        // Create GlobalState with custom ArbConfig
+        let config = ArbConfig::new(95, 5.0);
+        let state = GlobalState::new(config);
+
+        // Verify arb_config() returns the custom values
+        assert_eq!(state.arb_config().threshold_cents(), 95);
+        assert_eq!(state.arb_config().min_contracts(), 5.0);
+    }
+
+    // =========================================================================
+    // ArbOpportunity::detect() Tests
+    // =========================================================================
+
+    #[test]
+    fn test_detect_returns_none_when_prices_too_high() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // Prices sum to 100 cents = no profit
+        let result = ArbOpportunity::detect(
+            1,                          // market_id
+            (50, 50, 1000, 1000),       // kalshi
+            (50, 50, 1000, 1000),       // poly
+            &config,
+            12345,
+        );
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_detect_finds_poly_yes_kalshi_no() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default(); // threshold = 99
+
+        // Poly YES @ 45 + Kalshi NO @ 52 = 97 cents (+ ~2c fee) = ~99 <= 99
+        let result = ArbOpportunity::detect(
+            1,
+            (55, 52, 500, 500),        // kalshi
+            (45, 58, 500, 500),        // poly
+            &config,
+            12345,
+        );
+
+        let arb = result.expect("should detect arb");
+        assert_eq!(arb.arb_type, ArbType::PolyYesKalshiNo);
+        assert_eq!(arb.yes_price, 45);  // poly yes
+        assert_eq!(arb.no_price, 52);   // kalshi no
+    }
+
+    #[test]
+    fn test_detect_returns_none_when_size_insufficient() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // Great prices but no size on kalshi NO side
+        let result = ArbOpportunity::detect(
+            1,
+            (55, 52, 500, 0),          // kalshi: no_size = 0
+            (45, 58, 500, 500),
+            &config,
+            12345,
+        );
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_detect_returns_none_when_any_price_is_zero() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // Kalshi yes price = 0 (no price available)
+        let result = ArbOpportunity::detect(
+            1,
+            (0, 52, 500, 500),
+            (45, 58, 500, 500),
+            &config,
+            12345,
+        );
+
+        assert!(result.is_none(), "Should return None when kalshi yes price is 0");
+
+        // Poly no price = 0
+        let result2 = ArbOpportunity::detect(
+            1,
+            (55, 52, 500, 500),
+            (45, 0, 500, 500),
+            &config,
+            12345,
+        );
+
+        assert!(result2.is_none(), "Should return None when poly no price is 0");
+    }
+
+    #[test]
+    fn test_detect_finds_kalshi_yes_poly_no() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // Kalshi YES @ 45 + Poly NO @ 52 = 97 + ~2c fee = ~99 <= 99
+        // Make Poly YES expensive so PolyYesKalshiNo doesn't win
+        let result = ArbOpportunity::detect(
+            1,
+            (45, 60, 500, 500),        // kalshi: yes=45, no=60
+            (60, 52, 500, 500),        // poly: yes=60, no=52
+            &config,
+            12345,
+        );
+
+        let arb = result.expect("should detect arb");
+        assert_eq!(arb.arb_type, ArbType::KalshiYesPolyNo);
+        assert_eq!(arb.yes_price, 45);  // kalshi yes
+        assert_eq!(arb.no_price, 52);   // poly no
+    }
+
+    #[test]
+    fn test_detect_finds_poly_only() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // Make cross-platform arbs too expensive, but Poly YES + Poly NO = 88 (no fees)
+        let result = ArbOpportunity::detect(
+            1,
+            (60, 60, 500, 500),        // kalshi: expensive
+            (40, 48, 500, 500),        // poly: 40 + 48 = 88 < 99
+            &config,
+            12345,
+        );
+
+        let arb = result.expect("should detect poly-only arb");
+        assert_eq!(arb.arb_type, ArbType::PolyOnly);
+        assert_eq!(arb.yes_price, 40);
+        assert_eq!(arb.no_price, 48);
+    }
+
+    #[test]
+    fn test_detect_finds_kalshi_only() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // Kalshi YES 40 + Kalshi NO 40 = 80 + ~4c fees = 84 < 99
+        // Make Poly expensive so cross-platform and poly-only don't win
+        let result = ArbOpportunity::detect(
+            1,
+            (40, 40, 500, 500),        // kalshi: 40 + 40 + ~4 fees = 84
+            (60, 60, 500, 500),        // poly: expensive
+            &config,
+            12345,
+        );
+
+        let arb = result.expect("should detect kalshi-only arb");
+        assert_eq!(arb.arb_type, ArbType::KalshiOnly);
+        assert_eq!(arb.yes_price, 40);
+        assert_eq!(arb.no_price, 40);
+    }
+
+    #[test]
+    fn test_detect_respects_min_contracts_threshold() {
+        use crate::arb::ArbConfig;
+
+        // Require at least 5 contracts
+        let config = ArbConfig::new(99, 5.0);
+
+        // Good arb prices: poly_yes=45, kalshi_no=52, cost=97 + ~1c fee = 98 < 99
+        // Size 180 cents at 45c/contract = 4 contracts (180/45 = 4)
+        // Size 200 cents at 52c/contract = 3 contracts (200/52 = 3)
+        // max_contracts = min(4, 3) = 3 < 5 (should reject)
+        let result = ArbOpportunity::detect(
+            1,
+            (55, 52, 500, 200),        // kalshi: yes=55, no=52, yes_size=500, no_size=200
+            (45, 58, 180, 500),        // poly: yes=45, no=58, yes_size=180, no_size=500
+            &config,
+            12345,
+        );
+
+        assert!(result.is_none(), "Should reject when max_contracts < min_contracts");
+
+        // Now with enough size:
+        // poly_yes: 250/45 = 5 contracts, kalshi_no: 260/52 = 5 contracts
+        // max_contracts = min(5, 5) = 5 >= 5 (should accept)
+        let result2 = ArbOpportunity::detect(
+            1,
+            (55, 52, 500, 260),        // kalshi: no_size=260 -> 5 contracts
+            (45, 58, 250, 500),        // poly: yes_size=250 -> 5 contracts
+            &config,
+            12345,
+        );
+
+        assert!(result2.is_some(), "Should accept when max_contracts >= min_contracts");
+    }
+
+    #[test]
+    fn test_detect_priority_order() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // All 4 arb types are valid with equal prices - should pick PolyYesKalshiNo (priority)
+        let result = ArbOpportunity::detect(
+            1,
+            (40, 40, 500, 500),
+            (40, 40, 500, 500),
+            &config,
+            12345,
+        );
+
+        let arb = result.expect("should detect arb");
+        assert_eq!(arb.arb_type, ArbType::PolyYesKalshiNo, "Should pick PolyYesKalshiNo first in priority");
+    }
+
+    #[test]
+    fn test_detect_sets_is_test_false() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        let result = ArbOpportunity::detect(
+            1,
+            (55, 52, 500, 500),
+            (45, 58, 500, 500),
+            &config,
+            12345,
+        );
+
+        let arb = result.expect("should detect arb");
+        assert!(!arb.is_test, "detect() should always set is_test to false");
+    }
+
+    #[test]
+    fn test_detect_preserves_market_id_and_timestamp() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        let result = ArbOpportunity::detect(
+            42,                         // specific market_id
+            (55, 52, 500, 500),
+            (45, 58, 500, 500),
+            &config,
+            999888777,                  // specific timestamp
+        );
+
+        let arb = result.expect("should detect arb");
+        assert_eq!(arb.market_id, 42);
+        assert_eq!(arb.detected_ns, 999888777);
     }
 }
 

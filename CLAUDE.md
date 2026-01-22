@@ -34,22 +34,27 @@ This is a Rust arbitrage bot that monitors price discrepancies between Kalshi an
 ### Data Flow
 
 ```
-WebSocket Feeds (kalshi.rs, polymarket.rs)
+WebSocket Price Updates (kalshi.rs, polymarket.rs)
     ↓
 Global State with Lock-Free Orderbook Cache (types.rs)
     ↓
-Heartbeat Arbitrage Detection (main.rs, every 10s default)
+ArbOpportunity::detect() in WebSocket Handlers - validates prices, fees, sizes
+    ↓
+Confirmation Queue (confirm_queue.rs) or Direct Execution
     ↓
 Execution Loop (execution.rs)
     ↓
 Platform Orders (kalshi.rs, polymarket_clob.rs)
     ↓
 Position Tracking (position_tracker.rs)
+
+Parallel: Heartbeat Monitoring (main.rs, every 10s) - logs status, does NOT trigger execution
 ```
 
 ### Key Modules
 
-- **`main.rs`** - Entry point, WebSocket orchestration, heartbeat-based arb detection
+- **`main.rs`** - Entry point, WebSocket orchestration, startup sweep, heartbeat monitoring
+- **`arb.rs`** - Centralized arbitrage opportunity detection (ArbConfig, ArbOpportunity)
 - **`types.rs`** - Core data structures including `AtomicOrderbook` (lock-free using packed u64 with CAS loops)
 - **`execution.rs`** - Concurrent order execution with in-flight deduplication (8-slot bitmask for 512 markets)
 - **`kalshi.rs`** - Kalshi REST/WebSocket client with RSA signature authentication
@@ -59,7 +64,7 @@ Position Tracking (position_tracker.rs)
 - **`circuit_breaker.rs`** - Risk management: position limits, daily loss limits, error tracking, cooldown
 - **`position_tracker.rs`** - Fill recording, P&L calculation, state persistence to `positions.json`
 - **`cache.rs`** - Team code bidirectional mapping between platforms
-- **`config.rs`** - League definitions, API endpoints, thresholds (ARB_THRESHOLD = 0.995)
+- **`config.rs`** - League definitions, API endpoints, platform configuration
 - **`confirm_tui.rs`** - Split-pane TUI for manual arb confirmation with TUI-aware log routing
 - **`confirm_queue.rs`** - Queue of pending arbs awaiting user confirmation
 
@@ -140,6 +145,10 @@ CONTROLLER_PLATFORMS=kalshi,polymarket dotenvx run -- cargo run --release
 # Pure router mode (no local execution)
 dotenvx run -- cargo run --release
 ```
+
+**Arbitrage detection:**
+- `ARB_THRESHOLD_CENTS` (default: 99, valid: 1-100) - arb exists when total cost ≤ threshold. Invalid values logged and replaced with default.
+- `ARB_MIN_CONTRACTS` (default: 1.0, must be > 0) - minimum executable contracts for valid arb. Invalid values logged and replaced with default.
 
 **Circuit breaker:** `CB_ENABLED`, `CB_MAX_POSITION_PER_MARKET`, `CB_MAX_TOTAL_POSITION`, `CB_MAX_DAILY_LOSS`, `CB_MAX_CONSECUTIVE_ERRORS`, `CB_COOLDOWN_SECS`, `CB_MIN_CONTRACTS` (minimum contracts to execute, trades are capped to remaining capacity)
 
