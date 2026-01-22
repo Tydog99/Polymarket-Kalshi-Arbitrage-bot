@@ -76,7 +76,9 @@ pub type SizeCents = u16;
 /// Maximum number of concurrently tracked markets
 pub const MAX_MARKETS: usize = 1024;
 
-/// Sentinel value indicating no price is currently available
+/// Sentinel value indicating no price is currently available.
+/// Used semantically in price checks (e.g., ArbOpportunity::new checks for 0).
+#[allow(dead_code)]
 pub const NO_PRICE: PriceCents = 0;
 
 /// Pack orderbook state into a single u64 for atomic operations.

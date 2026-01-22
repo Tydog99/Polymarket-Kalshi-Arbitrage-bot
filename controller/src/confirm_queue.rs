@@ -51,9 +51,15 @@ impl PendingArb {
         self.request.profit_cents()
     }
 
-    /// Calculate max contracts from size
+    /// Calculate max contracts based on available size and prices.
+    /// Returns the minimum of (yes_size / yes_price) and (no_size / no_price).
     pub fn max_contracts(&self) -> i64 {
-        (self.request.yes_size.min(self.request.no_size) / 100) as i64
+        if self.request.yes_price == 0 || self.request.no_price == 0 {
+            return 0;
+        }
+        let yes_contracts = self.request.yes_size / self.request.yes_price;
+        let no_contracts = self.request.no_size / self.request.no_price;
+        yes_contracts.min(no_contracts) as i64
     }
 }
 
@@ -241,6 +247,10 @@ impl ConfirmationQueue {
 
     /// Re-validate arb using ArbOpportunity with current orderbook prices.
     /// Returns Some(ArbOpportunity) if a valid arb still exists, None otherwise.
+    ///
+    /// This can be used to get a fresh ArbOpportunity with current prices for execution,
+    /// rather than using the potentially stale prices from when the arb was queued.
+    #[allow(dead_code)]
     pub fn validate_arb(&self, arb: &PendingArb, config: &ArbConfig) -> Option<ArbOpportunity> {
         // Test arbs always pass validation
         if arb.request.is_test {

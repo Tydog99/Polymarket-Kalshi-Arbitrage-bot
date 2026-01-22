@@ -208,7 +208,10 @@ impl ArbOpportunity {
 
     /// Returns the maximum number of contracts that can be executed.
     /// This is the minimum of (yes_size / yes_price) and (no_size / no_price).
+    ///
+    /// Used by PendingArb for display in TUI and logging.
     #[inline]
+    #[allow(dead_code)]
     pub fn max_contracts(&self) -> u16 {
         if self.yes_price == 0 || self.no_price == 0 {
             return 0;
@@ -219,7 +222,10 @@ impl ArbOpportunity {
     }
 
     /// Returns the gross profit per contract in cents (100 - cost - fees).
+    ///
+    /// Can be used for display or logging when an ArbOpportunity is available.
     #[inline]
+    #[allow(dead_code)]
     pub fn gross_profit_cents(&self) -> i16 {
         if !self.is_valid() {
             return 0;
@@ -250,9 +256,13 @@ pub struct ArbConfig {
     pub min_contracts: f64,
     /// Kalshi fee rate (7% of notional).
     /// Default: 0.07
+    /// Reserved for future configurability; currently using kalshi_fee() function.
+    #[allow(dead_code)]
     pub kalshi_fee_rate: f64,
     /// Polymarket fee rate (currently 0%).
     /// Default: 0.0
+    /// Reserved for future configurability when Polymarket adds fees.
+    #[allow(dead_code)]
     pub poly_fee_rate: f64,
 }
 
