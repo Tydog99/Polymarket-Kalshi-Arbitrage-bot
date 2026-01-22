@@ -1,6 +1,6 @@
 //! Centralized arbitrage configuration and fee calculation.
 //!
-//! Arb detection logic lives in `FastExecutionRequest::detect()`.
+//! Arb detection logic lives in `ArbOpportunity::detect()`.
 //! This module provides:
 //! - `ArbConfig` - threshold and min_contracts configuration
 //! - `kalshi_fee()` - Kalshi fee calculation

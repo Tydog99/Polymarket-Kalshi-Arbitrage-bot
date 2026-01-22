@@ -77,7 +77,7 @@ pub type SizeCents = u16;
 pub const MAX_MARKETS: usize = 1024;
 
 /// Sentinel value indicating no price is currently available.
-/// Used semantically in price checks (e.g., FastExecutionRequest::detect checks for 0).
+/// Used semantically in price checks (e.g., ArbOpportunity::detect checks for 0).
 #[allow(dead_code)]
 pub const NO_PRICE: PriceCents = 0;
 
@@ -303,7 +303,7 @@ pub enum ArbType {
 
 /// High-priority execution request for an arbitrage opportunity
 #[derive(Debug, Clone, Copy)]
-pub struct FastExecutionRequest {
+pub struct ArbOpportunity {
     /// Market identifier (index into GlobalState.markets array)
     pub market_id: u16,
     /// YES outcome ask price in cents
@@ -322,7 +322,7 @@ pub struct FastExecutionRequest {
     pub is_test: bool,
 }
 
-impl FastExecutionRequest {
+impl ArbOpportunity {
     /// Calculate max executable contracts (minimum of both sides).
     ///
     /// Returns the number of complete contracts that can be bought,
@@ -874,7 +874,7 @@ mod tests {
     }
 
     // =========================================================================
-    // FastExecutionRequest Tests
+    // ArbOpportunity Tests
     // =========================================================================
 
     #[test]
@@ -882,7 +882,7 @@ mod tests {
         // Poly YES 40¢ + Kalshi NO 50¢ = 90¢
         // Kalshi fee on 50¢ = 2¢
         // Profit = 100 - 90 - 2 = 8¢
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -901,7 +901,7 @@ mod tests {
         // Kalshi YES 40¢ + Poly NO 50¢ = 90¢
         // Kalshi fee on 40¢ = 2¢
         // Profit = 100 - 90 - 2 = 8¢
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -920,7 +920,7 @@ mod tests {
         // Poly YES 40¢ + Poly NO 48¢ = 88¢
         // No fees on Polymarket
         // Profit = 100 - 88 - 0 = 12¢
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 48,
@@ -940,7 +940,7 @@ mod tests {
         // Kalshi YES 40¢ + Kalshi NO 44¢ = 84¢
         // Kalshi fee on both: 2¢ + 2¢ = 4¢
         // Profit = 100 - 84 - 4 = 12¢
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 44,
@@ -958,7 +958,7 @@ mod tests {
     #[test]
     fn test_execution_request_negative_profit() {
         // Prices too high - no profit
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 52,
             no_price: 52,
@@ -975,7 +975,7 @@ mod tests {
     #[test]
     fn test_execution_request_estimated_fee() {
         // PolyYesKalshiNo → fee on Kalshi NO
-        let req1 = FastExecutionRequest {
+        let req1 = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -988,7 +988,7 @@ mod tests {
         assert_eq!(req1.estimated_fee_cents(), kalshi_fee(50));
 
         // KalshiYesPolyNo → fee on Kalshi YES
-        let req2 = FastExecutionRequest {
+        let req2 = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1001,7 +1001,7 @@ mod tests {
         assert_eq!(req2.estimated_fee_cents(), kalshi_fee(40));
 
         // PolyOnly → no fees
-        let req3 = FastExecutionRequest {
+        let req3 = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1014,7 +1014,7 @@ mod tests {
         assert_eq!(req3.estimated_fee_cents(), 0);
 
         // KalshiOnly → fees on both sides
-        let req4 = FastExecutionRequest {
+        let req4 = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1028,7 +1028,7 @@ mod tests {
     }
 
     // =========================================================================
-    // FastExecutionRequest::max_contracts() Tests
+    // ArbOpportunity::max_contracts() Tests
     // =========================================================================
 
     #[test]
@@ -1036,7 +1036,7 @@ mod tests {
         // YES: 1000 cents / 40 cents = 25 contracts
         // NO: 1000 cents / 50 cents = 20 contracts
         // max_contracts = min(25, 20) = 20
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1055,7 +1055,7 @@ mod tests {
         // YES: 500 cents / 50 cents = 10 contracts
         // NO: 1000 cents / 50 cents = 20 contracts
         // max_contracts = min(10, 20) = 10
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 50,
             no_price: 50,
@@ -1074,7 +1074,7 @@ mod tests {
         // YES: 1000 cents / 50 cents = 20 contracts
         // NO: 500 cents / 50 cents = 10 contracts
         // max_contracts = min(20, 10) = 10
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 50,
             no_price: 50,
@@ -1090,7 +1090,7 @@ mod tests {
 
     #[test]
     fn test_execution_request_max_contracts_zero_yes_price() {
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 0,
             no_price: 50,
@@ -1106,7 +1106,7 @@ mod tests {
 
     #[test]
     fn test_execution_request_max_contracts_zero_no_price() {
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 50,
             no_price: 0,
@@ -1125,7 +1125,7 @@ mod tests {
         // Verify integer division behavior (truncation, not rounding)
         // YES: 99 cents / 10 cents = 9 contracts (not 10)
         // NO: 99 cents / 10 cents = 9 contracts
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 10,
             no_price: 10,
@@ -1200,11 +1200,11 @@ mod tests {
             state.markets[id as usize].poly.store(40, 65, 700, 800);
         }
 
-        // 3. Check for arbs using FastExecutionRequest::detect()
+        // 3. Check for arbs using ArbOpportunity::detect()
         let market = state.get_by_id(market_id).unwrap();
         let kalshi_data = market.kalshi.load();
         let poly_data = market.poly.load();
-        let req = FastExecutionRequest::detect(
+        let req = ArbOpportunity::detect(
             market_id,
             kalshi_data,
             poly_data,
@@ -1243,10 +1243,10 @@ mod tests {
                         market.poly.update_no(50 + ((j % 10) as u16), 600 + j as u16);
                     }
 
-                    // Check arbs using FastExecutionRequest::detect() (should never panic)
+                    // Check arbs using ArbOpportunity::detect() (should never panic)
                     let kalshi_data = market.kalshi.load();
                     let poly_data = market.poly.load();
-                    let _ = FastExecutionRequest::detect(
+                    let _ = ArbOpportunity::detect(
                         market.market_id,
                         kalshi_data,
                         poly_data,
@@ -1303,7 +1303,7 @@ mod tests {
     }
 
     // =========================================================================
-    // FastExecutionRequest::detect() Tests
+    // ArbOpportunity::detect() Tests
     // =========================================================================
 
     #[test]
@@ -1313,7 +1313,7 @@ mod tests {
         let config = ArbConfig::default();
 
         // Prices sum to 100 cents = no profit
-        let result = FastExecutionRequest::detect(
+        let result = ArbOpportunity::detect(
             1,                          // market_id
             (50, 50, 1000, 1000),       // kalshi
             (50, 50, 1000, 1000),       // poly
@@ -1331,7 +1331,7 @@ mod tests {
         let config = ArbConfig::default(); // threshold = 99
 
         // Poly YES @ 45 + Kalshi NO @ 52 = 97 cents (+ ~2c fee) = ~99 <= 99
-        let result = FastExecutionRequest::detect(
+        let result = ArbOpportunity::detect(
             1,
             (55, 52, 500, 500),        // kalshi
             (45, 58, 500, 500),        // poly
@@ -1352,7 +1352,7 @@ mod tests {
         let config = ArbConfig::default();
 
         // Great prices but no size on kalshi NO side
-        let result = FastExecutionRequest::detect(
+        let result = ArbOpportunity::detect(
             1,
             (55, 52, 500, 0),          // kalshi: no_size = 0
             (45, 58, 500, 500),
@@ -1370,7 +1370,7 @@ mod tests {
         let config = ArbConfig::default();
 
         // Kalshi yes price = 0 (no price available)
-        let result = FastExecutionRequest::detect(
+        let result = ArbOpportunity::detect(
             1,
             (0, 52, 500, 500),
             (45, 58, 500, 500),
@@ -1381,7 +1381,7 @@ mod tests {
         assert!(result.is_none(), "Should return None when kalshi yes price is 0");
 
         // Poly no price = 0
-        let result2 = FastExecutionRequest::detect(
+        let result2 = ArbOpportunity::detect(
             1,
             (55, 52, 500, 500),
             (45, 0, 500, 500),
@@ -1400,7 +1400,7 @@ mod tests {
 
         // Kalshi YES @ 45 + Poly NO @ 52 = 97 + ~2c fee = ~99 <= 99
         // Make Poly YES expensive so PolyYesKalshiNo doesn't win
-        let result = FastExecutionRequest::detect(
+        let result = ArbOpportunity::detect(
             1,
             (45, 60, 500, 500),        // kalshi: yes=45, no=60
             (60, 52, 500, 500),        // poly: yes=60, no=52
@@ -1421,7 +1421,7 @@ mod tests {
         let config = ArbConfig::default();
 
         // Make cross-platform arbs too expensive, but Poly YES + Poly NO = 88 (no fees)
-        let result = FastExecutionRequest::detect(
+        let result = ArbOpportunity::detect(
             1,
             (60, 60, 500, 500),        // kalshi: expensive
             (40, 48, 500, 500),        // poly: 40 + 48 = 88 < 99
@@ -1443,7 +1443,7 @@ mod tests {
 
         // Kalshi YES 40 + Kalshi NO 40 = 80 + ~4c fees = 84 < 99
         // Make Poly expensive so cross-platform and poly-only don't win
-        let result = FastExecutionRequest::detect(
+        let result = ArbOpportunity::detect(
             1,
             (40, 40, 500, 500),        // kalshi: 40 + 40 + ~4 fees = 84
             (60, 60, 500, 500),        // poly: expensive
@@ -1468,7 +1468,7 @@ mod tests {
         // Size 180 cents at 45c/contract = 4 contracts (180/45 = 4)
         // Size 200 cents at 52c/contract = 3 contracts (200/52 = 3)
         // max_contracts = min(4, 3) = 3 < 5 (should reject)
-        let result = FastExecutionRequest::detect(
+        let result = ArbOpportunity::detect(
             1,
             (55, 52, 500, 200),        // kalshi: yes=55, no=52, yes_size=500, no_size=200
             (45, 58, 180, 500),        // poly: yes=45, no=58, yes_size=180, no_size=500
@@ -1481,7 +1481,7 @@ mod tests {
         // Now with enough size:
         // poly_yes: 250/45 = 5 contracts, kalshi_no: 260/52 = 5 contracts
         // max_contracts = min(5, 5) = 5 >= 5 (should accept)
-        let result2 = FastExecutionRequest::detect(
+        let result2 = ArbOpportunity::detect(
             1,
             (55, 52, 500, 260),        // kalshi: no_size=260 -> 5 contracts
             (45, 58, 250, 500),        // poly: yes_size=250 -> 5 contracts
@@ -1499,7 +1499,7 @@ mod tests {
         let config = ArbConfig::default();
 
         // All 4 arb types are valid with equal prices - should pick PolyYesKalshiNo (priority)
-        let result = FastExecutionRequest::detect(
+        let result = ArbOpportunity::detect(
             1,
             (40, 40, 500, 500),
             (40, 40, 500, 500),
@@ -1517,7 +1517,7 @@ mod tests {
 
         let config = ArbConfig::default();
 
-        let result = FastExecutionRequest::detect(
+        let result = ArbOpportunity::detect(
             1,
             (55, 52, 500, 500),
             (45, 58, 500, 500),
@@ -1535,7 +1535,7 @@ mod tests {
 
         let config = ArbConfig::default();
 
-        let result = FastExecutionRequest::detect(
+        let result = ArbOpportunity::detect(
             42,                         // specific market_id
             (55, 52, 500, 500),
             (45, 58, 500, 500),

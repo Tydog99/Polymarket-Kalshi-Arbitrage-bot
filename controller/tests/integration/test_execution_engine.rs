@@ -40,7 +40,7 @@ use arb_bot::kalshi::{KalshiApiClient, KalshiConfig};
 use arb_bot::poly_executor::mock::MockPolyClient;
 use arb_bot::poly_executor::PolyExecutor;
 use arb_bot::position_tracker::{create_position_channel, FillRecord};
-use arb_bot::types::{ArbType, FastExecutionRequest, GlobalState, MarketPair, MarketType};
+use arb_bot::types::{ArbType, ArbOpportunity, GlobalState, MarketPair, MarketType};
 
 use super::replay_harness::load_fixture;
 
@@ -134,9 +134,9 @@ fn create_test_engine(
     (engine, fill_rx)
 }
 
-/// Create a FastExecutionRequest for testing.
-fn create_test_request(arb_type: ArbType) -> FastExecutionRequest {
-    FastExecutionRequest {
+/// Create a ArbOpportunity for testing.
+fn create_test_request(arb_type: ArbType) -> ArbOpportunity {
+    ArbOpportunity {
         market_id: 0,
         yes_price: 9,   // 9 cents
         no_price: 85,   // 85 cents
