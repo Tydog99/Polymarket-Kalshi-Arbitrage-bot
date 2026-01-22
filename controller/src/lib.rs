@@ -6,6 +6,9 @@
 pub mod cache;
 pub mod circuit_breaker;
 pub mod config;
+pub mod confirm_log;
+pub mod confirm_queue;
+pub mod confirm_tui;
 pub mod discovery;
 pub mod execution;
 pub mod kalshi;
