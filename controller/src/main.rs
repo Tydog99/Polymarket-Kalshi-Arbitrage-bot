@@ -22,6 +22,7 @@
 //! - **Circuit breaker protection** with configurable risk limits
 //! - **Market discovery system** with intelligent caching and incremental updates
 
+mod arb;
 mod cache;
 mod circuit_breaker;
 mod config;
@@ -733,9 +734,12 @@ async fn main() -> Result<()> {
     // Create Kalshi API client
     let kalshi_api = Arc::new(KalshiApiClient::new(kalshi_config));
 
-    // Build global state
+    // Build global state with arb config loaded from environment
+    let arb_config = arb::ArbConfig::from_env();
+    info!("   Arb threshold: {}¢ | min contracts: {}",
+          arb_config.threshold_cents, arb_config.min_contracts);
     let state = Arc::new({
-        let s = GlobalState::new();
+        let s = GlobalState::new(arb_config);
         for pair in result.pairs {
             s.add_pair(pair);
         }
