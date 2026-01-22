@@ -14,7 +14,7 @@ use crate::config::{KALSHI_WEB_BASE, build_polymarket_url};
 use crate::execution::describe_arb_trade;
 use crate::remote_protocol::{IncomingMessage, OrderAction, OutcomeSide, Platform as WsPlatform};
 use crate::remote_trader::RemoteTraderRouter;
-use crate::types::{ArbType, FastExecutionRequest, GlobalState, MarketPair};
+use crate::types::{ArbType, ArbOpportunity, GlobalState, MarketPair};
 
 use trading::execution::{
     execute_leg, ExecutionClients, LegRequest, OrderAction as TradingOrderAction,
@@ -120,7 +120,7 @@ impl HybridExecutor {
         }
     }
 
-    pub async fn process(&self, req: FastExecutionRequest) -> Result<()> {
+    pub async fn process(&self, req: ArbOpportunity) -> Result<()> {
         let market_id = req.market_id;
 
         // Deduplication check (512 markets via 8x u64 bitmask)
@@ -333,7 +333,7 @@ impl HybridExecutor {
 }
 
 fn build_legs(
-    req: &FastExecutionRequest,
+    req: &ArbOpportunity,
     pair: &MarketPair,
     contracts: i64,
     leg_seq: &AtomicU64,
@@ -495,7 +495,7 @@ fn build_legs(
 
 /// Hybrid execution event loop - forwards arbitrage opportunities to remote traders or executes locally.
 pub async fn run_hybrid_execution_loop(
-    mut rx: mpsc::Receiver<FastExecutionRequest>,
+    mut rx: mpsc::Receiver<ArbOpportunity>,
     executor: Arc<HybridExecutor>,
 ) {
     executor.log_info(format!(
@@ -570,7 +570,7 @@ mod tests {
         // No polymarket trader connected and no local authorization
 
         let exec = HybridExecutor::new(state, cb, router, HashSet::new(), None, None, true, None);
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -598,7 +598,7 @@ mod tests {
         let mut poly_rx = router.test_register(WsPlatform::Polymarket).await;
 
         let exec = HybridExecutor::new(state, cb, router, HashSet::new(), None, None, true, None);
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -644,7 +644,7 @@ mod tests {
         let mut poly_rx = router.test_register(WsPlatform::Polymarket).await;
 
         let exec = HybridExecutor::new(state, cb, router, HashSet::new(), None, None, true, None);
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 48,
             no_price: 50,

@@ -69,7 +69,7 @@ use crate::remote_execution::{HybridExecutor, run_hybrid_execution_loop};
 use crate::remote_protocol::Platform as WsPlatform;
 use crate::remote_trader::RemoteTraderServer;
 use trading::execution::Platform as TradingPlatform;
-use types::{FastExecutionRequest, GlobalState, MarketPair, MarketType, PriceCents};
+use types::{ArbOpportunity, GlobalState, MarketPair, MarketType, PriceCents};
 
 /// Polymarket CLOB API host
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
@@ -753,7 +753,7 @@ async fn main() -> Result<()> {
 
     // Confirmation mode setup
     let confirm_enabled = config::any_league_requires_confirmation();
-    let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::channel::<(FastExecutionRequest, Arc<MarketPair>)>(256);
+    let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::channel::<(ArbOpportunity, Arc<MarketPair>)>(256);
     let (tui_update_tx, tui_update_rx) = tokio::sync::mpsc::channel::<()>(16);
     let (tui_action_tx, mut tui_action_rx) = tokio::sync::mpsc::channel::<ConfirmAction>(16);
     let (tui_log_tx, tui_log_rx) = tokio::sync::mpsc::channel::<String>(1024);
@@ -1123,7 +1123,7 @@ async fn main() -> Result<()> {
             .unwrap_or(10);
 
         tokio::spawn(async move {
-            use types::{FastExecutionRequest, ArbType};
+            use types::{ArbOpportunity, ArbType};
 
             // Wait for WebSocket connections to establish and populate orderbooks
             info!("[TEST] Injecting synthetic arbitrage opportunity in {} seconds...", test_arb_delay);
@@ -1156,7 +1156,7 @@ async fn main() -> Result<()> {
                 if let Some(market) = test_state.get_by_id(market_id as u16) {
                     if let Some(pair) = market.pair() {
                         // SIZE: 1000 cents = 10 contracts (Poly $1 min requires ~3 contracts at 40¢)
-                        let fake_req = FastExecutionRequest {
+                        let fake_req = ArbOpportunity {
                             market_id: market_id as u16,
                             yes_price,
                             no_price,
@@ -1269,8 +1269,8 @@ async fn main() -> Result<()> {
             }
             markets_scanned += 1;
 
-            // Check for arbs using FastExecutionRequest::detect()
-            if let Some(req) = FastExecutionRequest::detect(
+            // Check for arbs using ArbOpportunity::detect()
+            if let Some(req) = ArbOpportunity::detect(
                 market.market_id,
                 market.kalshi.load(),
                 market.poly.load(),

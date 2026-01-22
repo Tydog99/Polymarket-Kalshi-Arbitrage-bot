@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 use crate::config::{self, POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS, GAMMA_API_BASE, POLY_MAX_TOKENS_PER_WS};
 use crate::execution::NanoClock;
 use crate::types::{
-    GlobalState, FastExecutionRequest, MarketPair, PriceCents, SizeCents,
+    GlobalState, ArbOpportunity, MarketPair, PriceCents, SizeCents,
     parse_price, fxhash_str,
 };
 
@@ -280,8 +280,8 @@ fn parse_size(s: &str) -> SizeCents {
 /// shutdown signal), all connections are aborted to trigger a coordinated reconnect.
 pub async fn run_ws(
     state: Arc<GlobalState>,
-    exec_tx: mpsc::Sender<FastExecutionRequest>,
-    confirm_tx: mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
+    exec_tx: mpsc::Sender<ArbOpportunity>,
+    confirm_tx: mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
     threshold_cents: PriceCents,
     shutdown_rx: watch::Receiver<bool>,
     clock: Arc<NanoClock>,
@@ -388,8 +388,8 @@ async fn run_single_ws(
     conn_id: usize,
     tokens: Vec<String>,
     state: Arc<GlobalState>,
-    exec_tx: mpsc::Sender<FastExecutionRequest>,
-    confirm_tx: mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
+    exec_tx: mpsc::Sender<ArbOpportunity>,
+    confirm_tx: mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
     threshold_cents: PriceCents,
     mut shutdown_rx: watch::Receiver<bool>,
     clock: Arc<NanoClock>,
@@ -518,8 +518,8 @@ async fn run_single_ws(
 async fn process_book(
     state: &GlobalState,
     book: &BookSnapshot,
-    exec_tx: &mpsc::Sender<FastExecutionRequest>,
-    confirm_tx: &mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
+    exec_tx: &mpsc::Sender<ArbOpportunity>,
+    confirm_tx: &mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
     _threshold_cents: PriceCents,
     clock: &NanoClock,
 ) {
@@ -559,8 +559,8 @@ async fn process_book(
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
 
-        // Check arbs using FastExecutionRequest::detect()
-        if let Some(req) = FastExecutionRequest::detect(
+        // Check arbs using ArbOpportunity::detect()
+        if let Some(req) = ArbOpportunity::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -590,8 +590,8 @@ async fn process_book(
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
 
-        // Check arbs using FastExecutionRequest::detect()
-        if let Some(req) = FastExecutionRequest::detect(
+        // Check arbs using ArbOpportunity::detect()
+        if let Some(req) = ArbOpportunity::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -617,8 +617,8 @@ async fn process_book(
 async fn process_price_change(
     state: &GlobalState,
     change: &PriceChangeItem,
-    exec_tx: &mpsc::Sender<FastExecutionRequest>,
-    confirm_tx: &mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
+    exec_tx: &mpsc::Sender<ArbOpportunity>,
+    confirm_tx: &mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
     _threshold_cents: PriceCents,
     clock: &NanoClock,
 ) {
@@ -655,7 +655,7 @@ async fn process_price_change(
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_yes || current_yes == 0 {
-            if let Some(req) = FastExecutionRequest::detect(
+            if let Some(req) = ArbOpportunity::detect(
                 market_id,
                 market.kalshi.load(),
                 market.poly.load(),
@@ -684,7 +684,7 @@ async fn process_price_change(
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_no || current_no == 0 {
-            if let Some(req) = FastExecutionRequest::detect(
+            if let Some(req) = ArbOpportunity::detect(
                 market_id,
                 market.kalshi.load(),
                 market.poly.load(),
@@ -704,9 +704,9 @@ async fn process_price_change(
 async fn route_arb_to_channel(
     state: &GlobalState,
     market_id: u16,
-    req: FastExecutionRequest,
-    exec_tx: &mpsc::Sender<FastExecutionRequest>,
-    confirm_tx: &mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
+    req: ArbOpportunity,
+    exec_tx: &mpsc::Sender<ArbOpportunity>,
+    confirm_tx: &mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
 ) {
     // Get market pair to check if confirmation is required
     let pair = match state.get_by_id(market_id).and_then(|m| m.pair()) {

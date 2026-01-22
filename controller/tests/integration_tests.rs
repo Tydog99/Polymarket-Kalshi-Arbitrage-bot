@@ -493,7 +493,7 @@ mod infra_integration_tests {
     }
 
     // =========================================================================
-    // Arb Detection Tests (FastExecutionRequest::detect)
+    // Arb Detection Tests (ArbOpportunity::detect)
     // =========================================================================
 
     /// Test: detects clear cross-platform arb (Poly YES + Kalshi NO)
@@ -505,7 +505,7 @@ mod infra_integration_tests {
         let (state, market_id) = setup_market(55, 50, 40, 65);
 
         let market = state.get_by_id(market_id).unwrap();
-        let arb = FastExecutionRequest::detect(
+        let arb = ArbOpportunity::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -526,7 +526,7 @@ mod infra_integration_tests {
         let (state, market_id) = setup_market(40, 65, 55, 50);
 
         let market = state.get_by_id(market_id).unwrap();
-        let arb = FastExecutionRequest::detect(
+        let arb = ArbOpportunity::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -545,7 +545,7 @@ mod infra_integration_tests {
         let (state, market_id) = setup_market(60, 60, 48, 50);
 
         let market = state.get_by_id(market_id).unwrap();
-        let arb = FastExecutionRequest::detect(
+        let arb = ArbOpportunity::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -566,7 +566,7 @@ mod infra_integration_tests {
         let (state, market_id) = setup_market(44, 44, 60, 60);
 
         let market = state.get_by_id(market_id).unwrap();
-        let arb = FastExecutionRequest::detect(
+        let arb = ArbOpportunity::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -587,7 +587,7 @@ mod infra_integration_tests {
         let (state, market_id) = setup_market(55, 50, 49, 55);
 
         let market = state.get_by_id(market_id).unwrap();
-        let arb = FastExecutionRequest::detect(
+        let arb = ArbOpportunity::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -610,7 +610,7 @@ mod infra_integration_tests {
         let (state, market_id) = setup_market(55, 55, 52, 52);
 
         let market = state.get_by_id(market_id).unwrap();
-        let arb = FastExecutionRequest::detect(
+        let arb = ArbOpportunity::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -627,7 +627,7 @@ mod infra_integration_tests {
         let (state, market_id) = setup_market(50, 0, 50, 50);
 
         let market = state.get_by_id(market_id).unwrap();
-        let arb = FastExecutionRequest::detect(
+        let arb = ArbOpportunity::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -660,16 +660,16 @@ mod infra_integration_tests {
     // The fee calculation (kalshi_fee_cents) is tested independently above.
 
     // =========================================================================
-    // FastExecutionRequest Tests
+    // ArbOpportunity Tests
     // =========================================================================
 
-    /// Test: FastExecutionRequest calculates profit correctly
+    /// Test: ArbOpportunity calculates profit correctly
     #[test]
     fn test_execution_request_profit_calculation() {
         // Poly YES 40¢ + Kalshi NO 50¢ = 90¢
         // Kalshi fee on 50¢ = 2¢
         // Profit = 100 - 90 - 2 = 8¢
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -683,11 +683,11 @@ mod infra_integration_tests {
         assert_eq!(req.profit_cents(), 8, "Profit should be 8¢");
     }
 
-    /// Test: FastExecutionRequest handles negative profit
+    /// Test: ArbOpportunity handles negative profit
     #[test]
     fn test_execution_request_negative_profit() {
         // Prices too high - no profit
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 52,
             no_price: 52,
@@ -797,9 +797,9 @@ mod infra_integration_tests {
         // 1. Setup market with arb opportunity
         let (state, market_id) = setup_market(55, 50, 40, 65);
 
-        // 2. Detect arb using FastExecutionRequest::detect()
+        // 2. Detect arb using ArbOpportunity::detect()
         let market = state.get_by_id(market_id).unwrap();
-        let req = FastExecutionRequest::detect(
+        let req = ArbOpportunity::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
@@ -841,7 +841,7 @@ mod execution_tests {
     #[tokio::test]
     async fn test_execution_profit_threshold() {
         // This tests the logic flow - actual execution would need mocked clients
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 50,
             no_price: 50,
@@ -1306,7 +1306,7 @@ mod process_mock_tests {
         tracker: &Arc<RwLock<PositionTracker>>,
         circuit_breaker: &CircuitBreaker,
         pair: &MarketPair,
-        req: &FastExecutionRequest,
+        req: &ArbOpportunity,
         result: MockExecutionResult,
     ) -> (i64, i16) {  // Returns (matched, profit_cents)
         let matched = result.kalshi_filled.min(result.poly_filled);
@@ -1399,7 +1399,7 @@ mod process_mock_tests {
         let cb = CircuitBreaker::new(test_circuit_breaker_config());
         let pair = test_market_pair();
 
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1450,7 +1450,7 @@ mod process_mock_tests {
         let pair = test_market_pair();
 
         // Poly YES + Kalshi NO configuration
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1492,7 +1492,7 @@ mod process_mock_tests {
         let pair = test_market_pair();
 
         // Kalshi YES + Poly NO configuration
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1533,7 +1533,7 @@ mod process_mock_tests {
         let cb = CircuitBreaker::new(test_circuit_breaker_config());
         let pair = test_market_pair();
 
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1568,7 +1568,7 @@ mod process_mock_tests {
         let cb = CircuitBreaker::new(test_circuit_breaker_config());
         let pair = test_market_pair();
 
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1611,7 +1611,7 @@ mod process_mock_tests {
         let cb = CircuitBreaker::new(test_circuit_breaker_config());
         let pair = test_market_pair();
 
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1647,7 +1647,7 @@ mod process_mock_tests {
         let cb = CircuitBreaker::new(test_circuit_breaker_config());
         let pair = test_market_pair();
 
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1690,7 +1690,7 @@ mod process_mock_tests {
         let cb = CircuitBreaker::new(test_circuit_breaker_config());
         let pair = test_market_pair();
 
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1725,7 +1725,7 @@ mod process_mock_tests {
         let cb = CircuitBreaker::new(test_circuit_breaker_config());
         let pair = test_market_pair();
 
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,  // Poly YES at 40¢
             no_price: 50,   // Kalshi NO at 50¢
@@ -1764,7 +1764,7 @@ mod process_mock_tests {
         let cb = CircuitBreaker::new(test_circuit_breaker_config());
         let pair = test_market_pair();
 
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1804,7 +1804,7 @@ mod process_mock_tests {
         let cb = CircuitBreaker::new(test_circuit_breaker_config());
         let pair = test_market_pair();
 
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1863,7 +1863,7 @@ mod process_mock_tests {
         let cb = CircuitBreaker::new(test_circuit_breaker_config());
         let pair = test_market_pair();
 
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1907,7 +1907,7 @@ mod process_mock_tests {
 
         // PolyOnly: Buy YES and NO both on Polymarket
         // This is unusual but profitable when Poly YES + Poly NO < $1
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 48,  // Poly YES at 48¢
             no_price: 50,   // Poly NO at 50¢ (total = 98¢, 2¢ profit with NO fees!)
@@ -1944,7 +1944,7 @@ mod process_mock_tests {
 
         // KalshiOnly: Buy YES and NO both on Kalshi
         // Must overcome DOUBLE fees (fee on YES side + fee on NO side)
-        let req = FastExecutionRequest {
+        let req = ArbOpportunity {
             market_id: 0,
             yes_price: 44,  // Kalshi YES at 44¢
             no_price: 44,   // Kalshi NO at 44¢ (raw = 88¢)
@@ -1970,7 +1970,7 @@ mod process_mock_tests {
     fn test_poly_only_zero_fees() {
         for yes_price in [10u16, 25, 50, 75, 90] {
             for no_price in [10u16, 25, 50, 75, 90] {
-                let req = FastExecutionRequest {
+                let req = ArbOpportunity {
                     market_id: 0,
                     yes_price,
                     no_price,
@@ -1994,7 +1994,7 @@ mod process_mock_tests {
 
         for yes_price in [10u16, 25, 50, 75, 90] {
             for no_price in [10u16, 25, 50, 75, 90] {
-                let req = FastExecutionRequest {
+                let req = ArbOpportunity {
                     market_id: 0,
                     yes_price,
                     no_price,
@@ -2018,7 +2018,7 @@ mod process_mock_tests {
         use arb_bot::arb::kalshi_fee;
 
         // PolyYesKalshiNo: fee on Kalshi NO side
-        let req1 = FastExecutionRequest {
+        let req1 = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -2032,7 +2032,7 @@ mod process_mock_tests {
             "PolyYesKalshiNo fee should be on NO side (50¢)");
 
         // KalshiYesPolyNo: fee on Kalshi YES side
-        let req2 = FastExecutionRequest {
+        let req2 = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -2056,7 +2056,7 @@ mod process_mock_tests {
         // Raw cost = 90¢, payout = 100¢
 
         // PolyOnly: 0 fees → 10¢ profit
-        let poly_only = FastExecutionRequest {
+        let poly_only = ArbOpportunity {
             market_id: 0,
             yes_price,
             no_price,
@@ -2068,7 +2068,7 @@ mod process_mock_tests {
         };
 
         // KalshiOnly: double fees → less profit
-        let kalshi_only = FastExecutionRequest {
+        let kalshi_only = ArbOpportunity {
             market_id: 0,
             yes_price,
             no_price,
@@ -2080,7 +2080,7 @@ mod process_mock_tests {
         };
 
         // Cross-platform: single fee
-        let cross1 = FastExecutionRequest {
+        let cross1 = ArbOpportunity {
             market_id: 0,
             yes_price,
             no_price,
@@ -2091,7 +2091,7 @@ mod process_mock_tests {
             is_test: false,
         };
 
-        let cross2 = FastExecutionRequest {
+        let cross2 = ArbOpportunity {
             market_id: 0,
             yes_price,
             no_price,
@@ -2184,7 +2184,7 @@ mod startup_sweep_tests {
     #[tokio::test]
     async fn test_startup_sweep_detects_arbs() {
         let state = setup_markets_for_sweep();
-        let (tx, mut rx) = mpsc::channel::<FastExecutionRequest>(16);
+        let (tx, mut rx) = mpsc::channel::<ArbOpportunity>(16);
 
         // Simulate startup sweep logic
         let market_count = state.market_count();
@@ -2203,7 +2203,7 @@ mod startup_sweep_tests {
             }
             markets_scanned += 1;
 
-            if let Some(req) = FastExecutionRequest::detect(
+            if let Some(req) = ArbOpportunity::detect(
                 market.market_id,
                 kalshi_data,
                 poly_data,
@@ -2264,7 +2264,7 @@ mod startup_sweep_tests {
         market.kalshi.store(55, 55, 1000, 1000);
         market.poly.store(55, 55, 1000, 1000);
 
-        let (_tx, mut rx) = mpsc::channel::<FastExecutionRequest>(16);
+        let (_tx, mut rx) = mpsc::channel::<ArbOpportunity>(16);
 
         let market_count = state.market_count();
         let mut arbs_found = 0;
@@ -2279,7 +2279,7 @@ mod startup_sweep_tests {
                 continue;
             }
 
-            if FastExecutionRequest::detect(
+            if ArbOpportunity::detect(
                 market.market_id,
                 kalshi_data,
                 poly_data,
@@ -2309,7 +2309,7 @@ mod startup_sweep_tests {
         market.kalshi.store(55, 50, 1000, 1000);
         market.poly.store(40, 50, 1000, 1000);
 
-        let arb = FastExecutionRequest::detect(
+        let arb = ArbOpportunity::detect(
             id,
             market.kalshi.load(),
             market.poly.load(),
@@ -2317,7 +2317,7 @@ mod startup_sweep_tests {
             0,
         );
 
-        // FastExecutionRequest::detect() should pick the best arb type with priority
+        // ArbOpportunity::detect() should pick the best arb type with priority
         let arb = arb.expect("Should detect arb");
 
         // PolyYesKalshiNo is checked first in priority order

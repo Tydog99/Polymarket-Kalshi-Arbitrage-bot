@@ -9,13 +9,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use crate::arb::{kalshi_fee, ArbConfig};
 use crate::config::{build_polymarket_url, KALSHI_WEB_BASE};
-use crate::types::{ArbType, FastExecutionRequest, GlobalState, MarketPair};
+use crate::types::{ArbType, ArbOpportunity, GlobalState, MarketPair};
 
 /// A pending arbitrage opportunity awaiting confirmation
 #[derive(Debug, Clone)]
 pub struct PendingArb {
     /// Original execution request
-    pub request: FastExecutionRequest,
+    pub request: ArbOpportunity,
     /// Market pair info (for display)
     pub pair: Arc<MarketPair>,
     /// Number of times this arb has been detected while pending
@@ -27,7 +27,7 @@ pub struct PendingArb {
 }
 
 impl PendingArb {
-    pub fn new(request: FastExecutionRequest, pair: Arc<MarketPair>) -> Self {
+    pub fn new(request: ArbOpportunity, pair: Arc<MarketPair>) -> Self {
         let kalshi_url = format!("{}/{}", KALSHI_WEB_BASE, pair.kalshi_market_ticker);
         let poly_url = build_polymarket_url(&pair.league, &pair.poly_slug);
 
@@ -41,7 +41,7 @@ impl PendingArb {
     }
 
     /// Update with fresher price data
-    pub fn update(&mut self, request: FastExecutionRequest) {
+    pub fn update(&mut self, request: ArbOpportunity) {
         self.request = request;
         self.detection_count += 1;
     }
@@ -52,7 +52,7 @@ impl PendingArb {
     }
 
     /// Calculate max contracts based on available size and prices.
-    /// Delegates to FastExecutionRequest::max_contracts().
+    /// Delegates to ArbOpportunity::max_contracts().
     pub fn max_contracts(&self) -> u16 {
         self.request.max_contracts()
     }
@@ -108,8 +108,8 @@ impl ConfirmationQueue {
 
     /// Push a new arb opportunity (or update existing for same market).
     /// Returns `true` if this was a new entry, `false` if updating existing or blacklisted.
-    /// Note: Size validation is done upstream in FastExecutionRequest::detect()
-    pub async fn push(&self, request: FastExecutionRequest, pair: Arc<MarketPair>) -> bool {
+    /// Note: Size validation is done upstream in ArbOpportunity::detect()
+    pub async fn push(&self, request: ArbOpportunity, pair: Arc<MarketPair>) -> bool {
         let market_id = request.market_id;
 
         // Check blacklist and clean expired entries in one lock acquisition
@@ -255,13 +255,13 @@ impl ConfirmationQueue {
         })
     }
 
-    /// Re-validate arb using FastExecutionRequest::detect() with current orderbook prices.
-    /// Returns Some(FastExecutionRequest) if a valid arb still exists, None otherwise.
+    /// Re-validate arb using ArbOpportunity::detect() with current orderbook prices.
+    /// Returns Some(ArbOpportunity) if a valid arb still exists, None otherwise.
     ///
     /// This can be used to get a fresh request with current prices for execution,
     /// rather than using the potentially stale prices from when the arb was queued.
     #[allow(dead_code)]
-    pub fn validate_arb(&self, arb: &PendingArb, config: &ArbConfig) -> Option<FastExecutionRequest> {
+    pub fn validate_arb(&self, arb: &PendingArb, config: &ArbConfig) -> Option<ArbOpportunity> {
         // Test arbs always pass validation - return a copy of the original request
         if arb.request.is_test {
             return Some(arb.request.clone());
@@ -273,8 +273,8 @@ impl ConfirmationQueue {
         let kalshi = market.kalshi.load();
         let poly = market.poly.load();
 
-        // Use FastExecutionRequest::detect() to re-validate with current prices
-        FastExecutionRequest::detect(arb.request.market_id, kalshi, poly, config, 0)
+        // Use ArbOpportunity::detect() to re-validate with current prices
+        ArbOpportunity::detect(arb.request.market_id, kalshi, poly, config, 0)
     }
 }
 
@@ -301,9 +301,9 @@ mod tests {
         })
     }
 
-    /// Create a test FastExecutionRequest
-    fn test_request(yes_price: u16, no_price: u16, yes_size: u16, no_size: u16) -> FastExecutionRequest {
-        FastExecutionRequest {
+    /// Create a test ArbOpportunity
+    fn test_request(yes_price: u16, no_price: u16, yes_size: u16, no_size: u16) -> ArbOpportunity {
+        ArbOpportunity {
             market_id: 1,
             yes_price,
             no_price,

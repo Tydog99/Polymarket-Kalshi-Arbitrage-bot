@@ -25,7 +25,7 @@ use crate::config::{self, KALSHI_WS_URL, KALSHI_API_BASE, KALSHI_API_DELAY_MS};
 use crate::execution::NanoClock;
 use crate::types::{
     KalshiEventsResponse, KalshiMarketsResponse, KalshiEvent, KalshiMarket,
-    GlobalState, FastExecutionRequest, PriceCents, SizeCents, fxhash_str,
+    GlobalState, ArbOpportunity, PriceCents, SizeCents, fxhash_str,
     MarketPair,
 };
 
@@ -459,8 +459,8 @@ struct SubscribeParams {
 pub async fn run_ws(
     config: &KalshiConfig,
     state: Arc<GlobalState>,
-    exec_tx: mpsc::Sender<FastExecutionRequest>,
-    confirm_tx: mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
+    exec_tx: mpsc::Sender<ArbOpportunity>,
+    confirm_tx: mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
     _threshold_cents: PriceCents,
     mut shutdown_rx: watch::Receiver<bool>,
     clock: Arc<NanoClock>,
@@ -549,8 +549,8 @@ pub async fn run_ws(
                                             process_kalshi_snapshot(market, body);
                                             market.mark_kalshi_update_unix_ms(now_ms);
 
-                                            // Check for arbs using FastExecutionRequest::detect()
-                                            if let Some(req) = FastExecutionRequest::detect(
+                                            // Check for arbs using ArbOpportunity::detect()
+                                            if let Some(req) = ArbOpportunity::detect(
                                                 market_id,
                                                 market.kalshi.load(),
                                                 market.poly.load(),
@@ -570,8 +570,8 @@ pub async fn run_ws(
                                             process_kalshi_delta(market, body);
                                             market.mark_kalshi_update_unix_ms(now_ms);
 
-                                            // Check for arbs using FastExecutionRequest::detect()
-                                            if let Some(req) = FastExecutionRequest::detect(
+                                            // Check for arbs using ArbOpportunity::detect()
+                                            if let Some(req) = ArbOpportunity::detect(
                                                 market_id,
                                                 market.kalshi.load(),
                                                 market.poly.load(),
@@ -723,9 +723,9 @@ fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiW
 async fn route_arb_to_channel(
     state: &GlobalState,
     market_id: u16,
-    req: FastExecutionRequest,
-    exec_tx: &mpsc::Sender<FastExecutionRequest>,
-    confirm_tx: &mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
+    req: ArbOpportunity,
+    exec_tx: &mpsc::Sender<ArbOpportunity>,
+    confirm_tx: &mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
 ) {
     // Get market pair to check if confirmation is required
     let pair = match state.get_by_id(market_id).and_then(|m| m.pair()) {
