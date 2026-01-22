@@ -40,7 +40,7 @@ pub struct ConfirmationRecord {
     pub yes_price_cents: u16,
     pub no_price_cents: u16,
     pub profit_cents: i16,
-    pub max_contracts: i64,
+    pub max_contracts: u16,
     pub detection_count: u32,
     pub kalshi_url: String,
     pub poly_url: String,
