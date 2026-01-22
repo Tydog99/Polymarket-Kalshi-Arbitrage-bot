@@ -94,6 +94,7 @@ impl ConfirmationLogger {
     }
 
     /// Get the number of records logged
+    #[allow(dead_code)]
     pub fn record_count(&self) -> usize {
         self.record_count
     }

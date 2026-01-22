@@ -20,6 +20,7 @@ pub struct PendingArb {
     /// Number of times this arb has been detected while pending
     pub detection_count: u32,
     /// First detection timestamp
+    #[allow(dead_code)]
     pub first_detected: Instant,
     /// Most recent detection timestamp
     pub last_detected: Instant,
@@ -196,6 +197,7 @@ impl ConfirmationQueue {
     }
 
     /// Remove a market from pending (e.g., when prices invalidate it)
+    #[allow(dead_code)]
     pub async fn remove(&self, market_id: u16) -> Option<PendingArb> {
         let mut pending = self.pending.write().await;
         let mut order = self.order.write().await;
@@ -260,6 +262,7 @@ impl ConfirmationQueue {
     }
 
     /// Get current prices for an arb (for live display updates)
+    #[allow(dead_code)]
     pub fn get_current_prices(&self, market_id: u16) -> Option<(PriceCents, PriceCents, PriceCents, PriceCents)> {
         let market = self.state.get_by_id(market_id)?;
         let (k_yes, k_no, _, _) = market.kalshi.load();

@@ -190,11 +190,9 @@ impl KalshiConfig {
     }
 
     pub fn sign(&self, message: &str) -> Result<String> {
-        tracing::debug!("[KALSHI-DEBUG] Signing message: {}", message);
         let signing_key = SigningKey::<Sha256>::new(self.private_key.clone());
         let signature = signing_key.sign_with_rng(&mut rand::thread_rng(), message.as_bytes());
         let sig_b64 = BASE64.encode(signature.to_bytes());
-        tracing::debug!("[KALSHI-DEBUG] Signature (first 50 chars): {}...", &sig_b64[..50.min(sig_b64.len())]);
         Ok(sig_b64)
     }
 }
@@ -295,14 +293,8 @@ impl KalshiApiClient {
         let resp: KalshiEventsResponse = self.get(&path).await?;
         Ok(resp.events)
     }
-    
-    pub async fn get_markets(&self, event_ticker: &str) -> Result<Vec<KalshiMarket>> {
-        let path = format!("/markets?event_ticker={}", event_ticker);
-        let resp: KalshiMarketsResponse = self.get(&path).await?;
-        Ok(resp.markets)
-    }
 
-    /// Get markets for a given series ticker (used for MVE series that don't expose events).
+    /// Get markets for a given series ticker (fast path - single call instead of N+1).
     ///
     /// Note: Kalshi's API accepts `status=open` to return actively tradable markets (often `status: "active"`).
     pub async fn get_markets_for_series(&self, series_ticker: &str, limit: u32) -> Result<Vec<KalshiMarket>> {

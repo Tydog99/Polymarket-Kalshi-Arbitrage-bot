@@ -80,29 +80,29 @@ impl GammaClient {
                 .expect("Failed to build HTTP client"),
         }
     }
-    
-    /// Look up Polymarket market by slug, return (token1, token2, outcomes)
-    /// Tries both the exact date and next day (timezone handling)
-    /// Note: token1/token2 are in Gamma API order; caller must use outcomes to determine YES/NO
-    pub async fn lookup_market(&self, slug: &str) -> Result<Option<(String, String, Vec<String>)>> {
-        // Try exact slug first
-        if let Some(result) = self.try_lookup_slug(slug).await? {
-            return Ok(Some(result));
+
+    /// Batch lookup multiple Polymarket markets by slug.
+    /// Returns HashMap keyed by slug with (token1, token2, outcomes) values.
+    /// Slugs not found or inactive are simply not included in the result.
+    ///
+    /// This is much more efficient than individual lookups:
+    /// - 100 slugs = 1-2 HTTP requests instead of 100
+    /// - Reduces Cloudflare rate limiting triggers
+    pub async fn lookup_markets_batch(
+        &self,
+        slugs: &[String],
+    ) -> Result<std::collections::HashMap<String, (String, String, Vec<String>)>> {
+        use std::collections::HashMap;
+
+        if slugs.is_empty() {
+            return Ok(HashMap::new());
         }
 
-        // Try with next day (Polymarket may use local time)
-        if let Some(next_day_slug) = increment_date_in_slug(slug) {
-            if let Some(result) = self.try_lookup_slug(&next_day_slug).await? {
-                info!("  📅 Found with next-day slug: {}", next_day_slug);
-                return Ok(Some(result));
-            }
-        }
-
-        Ok(None)
-    }
-    
-    async fn try_lookup_slug(&self, slug: &str) -> Result<Option<(String, String, Vec<String>)>> {
-        let url = format!("{}/markets?slug={}", GAMMA_API_BASE, slug);
+        // Build URL with multiple slug parameters: /markets?slug=x&slug=y&slug=z
+        let query_params: Vec<String> = slugs.iter()
+            .map(|s| format!("slug={}", s))
+            .collect();
+        let url = format!("{}/markets?{}", GAMMA_API_BASE, query_params.join("&"));
 
         // Retry logic for transient failures (Cloudflare throttling, network issues)
         let mut last_error = None;
@@ -116,8 +116,7 @@ impl GammaClient {
                 Ok(resp) if resp.status().is_success() => {
                     match resp.json::<Vec<GammaMarket>>().await {
                         Ok(markets) => {
-                            // Success - continue with normal logic below
-                            return self.parse_gamma_market_response(markets);
+                            return Ok(self.parse_gamma_batch_response(markets));
                         }
                         Err(e) => {
                             last_error = Some(format!("JSON parse error: {}", e));
@@ -125,9 +124,13 @@ impl GammaClient {
                         }
                     }
                 }
-                Ok(_resp) => {
-                    // Non-success status, don't retry (likely 404)
-                    return Ok(None);
+                Ok(resp) => {
+                    // Non-success status - log and return empty (404 means no markets found)
+                    let status = resp.status();
+                    if status.as_u16() != 404 {
+                        tracing::warn!("Gamma batch lookup got status {}", status);
+                    }
+                    return Ok(HashMap::new());
                 }
                 Err(e) => {
                     last_error = Some(format!("Request error: {}", e));
@@ -136,44 +139,52 @@ impl GammaClient {
             }
         }
 
-        // All retries exhausted - return error so callers can distinguish from "not found"
+        // All retries exhausted
         if let Some(err) = last_error {
-            tracing::warn!("Gamma lookup failed after 3 attempts for {}: {}", slug, err);
-            anyhow::bail!("Gamma API failed after 3 retries for {}: {}", slug, err);
+            tracing::warn!("Gamma batch lookup failed after 3 attempts: {}", err);
+            anyhow::bail!("Gamma API batch failed after 3 retries: {}", err);
         }
-        // Should never reach here (last_error is always Some if we get here), but be safe
-        Ok(None)
+        Ok(HashMap::new())
     }
 
-    fn parse_gamma_market_response(&self, markets: Vec<GammaMarket>) -> Result<Option<(String, String, Vec<String>)>> {
-        if markets.is_empty() {
-            return Ok(None);
+    /// Parse batch response into HashMap keyed by slug
+    fn parse_gamma_batch_response(
+        &self,
+        markets: Vec<GammaMarket>,
+    ) -> std::collections::HashMap<String, (String, String, Vec<String>)> {
+        use std::collections::HashMap;
+
+        let mut results = HashMap::new();
+
+        for market in markets {
+            // Skip inactive/closed markets
+            if market.closed == Some(true) || market.active == Some(false) {
+                continue;
+            }
+
+            // Need slug to key the result
+            let Some(slug) = market.slug else {
+                continue;
+            };
+
+            // Parse clobTokenIds JSON array
+            let token_ids: Vec<String> = market.clob_token_ids
+                .as_ref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+
+            // Parse outcomes JSON array
+            let outcomes: Vec<String> = market.outcomes
+                .as_ref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+
+            if token_ids.len() >= 2 {
+                results.insert(slug, (token_ids[0].clone(), token_ids[1].clone(), outcomes));
+            }
         }
 
-        let market = &markets[0];
-
-        // Check if active and not closed
-        if market.closed == Some(true) || market.active == Some(false) {
-            return Ok(None);
-        }
-
-        // Parse clobTokenIds JSON array
-        let token_ids: Vec<String> = market.clob_token_ids
-            .as_ref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-
-        // Parse outcomes JSON array
-        let outcomes: Vec<String> = market.outcomes
-            .as_ref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-
-        if token_ids.len() >= 2 {
-            Ok(Some((token_ids[0].clone(), token_ids[1].clone(), outcomes)))
-        } else {
-            Ok(None)
-        }
+        results
     }
 
     /// Fetch events by Polymarket series ID (for esports discovery)
@@ -196,6 +207,8 @@ impl GammaClient {
 
 #[derive(Debug, Deserialize)]
 struct GammaMarket {
+    /// Market slug, used for matching in batch lookups
+    slug: Option<String>,
     #[serde(rename = "clobTokenIds")]
     clob_token_ids: Option<String>,
     /// JSON array of outcome names, e.g. '["Team A", "Team B"]'
@@ -226,7 +239,7 @@ pub struct PolyEventMarket {
 
 /// Increment the date in a Polymarket slug by 1 day
 /// e.g., "epl-che-avl-2025-12-08" -> "epl-che-avl-2025-12-09"
-fn increment_date_in_slug(slug: &str) -> Option<String> {
+pub fn increment_date_in_slug(slug: &str) -> Option<String> {
     let parts: Vec<&str> = slug.split('-').collect();
     if parts.len() < 6 {
         return None;
@@ -1209,5 +1222,102 @@ mod tests {
         let (_, m1_p_upd) = state.markets[1].load_update_counts();
         assert_eq!(m0_p_upd, 1, "Market 0 should have 1 Poly update from price change");
         assert_eq!(m1_p_upd, 1, "Market 1 should have 1 Poly update from price change");
+    }
+
+    // === Tests for increment_date_in_slug ===
+
+    #[test]
+    fn test_increment_date_in_slug_basic() {
+        use super::increment_date_in_slug;
+
+        // Basic case: mid-month
+        assert_eq!(
+            increment_date_in_slug("epl-che-avl-2025-12-08"),
+            Some("epl-che-avl-2025-12-09".to_string())
+        );
+
+        // NBA style slug
+        assert_eq!(
+            increment_date_in_slug("nba-lal-bos-2026-01-17"),
+            Some("nba-lal-bos-2026-01-18".to_string())
+        );
+    }
+
+    #[test]
+    fn test_increment_date_in_slug_month_rollover() {
+        use super::increment_date_in_slug;
+
+        // End of 31-day month
+        assert_eq!(
+            increment_date_in_slug("nba-lal-bos-2026-01-31"),
+            Some("nba-lal-bos-2026-02-01".to_string())
+        );
+
+        // End of 30-day month
+        assert_eq!(
+            increment_date_in_slug("epl-mun-liv-2026-04-30"),
+            Some("epl-mun-liv-2026-05-01".to_string())
+        );
+    }
+
+    #[test]
+    fn test_increment_date_in_slug_year_rollover() {
+        use super::increment_date_in_slug;
+
+        // End of year
+        assert_eq!(
+            increment_date_in_slug("nfl-dal-phi-2025-12-31"),
+            Some("nfl-dal-phi-2026-01-01".to_string())
+        );
+    }
+
+    #[test]
+    fn test_increment_date_in_slug_february() {
+        use super::increment_date_in_slug;
+
+        // Non-leap year February
+        assert_eq!(
+            increment_date_in_slug("nba-lal-bos-2025-02-28"),
+            Some("nba-lal-bos-2025-03-01".to_string())
+        );
+
+        // Leap year February
+        assert_eq!(
+            increment_date_in_slug("nba-lal-bos-2024-02-28"),
+            Some("nba-lal-bos-2024-02-29".to_string())
+        );
+        assert_eq!(
+            increment_date_in_slug("nba-lal-bos-2024-02-29"),
+            Some("nba-lal-bos-2024-03-01".to_string())
+        );
+    }
+
+    #[test]
+    fn test_increment_date_in_slug_with_suffix() {
+        use super::increment_date_in_slug;
+
+        // Spread market with suffix
+        assert_eq!(
+            increment_date_in_slug("nba-lal-bos-2026-01-17-spread-home-5pt5"),
+            Some("nba-lal-bos-2026-01-18-spread-home-5pt5".to_string())
+        );
+
+        // Total market with suffix
+        assert_eq!(
+            increment_date_in_slug("nba-lal-bos-2026-01-31-total-220pt5"),
+            Some("nba-lal-bos-2026-02-01-total-220pt5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_increment_date_in_slug_invalid() {
+        use super::increment_date_in_slug;
+
+        // Too few parts
+        assert_eq!(increment_date_in_slug("nba-lal-bos"), None);
+        assert_eq!(increment_date_in_slug("invalid"), None);
+
+        // Invalid date parts
+        assert_eq!(increment_date_in_slug("nba-lal-bos-abc-01-17"), None);
     }
 }
