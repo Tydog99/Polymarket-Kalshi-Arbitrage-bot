@@ -2220,18 +2220,14 @@ mod startup_sweep_tests {
             }
             markets_scanned += 1;
 
-            let arb = ArbOpportunity::new(
+            if let Some(req) = FastExecutionRequest::detect(
                 market.market_id,
                 kalshi_data,
                 poly_data,
                 state.arb_config(),
                 0,
-            );
-
-            if arb.is_valid() {
+            ) {
                 arbs_found += 1;
-
-                let req = FastExecutionRequest::from_arb(&arb);
                 tx.try_send(req).unwrap();
             }
         }
