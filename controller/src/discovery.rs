@@ -1452,11 +1452,13 @@ impl DiscoveryClient {
 
         info!("  📊 Built {} Polymarket lookup entries", poly_lookup.len() / 2);
 
-        // Phase 2: Fetch and match Kalshi events
-        let kalshi_events = {
+        // Phase 2: Fetch Kalshi events (for titles) and ALL markets in parallel
+        // This is 2 calls instead of N+1 calls
+        let (kalshi_events, all_markets) = {
             let _permit = self.kalshi_semaphore.acquire().await.ok();
             self.kalshi_limiter.until_ready().await;
-            match self.kalshi.get_events(config.kalshi_series_game, 50).await {
+
+            let events = match self.kalshi.get_events(config.kalshi_series_game, 50).await {
                 Ok(events) => events,
                 Err(e) => {
                     warn!("Failed to fetch Kalshi events for {}: {}", config.league_code, e);
@@ -1465,8 +1467,29 @@ impl DiscoveryClient {
                         ..Default::default()
                     };
                 }
-            }
+            };
+
+            // Wait for rate limit before second call
+            self.kalshi_limiter.until_ready().await;
+
+            let markets = match self.kalshi.get_markets_for_series(config.kalshi_series_game, 200).await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("Failed to fetch Kalshi markets for {}: {}", config.league_code, e);
+                    vec![] // Continue with events only, markets will be empty
+                }
+            };
+
+            (events, markets)
         };
+
+        // Group markets by event_ticker for O(1) lookup
+        let mut markets_by_event: HashMap<String, Vec<KalshiMarket>> = HashMap::new();
+        for market in all_markets {
+            if let Some(ref event_ticker) = market.event_ticker {
+                markets_by_event.entry(event_ticker.clone()).or_default().push(market);
+            }
+        }
 
         let mut pairs = Vec::new();
 
@@ -1480,12 +1503,8 @@ impl DiscoveryClient {
                     let key = format!("{}:{}:{}", date, norm1, norm2);
 
                     if let Some((slug, yes_token, no_token, poly_team1)) = poly_lookup.get(&key) {
-                        // Get Kalshi markets for this event
-                        let markets = {
-                            let _permit = self.kalshi_semaphore.acquire().await.ok();
-                            self.kalshi_limiter.until_ready().await;
-                            self.kalshi.get_markets(&event.event_ticker).await.unwrap_or_default()
-                        };
+                        // Use pre-fetched markets (no API call needed)
+                        let markets = markets_by_event.get(&event.event_ticker).cloned().unwrap_or_default();
 
                         for market in markets {
                             let team_suffix = extract_team_suffix(&market.ticker);
