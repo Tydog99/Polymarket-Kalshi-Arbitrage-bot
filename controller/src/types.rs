@@ -10,7 +10,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 use parking_lot::RwLock;
 
-use crate::arb::ArbConfig;
+use crate::arb::{ArbConfig, kalshi_fee};
 
 // === Market Types ===
 
@@ -245,63 +245,6 @@ impl AtomicMarketState {
             self.poly_updates.load(Ordering::Relaxed),
         )
     }
-
-    #[inline(always)]
-    pub fn check_arbs(&self, threshold_cents: PriceCents) -> u8 {
-        use wide::{i16x8, CmpLt};
-
-        let (k_yes, k_no, _, _) = self.kalshi.load();
-        let (p_yes, p_no, _, _) = self.poly.load();
-
-        if k_yes == NO_PRICE || k_no == NO_PRICE || p_yes == NO_PRICE || p_no == NO_PRICE {
-            return 0;
-        }
-
-        let k_yes_fee = KALSHI_FEE_TABLE[k_yes as usize];
-        let k_no_fee = KALSHI_FEE_TABLE[k_no as usize];
-
-        let costs = i16x8::new([
-            (p_yes + k_no + k_no_fee) as i16,
-            (k_yes + k_yes_fee + p_no) as i16,
-            (p_yes + p_no) as i16,
-            (k_yes + k_yes_fee + k_no + k_no_fee) as i16,
-            i16::MAX, i16::MAX, i16::MAX, i16::MAX,
-        ]);
-
-        let cmp = costs.cmp_lt(i16x8::splat(threshold_cents as i16));
-        let arr = cmp.to_array();
-
-        let mut mask = 0u8;
-        if arr[0] != 0 { mask |= 1; }
-        if arr[1] != 0 { mask |= 2; }
-        if arr[2] != 0 { mask |= 4; }
-        if arr[3] != 0 { mask |= 8; }
-        mask
-    }
-}
-
-/// Precomputed Kalshi trading fee lookup table (101 entries for prices 0-100 cents).
-/// Fee formula: ceil(0.07 × P × (1-P)) in cents, where P is price in cents.
-static KALSHI_FEE_TABLE: [u16; 101] = {
-    let mut table = [0u16; 101];
-    let mut p = 1u32;
-    while p < 100 {
-        // fee = ceil(7 × p × (100-p) / 10000)
-        let numerator = 7 * p * (100 - p) + 9999;
-        table[p as usize] = (numerator / 10000) as u16;
-        p += 1;
-    }
-    table
-};
-
-/// Calculate Kalshi trading fee in cents for a single contract at the given price.
-/// For typical prices (10-90 cents), fees are usually 1-2 cents per contract.
-#[inline(always)]
-pub fn kalshi_fee_cents(price_cents: PriceCents) -> PriceCents {
-    if price_cents > 100 {
-        return 0;
-    }
-    KALSHI_FEE_TABLE[price_cents as usize]
 }
 
 /// Convert f64 price (0.01-0.99) to PriceCents (1-99)
@@ -404,12 +347,12 @@ impl FastExecutionRequest {
     pub fn estimated_fee_cents(&self) -> PriceCents {
         match self.arb_type {
             // Cross-platform: fee on the Kalshi side only
-            ArbType::PolyYesKalshiNo => kalshi_fee_cents(self.no_price),
-            ArbType::KalshiYesPolyNo => kalshi_fee_cents(self.yes_price),
+            ArbType::PolyYesKalshiNo => kalshi_fee(self.no_price),
+            ArbType::KalshiYesPolyNo => kalshi_fee(self.yes_price),
             // Poly-only: no fees
             ArbType::PolyOnly => 0,
             // Kalshi-only: fees on both sides
-            ArbType::KalshiOnly => kalshi_fee_cents(self.yes_price) + kalshi_fee_cents(self.no_price),
+            ArbType::KalshiOnly => kalshi_fee(self.yes_price) + kalshi_fee(self.no_price),
         }
     }
 }
@@ -716,56 +659,6 @@ mod tests {
     }
 
     // =========================================================================
-    // kalshi_fee_cents Tests - Integer fee calculation
-    // =========================================================================
-
-    #[test]
-    fn test_kalshi_fee_cents_formula() {
-        // fee = ceil(7 × P × (100-P) / 10000) cents
-
-        // At 50 cents: ceil(7 * 50 * 50 / 10000) = ceil(1.75) = 2
-        assert_eq!(kalshi_fee_cents(50), 2);
-
-        // At 10 cents: ceil(7 * 10 * 90 / 10000) = ceil(0.63) = 1
-        assert_eq!(kalshi_fee_cents(10), 1);
-
-        // At 90 cents: ceil(7 * 90 * 10 / 10000) = ceil(0.63) = 1
-        assert_eq!(kalshi_fee_cents(90), 1);
-
-        // At 1 cent: ceil(7 * 1 * 99 / 10000) = ceil(0.0693) = 1
-        assert_eq!(kalshi_fee_cents(1), 1);
-
-        // At 99 cents: ceil(7 * 99 * 1 / 10000) = ceil(0.0693) = 1
-        assert_eq!(kalshi_fee_cents(99), 1);
-    }
-
-    #[test]
-    fn test_kalshi_fee_cents_edge_cases() {
-        // 0 and 100 should have no fee
-        assert_eq!(kalshi_fee_cents(0), 0);
-        assert_eq!(kalshi_fee_cents(100), 0);
-
-        // Values > 100 should also return 0
-        assert_eq!(kalshi_fee_cents(150), 0);
-    }
-
-    #[test]
-    fn test_kalshi_fee_cents_matches_float_formula() {
-        // Verify integer formula matches float formula for all valid prices
-        for price_cents in 1..100u16 {
-            let p = price_cents as f64 / 100.0;
-            let float_fee = (0.07 * p * (1.0 - p) * 100.0).ceil() as u16;
-            let int_fee = kalshi_fee_cents(price_cents);
-
-            // Allow 1 cent difference due to rounding differences
-            assert!(
-                (int_fee as i16 - float_fee as i16).abs() <= 1,
-                "Fee mismatch at {}¢: int={}, float={}", price_cents, int_fee, float_fee
-            );
-        }
-    }
-
-    // =========================================================================
     // Price Conversion Tests
     // =========================================================================
 
@@ -804,122 +697,6 @@ mod tests {
         // Invalid input
         assert_eq!(parse_price("invalid"), 0);
         assert_eq!(parse_price(""), 0);
-    }
-
-    // =========================================================================
-    // check_arbs Tests
-    // =========================================================================
-
-    fn make_market_state(
-        kalshi_yes: PriceCents,
-        kalshi_no: PriceCents,
-        poly_yes: PriceCents,
-        poly_no: PriceCents,
-    ) -> AtomicMarketState {
-        let state = AtomicMarketState::new(0);
-        state.kalshi.store(kalshi_yes, kalshi_no, 1000, 1000);
-        state.poly.store(poly_yes, poly_no, 1000, 1000);
-        state
-    }
-
-    #[test]
-    fn test_check_arbs_poly_yes_kalshi_no() {
-        // Poly YES 40¢ + Kalshi NO 50¢ = 90¢ raw
-        // Kalshi fee on 50¢ = 2¢
-        // Effective = 92¢ → ARB (< 100¢ threshold)
-        let state = make_market_state(55, 50, 40, 65);
-
-        // threshold_cents is in cents, so 100 = $1.00
-        let mask = state.check_arbs(100);
-
-        assert!(mask & 1 != 0, "Should detect Poly YES + Kalshi NO arb (bit 0)");
-    }
-
-    #[test]
-    fn test_check_arbs_kalshi_yes_poly_no() {
-        // Kalshi YES 40¢ + Poly NO 50¢ = 90¢ raw
-        // Kalshi fee on 40¢ = 2¢
-        // Effective = 92¢ → ARB
-        let state = make_market_state(40, 65, 55, 50);
-
-        let mask = state.check_arbs(100);
-
-        assert!(mask & 2 != 0, "Should detect Kalshi YES + Poly NO arb (bit 1)");
-    }
-
-    #[test]
-    fn test_check_arbs_poly_only() {
-        // Poly YES 48¢ + Poly NO 50¢ = 98¢ → ARB (no fees!)
-        let state = make_market_state(60, 60, 48, 50);
-
-        let mask = state.check_arbs(100);
-
-        assert!(mask & 4 != 0, "Should detect Poly-only arb (bit 2)");
-    }
-
-    #[test]
-    fn test_check_arbs_kalshi_only() {
-        // Kalshi YES 44¢ + Kalshi NO 44¢ = 88¢ raw
-        // Double fee: 2¢ + 2¢ = 4¢
-        // Effective = 92¢ → ARB
-        let state = make_market_state(44, 44, 60, 60);
-
-        let mask = state.check_arbs(100);
-
-        assert!(mask & 8 != 0, "Should detect Kalshi-only arb (bit 3)");
-    }
-
-    #[test]
-    fn test_check_arbs_no_arbs() {
-        // All prices efficient - no arbs
-        // Cross: 55 + 55 + 2 fee = 112 > 100
-        // Cross: 52 + 52 + 2 fee = 106 > 100
-        // Poly: 52 + 52 = 104 > 100
-        // Kalshi: 55 + 55 + 4 fee = 114 > 100
-        let state = make_market_state(55, 55, 52, 52);
-
-        let mask = state.check_arbs(100);
-
-        assert_eq!(mask, 0, "Should detect no arbs in efficient market");
-    }
-
-    #[test]
-    fn test_check_arbs_missing_prices() {
-        // Missing price should return no arbs
-        let state = make_market_state(50, NO_PRICE, 50, 50);
-
-        let mask = state.check_arbs(100);
-
-        assert_eq!(mask, 0, "Should return 0 when any price is missing");
-    }
-
-    #[test]
-    fn test_check_arbs_fees_eliminate_marginal() {
-        // Poly YES 49¢ + Kalshi NO 50¢ = 99¢ raw
-        // Kalshi fee on 50¢ = 2¢
-        // Effective = 101¢ → NO ARB (> 100¢ threshold)
-        let state = make_market_state(55, 50, 49, 55);
-
-        let mask = state.check_arbs(100);
-
-        // Bit 0 should NOT be set (Poly YES + Kalshi NO = 101¢ > 100¢)
-        assert!(mask & 1 == 0, "Fees should eliminate marginal arb");
-    }
-
-    #[test]
-    fn test_check_arbs_multiple_arbs() {
-        // Scenario where multiple arbs exist
-        // Kalshi: YES=40, NO=40 (sum=80+4fee=84)
-        // Poly: YES=40, NO=40 (sum=80, no fees)
-        let state = make_market_state(40, 40, 40, 40);
-
-        let mask = state.check_arbs(100);
-
-        // Should detect all 4 combinations
-        assert!(mask & 1 != 0, "Should detect Poly YES + Kalshi NO");
-        assert!(mask & 2 != 0, "Should detect Kalshi YES + Poly NO");
-        assert!(mask & 4 != 0, "Should detect Poly-only");
-        assert!(mask & 8 != 0, "Should detect Kalshi-only");
     }
 
     // =========================================================================
@@ -1117,7 +894,7 @@ mod tests {
         };
 
         assert_eq!(req.profit_cents(), 12);
-        assert_eq!(req.estimated_fee_cents(), kalshi_fee_cents(40) + kalshi_fee_cents(44));
+        assert_eq!(req.estimated_fee_cents(), kalshi_fee(40) + kalshi_fee(44));
     }
 
     #[test]
@@ -1150,7 +927,7 @@ mod tests {
             detected_ns: 0,
             is_test: false,
         };
-        assert_eq!(req1.estimated_fee_cents(), kalshi_fee_cents(50));
+        assert_eq!(req1.estimated_fee_cents(), kalshi_fee(50));
 
         // KalshiYesPolyNo → fee on Kalshi YES
         let req2 = FastExecutionRequest {
@@ -1163,7 +940,7 @@ mod tests {
             detected_ns: 0,
             is_test: false,
         };
-        assert_eq!(req2.estimated_fee_cents(), kalshi_fee_cents(40));
+        assert_eq!(req2.estimated_fee_cents(), kalshi_fee(40));
 
         // PolyOnly → no fees
         let req3 = FastExecutionRequest {
@@ -1189,7 +966,7 @@ mod tests {
             detected_ns: 0,
             is_test: false,
         };
-        assert_eq!(req4.estimated_fee_cents(), kalshi_fee_cents(40) + kalshi_fee_cents(50));
+        assert_eq!(req4.estimated_fee_cents(), kalshi_fee(40) + kalshi_fee(50));
     }
 
     // =========================================================================
@@ -1253,16 +1030,25 @@ mod tests {
             state.markets[id as usize].poly.store(40, 65, 700, 800);
         }
 
-        // 3. Check for arbs (threshold = 100 cents = $1.00)
+        // 3. Check for arbs using ArbOpportunity
         let market = state.get_by_id(market_id).unwrap();
-        let arb_mask = market.check_arbs(100);
+        let kalshi_data = market.kalshi.load();
+        let poly_data = market.poly.load();
+        let arb = crate::arb::ArbOpportunity::new(
+            market_id,
+            kalshi_data,
+            poly_data,
+            state.arb_config(),
+            0,
+        );
 
         // 4. Verify arb detected
-        assert!(arb_mask & 1 != 0, "Should detect Poly YES + Kalshi NO arb");
+        assert!(arb.is_valid(), "Should detect arb opportunity");
+        assert_eq!(arb.arb_type(), Some(ArbType::PolyYesKalshiNo), "Should detect Poly YES + Kalshi NO arb");
 
         // 5. Build execution request
-        let (p_yes, _, p_yes_sz, _) = market.poly.load();
-        let (_, k_no, _, k_no_sz) = market.kalshi.load();
+        let (p_yes, _, p_yes_sz, _) = poly_data;
+        let (_, k_no, _, k_no_sz) = kalshi_data;
 
         let req = FastExecutionRequest {
             market_id,
@@ -1301,8 +1087,16 @@ mod tests {
                         market.poly.update_no(50 + ((j % 10) as u16), 600 + j as u16);
                     }
 
-                    // Check arbs (should never panic) - threshold = 100 cents
-                    let _ = market.check_arbs(100);
+                    // Check arbs using ArbOpportunity (should never panic)
+                    let kalshi_data = market.kalshi.load();
+                    let poly_data = market.poly.load();
+                    let _ = crate::arb::ArbOpportunity::new(
+                        market.market_id,
+                        kalshi_data,
+                        poly_data,
+                        state.arb_config(),
+                        0,
+                    );
                 }
             })
         }).collect();

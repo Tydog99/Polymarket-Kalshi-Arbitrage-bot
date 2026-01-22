@@ -1280,7 +1280,7 @@ async fn main() -> Result<()> {
     let heartbeat_tui_state = tui_state.clone();
     let heartbeat_log_tx = tui_log_tx.clone();
     let heartbeat_handle = tokio::spawn(async move {
-        use crate::types::kalshi_fee_cents;
+        use crate::arb::kalshi_fee;
         use std::collections::HashMap;
 
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
@@ -1368,9 +1368,9 @@ async fn main() -> Result<()> {
                     if verbose {
                         // Calculate gap and sizes only if both platforms have prices
                         let (gap, yes_size, no_size) = if has_k && has_p {
-                            let fee1 = kalshi_fee_cents(k_no);
+                            let fee1 = kalshi_fee(k_no);
                             let cost1 = p_yes + k_no + fee1;
-                            let fee2 = kalshi_fee_cents(k_yes);
+                            let fee2 = kalshi_fee(k_yes);
                             let cost2 = k_yes + fee2 + p_no;
                             // Determine which arb type is better and use those sizes
                             if cost1 <= cost2 {
@@ -1406,10 +1406,10 @@ async fn main() -> Result<()> {
                 if has_k && has_p {
                     with_both += 1;
 
-                    let fee1 = kalshi_fee_cents(k_no);
+                    let fee1 = kalshi_fee(k_no);
                     let cost1 = p_yes + k_no + fee1;
 
-                    let fee2 = kalshi_fee_cents(k_yes);
+                    let fee2 = kalshi_fee(k_yes);
                     let cost2 = k_yes + fee2 + p_no;
 
                     let (best_cost, best_fee, is_poly_yes, yes_size, no_size) = if cost1 <= cost2 {
