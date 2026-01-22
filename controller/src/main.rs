@@ -1193,6 +1193,8 @@ async fn main() -> Result<()> {
     let kalshi_ws_config = KalshiConfig::from_env()?;
     let kalshi_shutdown_rx = shutdown_rx.clone();
     let kalshi_clock = clock.clone();
+    let kalshi_tui_state = tui_state.clone();
+    let kalshi_log_tx = tui_log_tx.clone();
     let kalshi_handle = tokio::spawn(async move {
         loop {
             let shutdown_rx = kalshi_shutdown_rx.clone();
@@ -1204,10 +1206,18 @@ async fn main() -> Result<()> {
                 kalshi_threshold,
                 shutdown_rx,
                 kalshi_clock.clone(),
+                kalshi_tui_state.clone(),
+                kalshi_log_tx.clone(),
             )
             .await
             {
-                error!("[KALSHI] WebSocket disconnected: {} - reconnecting...", e);
+                let tui_active = kalshi_tui_state.read().await.active;
+                if tui_active {
+                    let _ = kalshi_log_tx.try_send(format!("[{}] ERROR [KALSHI] WebSocket disconnected: {} - reconnecting...",
+                        chrono::Local::now().format("%H:%M:%S"), e));
+                } else {
+                    error!("[KALSHI] WebSocket disconnected: {} - reconnecting...", e);
+                }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
         }
@@ -1220,6 +1230,8 @@ async fn main() -> Result<()> {
     let poly_threshold = threshold_cents;
     let poly_shutdown_rx = shutdown_rx.clone();
     let poly_clock = clock.clone();
+    let poly_tui_state = tui_state.clone();
+    let poly_log_tx = tui_log_tx.clone();
     let poly_handle = tokio::spawn(async move {
         loop {
             let shutdown_rx = poly_shutdown_rx.clone();
@@ -1230,10 +1242,18 @@ async fn main() -> Result<()> {
                 poly_threshold,
                 shutdown_rx,
                 poly_clock.clone(),
+                poly_tui_state.clone(),
+                poly_log_tx.clone(),
             )
             .await
             {
-                error!("[POLYMARKET] WebSocket disconnected: {} - reconnecting...", e);
+                let tui_active = poly_tui_state.read().await.active;
+                if tui_active {
+                    let _ = poly_log_tx.try_send(format!("[{}] ERROR [POLYMARKET] WebSocket disconnected: {} - reconnecting...",
+                        chrono::Local::now().format("%H:%M:%S"), e));
+                } else {
+                    error!("[POLYMARKET] WebSocket disconnected: {} - reconnecting...", e);
+                }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
         }

@@ -464,14 +464,40 @@ pub async fn run_ws(
     threshold_cents: PriceCents,
     mut shutdown_rx: watch::Receiver<bool>,
     clock: Arc<NanoClock>,
+    tui_state: Arc<tokio::sync::RwLock<crate::confirm_tui::TuiState>>,
+    log_tx: mpsc::Sender<String>,
 ) -> Result<()> {
+    // Helper to route logs based on TUI state
+    let log_info = |msg: &str, tui_active: bool| {
+        if tui_active {
+            let _ = log_tx.try_send(format!("[{}]  INFO {}", chrono::Local::now().format("%H:%M:%S"), msg));
+        } else {
+            info!("{}", msg);
+        }
+    };
+    let log_warn = |msg: &str, tui_active: bool| {
+        if tui_active {
+            let _ = log_tx.try_send(format!("[{}]  WARN {}", chrono::Local::now().format("%H:%M:%S"), msg));
+        } else {
+            tracing::warn!("{}", msg);
+        }
+    };
+    let log_error = |msg: &str, tui_active: bool| {
+        if tui_active {
+            let _ = log_tx.try_send(format!("[{}] ERROR {}", chrono::Local::now().format("%H:%M:%S"), msg));
+        } else {
+            error!("{}", msg);
+        }
+    };
+
     let tickers: Vec<String> = state.markets.iter()
         .take(state.market_count())
         .filter_map(|m| m.pair().map(|p| p.kalshi_market_ticker.to_string()))
         .collect();
 
+    let tui_active = tui_state.read().await.active;
     if tickers.is_empty() {
-        info!("[KALSHI] No markets to monitor");
+        log_info("[KALSHI] No markets to monitor", tui_active);
         tokio::time::sleep(Duration::from_secs(u64::MAX)).await;
         return Ok(());
     }
@@ -496,7 +522,8 @@ pub async fn run_ws(
         .body(())?;
 
     let (ws_stream, _) = connect_async(request).await.context("Failed to connect to Kalshi")?;
-    info!("[KALSHI] Connected");
+    let tui_active = tui_state.read().await.active;
+    log_info("[KALSHI] Connected", tui_active);
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -511,7 +538,8 @@ pub async fn run_ws(
     };
 
     write.send(Message::Text(serde_json::to_string(&subscribe_msg)?)).await?;
-    info!("[KALSHI] Subscribed to {} markets", tickers.len());
+    let tui_active = tui_state.read().await.active;
+    log_info(&format!("[KALSHI] Subscribed to {} markets", tickers.len()), tui_active);
 
     loop {
         tokio::select! {
@@ -520,7 +548,8 @@ pub async fn run_ws(
             // Check shutdown signal first
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
-                    info!("[KALSHI] Shutdown signal received, disconnecting...");
+                    let tui_active = tui_state.read().await.active;
+                    log_info("[KALSHI] Shutdown signal received, disconnecting...", tui_active);
                     break;
                 }
             }
@@ -582,11 +611,13 @@ pub async fn run_ws(
                     }
                     Some(Ok(Message::Ping(data))) => {
                         if let Err(e) = write.send(Message::Pong(data)).await {
-                            tracing::warn!("[KALSHI] Failed to send pong: {} (connection may be degraded)", e);
+                            let tui_active = tui_state.read().await.active;
+                            log_warn(&format!("[KALSHI] Failed to send pong: {} (connection may be degraded)", e), tui_active);
                         }
                     }
                     Some(Err(e)) => {
-                        error!("[KALSHI] WebSocket error: {}", e);
+                        let tui_active = tui_state.read().await.active;
+                        log_error(&format!("[KALSHI] WebSocket error: {}", e), tui_active);
                         break;
                     }
                     None => {
