@@ -13,7 +13,6 @@ use tokio::time::{interval, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
-use crate::arb::ArbOpportunity;
 use crate::config::{self, POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS, GAMMA_API_BASE, POLY_MAX_TOKENS_PER_WS};
 use crate::execution::NanoClock;
 use crate::types::{
@@ -560,16 +559,15 @@ async fn process_book(
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
 
-        // Check arbs using ArbOpportunity
-        let arb = ArbOpportunity::new(
+        // Check arbs using FastExecutionRequest::detect()
+        if let Some(req) = FastExecutionRequest::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
             state.arb_config(),
             clock.now_ns(),
-        );
-        if arb.is_valid() {
-            route_arb_to_channel(state, market_id, &arb, exec_tx, confirm_tx).await;
+        ) {
+            route_arb_to_channel(state, market_id, req, exec_tx, confirm_tx).await;
         }
         matched = true;
     }
@@ -592,16 +590,15 @@ async fn process_book(
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
 
-        // Check arbs using ArbOpportunity
-        let arb = ArbOpportunity::new(
+        // Check arbs using FastExecutionRequest::detect()
+        if let Some(req) = FastExecutionRequest::detect(
             market_id,
             market.kalshi.load(),
             market.poly.load(),
             state.arb_config(),
             clock.now_ns(),
-        );
-        if arb.is_valid() {
-            route_arb_to_channel(state, market_id, &arb, exec_tx, confirm_tx).await;
+        ) {
+            route_arb_to_channel(state, market_id, req, exec_tx, confirm_tx).await;
         }
         matched = true;
     }
@@ -658,15 +655,14 @@ async fn process_price_change(
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_yes || current_yes == 0 {
-            let arb = ArbOpportunity::new(
+            if let Some(req) = FastExecutionRequest::detect(
                 market_id,
                 market.kalshi.load(),
                 market.poly.load(),
                 state.arb_config(),
                 clock.now_ns(),
-            );
-            if arb.is_valid() {
-                route_arb_to_channel(state, market_id, &arb, exec_tx, confirm_tx).await;
+            ) {
+                route_arb_to_channel(state, market_id, req, exec_tx, confirm_tx).await;
             }
         }
     }
@@ -688,15 +684,14 @@ async fn process_price_change(
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_no || current_no == 0 {
-            let arb = ArbOpportunity::new(
+            if let Some(req) = FastExecutionRequest::detect(
                 market_id,
                 market.kalshi.load(),
                 market.poly.load(),
                 state.arb_config(),
                 clock.now_ns(),
-            );
-            if arb.is_valid() {
-                route_arb_to_channel(state, market_id, &arb, exec_tx, confirm_tx).await;
+            ) {
+                route_arb_to_channel(state, market_id, req, exec_tx, confirm_tx).await;
             }
         }
     }
@@ -709,12 +704,10 @@ async fn process_price_change(
 async fn route_arb_to_channel(
     state: &GlobalState,
     market_id: u16,
-    arb: &ArbOpportunity,
+    req: FastExecutionRequest,
     exec_tx: &mpsc::Sender<FastExecutionRequest>,
     confirm_tx: &mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
 ) {
-    let req = FastExecutionRequest::from_arb(arb);
-
     // Get market pair to check if confirmation is required
     let pair = match state.get_by_id(market_id).and_then(|m| m.pair()) {
         Some(p) => p,
