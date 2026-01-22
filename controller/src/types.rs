@@ -378,6 +378,23 @@ pub struct FastExecutionRequest {
 }
 
 impl FastExecutionRequest {
+    /// Create from an ArbOpportunity (must be valid).
+    ///
+    /// # Panics
+    /// Panics if `arb.arb_type()` returns None (i.e., arb is not valid).
+    pub fn from_arb(arb: &crate::arb::ArbOpportunity) -> Self {
+        Self {
+            market_id: arb.market_id(),
+            yes_price: arb.yes_price(),
+            no_price: arb.no_price(),
+            yes_size: arb.yes_size(),
+            no_size: arb.no_size(),
+            arb_type: arb.arb_type().expect("from_arb called on invalid arb"),
+            detected_ns: arb.detected_ns(),
+            is_test: false,
+        }
+    }
+
     #[inline(always)]
     pub fn profit_cents(&self) -> i16 {
         100 - (self.yes_price as i16 + self.no_price as i16 + self.estimated_fee_cents() as i16)
