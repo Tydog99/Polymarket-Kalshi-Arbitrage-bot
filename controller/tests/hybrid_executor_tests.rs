@@ -50,7 +50,7 @@ fn cb_disabled() -> Arc<CircuitBreaker> {
 }
 
 fn make_state_with_pair(pair: MarketPair) -> Arc<GlobalState> {
-    let state = Arc::new(GlobalState::new());
+    let state = Arc::new(GlobalState::default());
     let id = state.add_pair(pair).expect("add_pair");
     assert_eq!(id, 0);
     state

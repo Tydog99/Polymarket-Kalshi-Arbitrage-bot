@@ -464,7 +464,7 @@ mod infra_integration_tests {
         poly_yes: PriceCents,
         poly_no: PriceCents,
     ) -> (GlobalState, u16) {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         let pair = MarketPair {
             pair_id: "arb-test-market".into(),
@@ -679,7 +679,7 @@ mod infra_integration_tests {
     /// Test: GlobalState handles multiple markets
     #[test]
     fn test_multiple_markets() {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         // Add 5 markets
         for i in 0..5 {
@@ -2108,7 +2108,7 @@ mod startup_sweep_tests {
 
     /// Helper: Create a GlobalState with multiple markets, some with arbs
     fn setup_markets_for_sweep() -> Arc<GlobalState> {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         // Market 0: Has arb (Poly YES 40 + Kalshi NO 50 + fee 2 = 92)
         let id0 = state.add_pair(make_pair("0")).unwrap();
@@ -2213,7 +2213,7 @@ mod startup_sweep_tests {
     /// Test: Startup sweep skips markets with incomplete prices
     #[tokio::test]
     async fn test_startup_sweep_skips_incomplete_markets() {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         // Market with only Kalshi prices
         let id = state.add_pair(make_pair("inc")).unwrap();
@@ -2234,7 +2234,7 @@ mod startup_sweep_tests {
     /// Test: Startup sweep handles zero arb opportunities gracefully
     #[tokio::test]
     async fn test_startup_sweep_no_arbs() {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         // Market with no arb (prices too high)
         let id = state.add_pair(make_pair("no-arb")).unwrap();
@@ -2269,7 +2269,7 @@ mod startup_sweep_tests {
     /// Test: Startup sweep correctly prioritizes cross-platform arbs
     #[tokio::test]
     async fn test_startup_sweep_arb_type_priority() {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         // Market with multiple arb types possible (cross-platform should win)
         let id = state.add_pair(make_pair("multi")).unwrap();

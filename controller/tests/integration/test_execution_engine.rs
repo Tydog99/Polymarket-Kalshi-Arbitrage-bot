@@ -112,7 +112,7 @@ fn create_test_engine(
     mock_poly: Arc<dyn PolyExecutor>,
 ) -> (ExecutionEngine, mpsc::UnboundedReceiver<FillRecord>) {
     let kalshi = Arc::new(create_test_kalshi_client(kalshi_server));
-    let state = Arc::new(GlobalState::new());
+    let state = Arc::new(GlobalState::default());
     let circuit_breaker = Arc::new(create_disabled_circuit_breaker());
     let (position_channel, fill_rx) = create_position_channel();
     let clock = Arc::new(NanoClock::new());

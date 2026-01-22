@@ -10,6 +10,8 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 use parking_lot::RwLock;
 
+use crate::arb::ArbConfig;
+
 // === Market Types ===
 
 /// Market category for a matched trading pair
@@ -412,10 +414,13 @@ pub struct GlobalState {
 
     /// O(1) lookup map: pre-hashed Polymarket NO token → market_id (RwLock for runtime updates)
     pub poly_no_to_id: RwLock<FxHashMap<u64, u16>>,
+
+    /// Arbitrage detection configuration
+    arb_config: ArbConfig,
 }
 
 impl GlobalState {
-    pub fn new() -> Self {
+    pub fn new(arb_config: ArbConfig) -> Self {
         // Allocate market slots
         let markets: Vec<AtomicMarketState> = (0..MAX_MARKETS)
             .map(|i| AtomicMarketState::new(i as u16))
@@ -427,7 +432,13 @@ impl GlobalState {
             kalshi_to_id: RwLock::new(FxHashMap::default()),
             poly_yes_to_id: RwLock::new(FxHashMap::default()),
             poly_no_to_id: RwLock::new(FxHashMap::default()),
+            arb_config,
         }
+    }
+
+    /// Returns a reference to the arbitrage configuration.
+    pub fn arb_config(&self) -> &ArbConfig {
+        &self.arb_config
     }
 
     /// Add a market pair, returns market_id.
@@ -529,7 +540,7 @@ impl GlobalState {
 
 impl Default for GlobalState {
     fn default() -> Self {
-        Self::new()
+        Self::new(ArbConfig::default())
     }
 }
 
@@ -917,7 +928,7 @@ mod tests {
 
     #[test]
     fn test_global_state_add_pair() {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         let pair = make_test_pair("001");
         let kalshi_ticker = pair.kalshi_market_ticker.clone();
@@ -941,7 +952,7 @@ mod tests {
 
     #[test]
     fn test_global_state_lookups() {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         let pair = make_test_pair("002");
         let kalshi_ticker = pair.kalshi_market_ticker.clone();
@@ -970,7 +981,7 @@ mod tests {
 
     #[test]
     fn test_global_state_multiple_markets() {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         // Add multiple markets
         for i in 0..10 {
@@ -990,7 +1001,7 @@ mod tests {
 
     #[test]
     fn test_global_state_update_prices() {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         let pair = make_test_pair("003");
         let id = state.add_pair(pair).unwrap();
@@ -1189,7 +1200,7 @@ mod tests {
     #[test]
     fn test_full_arb_flow() {
         // Simulate the full flow: add market, update prices, detect arb
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         // 1. Add market during discovery
         let pair = MarketPair {
@@ -1292,6 +1303,41 @@ mod tests {
         assert!(k_no > 0 && k_no < 100);
         assert!(p_yes > 0 && p_yes < 100);
         assert!(p_no > 0 && p_no < 100);
+    }
+
+    // =========================================================================
+    // GlobalState ArbConfig Integration Tests
+    // =========================================================================
+
+    #[test]
+    fn test_global_state_has_arb_config() {
+        use crate::arb::ArbConfig;
+
+        // Create GlobalState with default ArbConfig
+        let config = ArbConfig::default();
+        let state = GlobalState::new(config);
+
+        // Verify arb_config() returns the correct threshold
+        assert_eq!(state.arb_config().threshold_cents, 99);
+        assert_eq!(state.arb_config().min_contracts, 1.0);
+    }
+
+    #[test]
+    fn test_global_state_arb_config_custom_threshold() {
+        use crate::arb::ArbConfig;
+
+        // Create GlobalState with custom ArbConfig
+        let config = ArbConfig {
+            threshold_cents: 95,
+            min_contracts: 5.0,
+            kalshi_fee_rate: 0.07,
+            poly_fee_rate: 0.0,
+        };
+        let state = GlobalState::new(config);
+
+        // Verify arb_config() returns the custom values
+        assert_eq!(state.arb_config().threshold_cents, 95);
+        assert_eq!(state.arb_config().min_contracts, 5.0);
     }
 }
 

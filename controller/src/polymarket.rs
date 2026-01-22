@@ -778,7 +778,7 @@ mod tests {
     ///   - YES for Market 2 (Thieves winning)
     ///   - NO for Market 1 (OpTic losing)
     fn create_esports_state_with_shared_tokens() -> (GlobalState, String, String) {
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         // Real token IDs from production logs (truncated for readability in tests)
         let token_optic = "43216923243873086858".to_string();  // OpTic Texas wins
@@ -979,7 +979,7 @@ mod tests {
         // With the bug, only YES matches were logged, NO matches never happened.
         // After fix, both YES and NO matches should occur for each book snapshot.
 
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         // Exact token IDs from production
         let token_a = "43216923243873086858".to_string();
@@ -1059,7 +1059,7 @@ mod tests {
     fn test_standard_market_single_token_per_role() {
         // Standard sports markets (NBA, NFL, etc.) don't have shared tokens.
         // Each market has unique YES/NO tokens. Verify this still works.
-        let state = GlobalState::new();
+        let state = GlobalState::default();
 
         let pair = MarketPair {
             pair_id: "nba-lal-bos".into(),
