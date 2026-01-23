@@ -25,6 +25,9 @@ FORCE_DISCOVERY=1 dotenvx run -- cargo run --release
 
 # Test mode with synthetic arbitrage
 TEST_ARB=1 TEST_ARB_TYPE=poly_yes_kalshi_no dotenvx run -- cargo run --release
+
+# Single-event mode (monitor only one Kalshi event)
+dotenvx run -- cargo run --release -- --kalshi-ticker KXNBAGAME-26JAN24MIAUTA
 ```
 
 ## Architecture Overview

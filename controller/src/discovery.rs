@@ -231,6 +231,103 @@ impl DiscoveryClient {
         result
     }
 
+    /// Discover markets by Kalshi event ticker
+    ///
+    /// Takes an event ticker (e.g., `KXNBAGAME-26JAN24MIAUTA`) and returns all
+    /// matched market pairs for that event.
+    ///
+    /// This bypasses normal discovery and directly fetches/matches specific markets.
+    /// Useful for debugging or monitoring a specific event.
+    pub async fn discover_single_ticker(&self, event_ticker: &str) -> Result<Vec<MarketPair>> {
+        info!("🎯 Event discovery for: {}", event_ticker);
+
+        // Step 1: Determine league and market type from ticker prefix
+        let (config, market_type) = infer_league_and_type_from_ticker(event_ticker)
+            .ok_or_else(|| anyhow::anyhow!("Could not determine league from ticker: {}", event_ticker))?;
+
+        info!("   League: {}, Type: {:?}", config.league_code, market_type);
+
+        // Step 2: Fetch all markets for this event
+        let markets = self.kalshi.get_markets_for_event(event_ticker).await?;
+
+        if markets.is_empty() {
+            anyhow::bail!("No markets found for event: {}", event_ticker);
+        }
+
+        info!("   Found {} Kalshi market(s)", markets.len());
+
+        // Step 3: Parse the event ticker to get date and teams
+        let parsed = parse_kalshi_event_ticker(event_ticker)
+            .ok_or_else(|| anyhow::anyhow!("Could not parse event ticker: {}", event_ticker))?;
+        info!("   Parsed: date={}, team1={}, team2={}", parsed.date, parsed.team1, parsed.team2);
+
+        // Step 4: Build Polymarket slugs and look them up
+        let mut slugs_to_lookup: Vec<(String, &KalshiMarket)> = Vec::new();
+
+        for market in &markets {
+            let poly_slug = self.build_poly_slug(
+                config.poly_prefix,
+                &parsed,
+                market_type,
+                market,
+                config.has_draws(),
+                config.home_team_first,
+            );
+            slugs_to_lookup.push((poly_slug, market));
+        }
+
+        // Batch lookup all slugs
+        let slug_list: Vec<String> = slugs_to_lookup.iter().map(|(s, _)| s.clone()).collect();
+        info!("   Looking up {} Polymarket slug(s)...", slug_list.len());
+        let results = self.gamma.lookup_markets_batch(&slug_list).await?;
+
+        // Step 5: Build MarketPairs for successful matches
+        let mut pairs = Vec::new();
+        for (poly_slug, market) in slugs_to_lookup {
+            if let Some((yes_token, no_token, _)) = results.get(&poly_slug) {
+                info!("   ✅ Matched: {} -> {}", market.ticker, poly_slug);
+
+                let desc = if market_type == MarketType::Moneyline {
+                    if let Some(ref sub) = market.yes_sub_title {
+                        format!("{} ({})", market.title.replace(" Winner?", "").replace(" Winner", ""), sub)
+                    } else {
+                        market.title.clone()
+                    }
+                } else if let Some(line) = market.floor_strike {
+                    format!("{} {}", market.title, line)
+                } else {
+                    market.title.clone()
+                };
+
+                let team_suffix = extract_team_suffix(&market.ticker);
+
+                pairs.push(MarketPair {
+                    pair_id: format!("{}-{}", poly_slug, market.ticker).into(),
+                    league: config.league_code.into(),
+                    market_type,
+                    description: desc.into(),
+                    kalshi_event_ticker: event_ticker.to_string().into(),
+                    kalshi_market_ticker: market.ticker.clone().into(),
+                    kalshi_event_slug: config.kalshi_web_slug.into(),
+                    poly_slug: poly_slug.into(),
+                    poly_yes_token: yes_token.clone().into(),
+                    poly_no_token: no_token.clone().into(),
+                    line_value: market.floor_strike,
+                    team_suffix: team_suffix.map(|s| s.into()),
+                });
+            } else {
+                info!("   ❌ No match: {} -> {}", market.ticker, poly_slug);
+            }
+        }
+
+        if pairs.is_empty() {
+            anyhow::bail!("No Polymarket matches found for event: {}", event_ticker);
+        }
+
+        info!("✅ Event discovery complete: {} pair(s) matched", pairs.len());
+        Ok(pairs)
+    }
+
     /// Full discovery without cache
     async fn discover_full(&self, leagues: &[&str], market_type_filter: Option<MarketType>) -> DiscoveryResult {
         let configs: Vec<_> = if leagues.is_empty() {
@@ -1602,6 +1699,40 @@ impl DiscoveryClient {
 }
 
 // === Helpers ===
+
+/// Infer league config and market type from a Kalshi market ticker
+///
+/// Examples:
+/// - "KXNBASPREAD-26JAN17WASDEN-DEN12" -> (nba config, Spread)
+/// - "KXEPLGAME-25DEC27CFCAVL-CFC" -> (epl config, Moneyline)
+fn infer_league_and_type_from_ticker(ticker: &str) -> Option<(LeagueConfig, MarketType)> {
+    let upper = ticker.to_uppercase();
+
+    for config in get_league_configs() {
+        // Check each series type in order of specificity
+        if let Some(series) = config.kalshi_series_btts {
+            if upper.starts_with(series) {
+                return Some((config, MarketType::Btts));
+            }
+        }
+        if let Some(series) = config.kalshi_series_total {
+            if upper.starts_with(series) {
+                return Some((config, MarketType::Total));
+            }
+        }
+        if let Some(series) = config.kalshi_series_spread {
+            if upper.starts_with(series) {
+                return Some((config, MarketType::Spread));
+            }
+        }
+        // Check game/moneyline last (it's the base prefix that others might share)
+        if upper.starts_with(config.kalshi_series_game) {
+            return Some((config, MarketType::Moneyline));
+        }
+    }
+
+    None
+}
 
 /// Filter market pairs by enabled leagues
 /// If leagues is empty, returns all pairs (no filtering)

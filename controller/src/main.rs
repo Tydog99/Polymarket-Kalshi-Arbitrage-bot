@@ -69,7 +69,7 @@ use crate::remote_execution::{HybridExecutor, run_hybrid_execution_loop};
 use crate::remote_protocol::Platform as WsPlatform;
 use crate::remote_trader::RemoteTraderServer;
 use trading::execution::Platform as TradingPlatform;
-use types::{ArbOpportunity, GlobalState, MarketPair, MarketType, PriceCents};
+use types::{ArbOpportunity, DiscoveryResult, GlobalState, MarketPair, MarketType, PriceCents};
 
 /// Polymarket CLOB API host
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
@@ -642,6 +642,12 @@ async fn main() -> Result<()> {
         info!("   Market type filter: {:?}", mt);
     }
 
+    // Parse --kalshi-ticker for single-event mode
+    let single_ticker: Option<String> = cli_arg_value(&args, "--kalshi-ticker");
+    if let Some(ref ticker) = single_ticker {
+        info!("   Single-event mode: {}", ticker);
+    }
+
     // Check for dry run mode
     let dry_run = std::env::var("DRY_RUN").map(|v| v == "1" || v == "true").unwrap_or(true);
     if dry_run {
@@ -677,18 +683,39 @@ async fn main() -> Result<()> {
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
 
-    info!("🔍 Market discovery{}...",
-          if force_discovery { " (forced refresh)" } else { "" });
-
     let discovery = DiscoveryClient::new(
         KalshiApiClient::new(KalshiConfig::from_env()?),
         team_cache
     );
 
-    let result = if force_discovery {
-        discovery.discover_all_force(&leagues, market_type_filter).await
+    // Single-event mode or normal discovery
+    let result = if let Some(ref ticker) = single_ticker {
+        info!("🎯 Single-event mode: {}", ticker);
+        match discovery.discover_single_ticker(ticker).await {
+            Ok(pairs) => {
+                info!("✅ Found {} matching market pair(s)", pairs.len());
+                DiscoveryResult {
+                    pairs,
+                    kalshi_events_found: 1,
+                    poly_matches: 1,
+                    poly_misses: 0,
+                    errors: vec![],
+                    stats: Default::default(),
+                }
+            }
+            Err(e) => {
+                error!("Failed to discover event: {}", e);
+                return Ok(());
+            }
+        }
     } else {
-        discovery.discover_all(&leagues, market_type_filter).await
+        info!("🔍 Market discovery{}...",
+              if force_discovery { " (forced refresh)" } else { "" });
+        if force_discovery {
+            discovery.discover_all_force(&leagues, market_type_filter).await
+        } else {
+            discovery.discover_all(&leagues, market_type_filter).await
+        }
     };
 
     if result.pairs.is_empty() {
@@ -705,8 +732,10 @@ async fn main() -> Result<()> {
               pair.kalshi_market_ticker);
     }
 
-    info!("📊 Market discovery complete:");
-    print_discovery_summary(&result);
+    if single_ticker.is_none() {
+        info!("📊 Market discovery complete:");
+        print_discovery_summary(&result);
+    }
     info!("   - Matched market pairs: {}", result.pairs.len());
 
     if !result.errors.is_empty() {
