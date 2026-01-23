@@ -10,7 +10,7 @@ use arb_bot::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use arb_bot::remote_execution::HybridExecutor;
 use arb_bot::remote_protocol::{IncomingMessage as WsMsg, Platform as WsPlatform};
 use arb_bot::remote_trader::RemoteTraderServer;
-use arb_bot::types::{ArbType, FastExecutionRequest, GlobalState, MarketPair, MarketType};
+use arb_bot::types::{ArbType, ArbOpportunity, GlobalState, MarketPair, MarketType};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -50,14 +50,14 @@ fn cb_disabled() -> Arc<CircuitBreaker> {
 }
 
 fn make_state_with_pair(pair: MarketPair) -> Arc<GlobalState> {
-    let state = Arc::new(GlobalState::new());
+    let state = Arc::new(GlobalState::default());
     let id = state.add_pair(pair).expect("add_pair");
     assert_eq!(id, 0);
     state
 }
 
-fn make_arb_request(arb_type: ArbType) -> FastExecutionRequest {
-    FastExecutionRequest {
+fn make_arb_request(arb_type: ArbType) -> ArbOpportunity {
+    ArbOpportunity {
         market_id: 0,
         yes_price: 40,
         no_price: 50,
@@ -502,7 +502,7 @@ async fn test_hybrid_executor_drops_zero_profit_arb() {
     );
 
     // Prices sum to more than $1 (no profit)
-    let req = FastExecutionRequest {
+    let req = ArbOpportunity {
         market_id: 0,
         yes_price: 55,
         no_price: 55, // 55 + 55 + fees > 100
@@ -547,7 +547,7 @@ async fn test_hybrid_executor_drops_insufficient_size_arb() {
     );
 
     // Size too small for even 1 contract (need >= 100 cents)
-    let req = FastExecutionRequest {
+    let req = ArbOpportunity {
         market_id: 0,
         yes_price: 40,
         no_price: 50,
@@ -609,7 +609,7 @@ async fn test_hybrid_executor_deduplication() {
     tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
 
     let h2 = tokio::spawn(async move {
-        let req2 = FastExecutionRequest {
+        let req2 = ArbOpportunity {
             market_id: 0, // Same market_id
             ..req
         };

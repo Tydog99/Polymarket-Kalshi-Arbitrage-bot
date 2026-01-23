@@ -15,7 +15,7 @@ use crate::kalshi::KalshiApiClient;
 use crate::poly_executor::PolyExecutor;
 use crate::types::{
     ArbType, MarketPair,
-    FastExecutionRequest, GlobalState,
+    ArbOpportunity, GlobalState,
     cents_to_price,
 };
 use crate::circuit_breaker::CircuitBreaker;
@@ -131,7 +131,7 @@ impl ExecutionEngine {
 
     /// Process an execution request
     #[inline]
-    pub async fn process(&self, req: FastExecutionRequest) -> Result<ExecutionResult> {
+    pub async fn process(&self, req: ArbOpportunity) -> Result<ExecutionResult> {
         let market_id = req.market_id;
 
         // Deduplication check (512 markets via 8x u64 bitmask)
@@ -422,7 +422,7 @@ impl ExecutionEngine {
 
     async fn execute_both_legs_async(
         &self,
-        req: &FastExecutionRequest,
+        req: &ArbOpportunity,
         pair: &MarketPair,
         contracts: i64,
     ) -> Result<(i64, i64, i64, i64, String, String)> {
@@ -960,7 +960,7 @@ pub struct ExecutionResult {
 }
 
 /// Create a new execution request channel with bounded capacity
-pub fn create_execution_channel() -> (mpsc::Sender<FastExecutionRequest>, mpsc::Receiver<FastExecutionRequest>) {
+pub fn create_execution_channel() -> (mpsc::Sender<ArbOpportunity>, mpsc::Receiver<ArbOpportunity>) {
     mpsc::channel(256)
 }
 
@@ -969,7 +969,7 @@ pub fn create_execution_channel() -> (mpsc::Sender<FastExecutionRequest>, mpsc::
 /// When `log_tx` is provided and TUI is active, logs are routed through the channel
 /// instead of going to stdout (which would corrupt the TUI display).
 pub async fn run_execution_loop(
-    mut rx: mpsc::Receiver<FastExecutionRequest>,
+    mut rx: mpsc::Receiver<ArbOpportunity>,
     engine: Arc<ExecutionEngine>,
     tui_state: Option<Arc<tokio::sync::RwLock<crate::confirm_tui::TuiState>>>,
     log_tx: Option<mpsc::Sender<String>>,

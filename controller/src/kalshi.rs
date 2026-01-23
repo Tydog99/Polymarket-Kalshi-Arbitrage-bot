@@ -25,7 +25,7 @@ use crate::config::{self, KALSHI_WS_URL, KALSHI_API_BASE, KALSHI_API_DELAY_MS};
 use crate::execution::NanoClock;
 use crate::types::{
     KalshiEventsResponse, KalshiMarketsResponse, KalshiEvent, KalshiMarket,
-    GlobalState, FastExecutionRequest, ArbType, PriceCents, SizeCents, fxhash_str,
+    GlobalState, ArbOpportunity, PriceCents, SizeCents, fxhash_str,
     MarketPair,
 };
 
@@ -451,9 +451,9 @@ struct SubscribeParams {
 pub async fn run_ws(
     config: &KalshiConfig,
     state: Arc<GlobalState>,
-    exec_tx: mpsc::Sender<FastExecutionRequest>,
-    confirm_tx: mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
-    threshold_cents: PriceCents,
+    exec_tx: mpsc::Sender<ArbOpportunity>,
+    confirm_tx: mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
+    _threshold_cents: PriceCents,
     mut shutdown_rx: watch::Receiver<bool>,
     clock: Arc<NanoClock>,
     tui_state: Arc<tokio::sync::RwLock<crate::confirm_tui::TuiState>>,
@@ -570,10 +570,15 @@ pub async fn run_ws(
                                             process_kalshi_snapshot(market, body);
                                             market.mark_kalshi_update_unix_ms(now_ms);
 
-                                            // Check for arbs
-                                            let arb_mask = market.check_arbs(threshold_cents);
-                                            if arb_mask != 0 {
-                                                send_kalshi_arb_request(market_id, market, arb_mask, &exec_tx, &confirm_tx, &clock).await;
+                                            // Check for arbs using ArbOpportunity::detect()
+                                            if let Some(req) = ArbOpportunity::detect(
+                                                market_id,
+                                                market.kalshi.load(),
+                                                market.poly.load(),
+                                                state.arb_config(),
+                                                clock.now_ns(),
+                                            ) {
+                                                route_arb_to_channel(&state, market_id, req, &exec_tx, &confirm_tx).await;
                                             }
                                         }
                                     }
@@ -586,9 +591,15 @@ pub async fn run_ws(
                                             process_kalshi_delta(market, body);
                                             market.mark_kalshi_update_unix_ms(now_ms);
 
-                                            let arb_mask = market.check_arbs(threshold_cents);
-                                            if arb_mask != 0 {
-                                                send_kalshi_arb_request(market_id, market, arb_mask, &exec_tx, &confirm_tx, &clock).await;
+                                            // Check for arbs using ArbOpportunity::detect()
+                                            if let Some(req) = ArbOpportunity::detect(
+                                                market_id,
+                                                market.kalshi.load(),
+                                                market.poly.load(),
+                                                state.arb_config(),
+                                                clock.now_ns(),
+                                            ) {
+                                                route_arb_to_channel(&state, market_id, req, &exec_tx, &confirm_tx).await;
                                             }
                                         }
                                     }
@@ -728,47 +739,22 @@ fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiW
     market.inc_kalshi_updates();
 }
 
-/// Send arb request from Kalshi handler
+/// Route a detected arbitrage opportunity to the appropriate channel.
+///
+/// Routes to confirm_tx if the league requires confirmation, otherwise to exec_tx.
 #[inline]
-async fn send_kalshi_arb_request(
+async fn route_arb_to_channel(
+    state: &GlobalState,
     market_id: u16,
-    market: &crate::types::AtomicMarketState,
-    arb_mask: u8,
-    exec_tx: &mpsc::Sender<FastExecutionRequest>,
-    confirm_tx: &mpsc::Sender<(FastExecutionRequest, Arc<MarketPair>)>,
-    clock: &NanoClock,
+    req: ArbOpportunity,
+    exec_tx: &mpsc::Sender<ArbOpportunity>,
+    confirm_tx: &mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
 ) {
-    let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
-    let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.load();
-
-    let (yes_price, no_price, yes_size, no_size, arb_type) = if arb_mask & 1 != 0 {
-        (p_yes, k_no, p_yes_size, k_no_size, ArbType::PolyYesKalshiNo)
-    } else if arb_mask & 2 != 0 {
-        (k_yes, p_no, k_yes_size, p_no_size, ArbType::KalshiYesPolyNo)
-    } else if arb_mask & 4 != 0 {
-        (p_yes, p_no, p_yes_size, p_no_size, ArbType::PolyOnly)
-    } else if arb_mask & 8 != 0 {
-        (k_yes, k_no, k_yes_size, k_no_size, ArbType::KalshiOnly)
-    } else {
-        return;
-    };
-
-    let req = FastExecutionRequest {
-        market_id,
-        yes_price,
-        no_price,
-        yes_size,
-        no_size,
-        arb_type,
-        detected_ns: clock.now_ns(),
-        is_test: false,
-    };
-
-    // Get the market pair to determine routing
-    let pair = match market.pair() {
+    // Get market pair to check if confirmation is required
+    let pair = match state.get_by_id(market_id).and_then(|m| m.pair()) {
         Some(p) => p,
         None => {
-            // No pair info, fall back to direct execution
+            // No pair found, send directly to exec channel
             if let Err(e) = exec_tx.try_send(req) {
                 tracing::warn!(
                     "[KALSHI] Arb request dropped for market {}: {} (channel backpressure)",
@@ -779,7 +765,7 @@ async fn send_kalshi_arb_request(
         }
     };
 
-    // Route based on confirmation requirements
+    // Route based on confirmation requirement
     if config::requires_confirmation(&pair.league) {
         if let Err(e) = confirm_tx.try_send((req, pair)) {
             tracing::warn!(
