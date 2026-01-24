@@ -224,7 +224,7 @@ ws_port = 9001       # WebSocket port
 
 ## Supported Markets
 
-Soccer (EPL, Bundesliga, La Liga, Serie A, Ligue 1, UCL, UEL, EFL Championship), NBA, NFL, NHL, MLB, MLS, NCAAF, Esports (CS2, LoL, CoD)
+Soccer (EPL, Bundesliga, La Liga, Serie A, Ligue 1, UCL, UEL, EFL Championship), NBA, NFL, NHL, MLB, MLS, NCAAF, NCAAMB (College Basketball), Esports (CS2, LoL, CoD)
 
 ## Market Pairing: Kalshi ↔ Polymarket Slug Mapping
 

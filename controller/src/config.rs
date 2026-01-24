@@ -401,6 +401,18 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             home_team_first: false,
             confirm_mode: true,
         },
+        LeagueConfig {
+            league_code: "ncaamb",
+            poly_prefix: "cbb",
+            kalshi_series_game: "KXNCAAMBGAME",
+            kalshi_series_spread: Some("KXNCAAMBSPREAD"),
+            kalshi_series_total: Some("KXNCAAMBTOTAL"),
+            kalshi_series_btts: None,
+            poly_series_id: None,
+            kalshi_web_slug: "ncaamb-game",
+            home_team_first: false,
+            confirm_mode: true,
+        },
         // Esports - no home/away concept, default to false
         LeagueConfig {
             league_code: "cs2",
@@ -450,7 +462,7 @@ impl LeagueConfig {
         // Only American sports (nba, nfl, nhl, mlb, ncaaf) and esports don't have draws
         !matches!(
             self.league_code,
-            "nba" | "nfl" | "nhl" | "mlb" | "ncaaf" | "cs2" | "lol" | "cod"
+            "nba" | "nfl" | "nhl" | "mlb" | "ncaaf" | "ncaamb" | "cs2" | "lol" | "cod"
         )
     }
 }
