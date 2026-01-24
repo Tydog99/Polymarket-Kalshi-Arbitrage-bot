@@ -312,7 +312,14 @@ impl KalshiApiClient {
         let resp: KalshiMarketsResponse = self.get(&path).await?;
         Ok(resp.markets)
     }
-    
+
+    /// Get markets for a given event ticker
+    pub async fn get_markets_for_event(&self, event_ticker: &str) -> Result<Vec<KalshiMarket>> {
+        let path = format!("/markets?event_ticker={}&status=open&limit=100", event_ticker);
+        let resp: KalshiMarketsResponse = self.get(&path).await?;
+        Ok(resp.markets)
+    }
+
     /// Generic authenticated POST request
     async fn post<T: serde::de::DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
@@ -639,6 +646,28 @@ pub async fn run_ws(
 /// Note: Kalshi sends BIDS - to buy YES you pay (100 - best_NO_bid), to buy NO you pay (100 - best_YES_bid)
 #[inline]
 fn process_kalshi_snapshot(market: &crate::types::AtomicMarketState, body: &KalshiWsMsgBody) {
+    let ticker = body.market_ticker.as_deref().unwrap_or("unknown");
+
+    // Debug: log raw orderbook data
+    if let Some(yes_bids) = &body.yes {
+        let best_yes_bid = yes_bids.iter()
+            .filter(|l| l.len() >= 2 && l[1] > 0)
+            .max_by_key(|l| l[0]);
+        tracing::debug!(
+            "[KALSHI-SNAP] {} | YES bids: {:?} | best_yes_bid: {:?}",
+            ticker, yes_bids, best_yes_bid
+        );
+    }
+    if let Some(no_bids) = &body.no {
+        let best_no_bid = no_bids.iter()
+            .filter(|l| l.len() >= 2 && l[1] > 0)
+            .max_by_key(|l| l[0]);
+        tracing::debug!(
+            "[KALSHI-SNAP] {} | NO bids: {:?} | best_no_bid: {:?}",
+            ticker, no_bids, best_no_bid
+        );
+    }
+
     // Find best YES bid (highest price) - this determines NO ask
     let (no_ask, no_size) = body.yes.as_ref()
         .and_then(|levels| {
@@ -679,6 +708,12 @@ fn process_kalshi_snapshot(market: &crate::types::AtomicMarketState, body: &Kals
         })
         .unwrap_or((0, 0));
 
+    // Debug: log computed prices
+    tracing::debug!(
+        "[KALSHI-SNAP] {} | COMPUTED: yes_ask={}¢ no_ask={}¢ yes_size={}¢ no_size={}¢",
+        ticker, yes_ask, no_ask, yes_size, no_size
+    );
+
     // Store
     market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
     market.inc_kalshi_updates();
@@ -688,9 +723,19 @@ fn process_kalshi_snapshot(market: &crate::types::AtomicMarketState, body: &Kals
 /// Note: Deltas update bid levels; we recompute asks from best bids
 #[inline]
 fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiWsMsgBody) {
+    let ticker = body.market_ticker.as_deref().unwrap_or("unknown");
+
     // For deltas, recompute from snapshot-like format
     // Kalshi deltas have yes/no as arrays of [price, new_qty]
     let (current_yes, current_no, current_yes_size, current_no_size) = market.kalshi.load();
+
+    // Debug: log delta updates
+    if body.yes.is_some() || body.no.is_some() {
+        tracing::debug!(
+            "[KALSHI-DELTA] {} | YES delta: {:?} | NO delta: {:?} | current: yes={}¢ no={}¢",
+            ticker, body.yes, body.no, current_yes, current_no
+        );
+    }
 
     // Process YES bid updates (affects NO ask)
     let (no_ask, no_size) = if let Some(levels) = &body.yes {
@@ -734,6 +779,12 @@ fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiW
     } else {
         (current_yes, current_yes_size)
     };
+
+    // Debug: log computed prices after delta
+    tracing::debug!(
+        "[KALSHI-DELTA] {} | COMPUTED: yes_ask={}¢ no_ask={}¢ (was yes={}¢ no={}¢)",
+        ticker, yes_ask, no_ask, current_yes, current_no
+    );
 
     market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
     market.inc_kalshi_updates();

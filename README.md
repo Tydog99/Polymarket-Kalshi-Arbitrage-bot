@@ -140,6 +140,20 @@ DRY_RUN=0 CONTROLLER_PLATFORMS=kalshi,polymarket cargo run -p controller --relea
 DRY_RUN=0 CONTROLLER_PLATFORMS=kalshi cargo run -p controller --release
 ```
 
+### Single-Event Mode
+
+Monitor only a specific Kalshi event (useful for debugging or focused monitoring):
+
+```bash
+# Monitor a single NBA game
+cargo run -p controller --release -- --kalshi-ticker KXNBAGAME-26JAN24MIAUTA
+
+# With dry run
+DRY_RUN=1 cargo run -p controller --release -- --kalshi-ticker KXNBAGAME-26JAN24MIAUTA
+```
+
+This fetches all markets under the specified event ticker and matches them to Polymarket, bypassing normal discovery.
+
 ### Quick Smoke Test
 
 ```bash
@@ -223,6 +237,13 @@ See `trader/README.md` for setup and required environment variables.
 | `FORCE_DISCOVERY` | `false` | `1` or `true` = clear cache and re-fetch all markets |
 | `DISCOVERY_INTERVAL_MINS` | `15` | Minutes between discovery refreshes (0 = disabled) |
 | `ENABLED_LEAGUES` | *(all)* | Comma-separated leagues to monitor (see below) |
+
+**CLI flags:**
+| Flag | Description |
+|------|-------------|
+| `--leagues nba,nfl` | Override `ENABLED_LEAGUES` from command line |
+| `--market-type moneyline` | Filter to specific market type (`moneyline`, `spread`, `total`, `btts`) |
+| `--kalshi-ticker TICKER` | Single-event mode: monitor only markets under this Kalshi event ticker |
 
 **Supported leagues**: `epl`, `bundesliga`, `laliga`, `seriea`, `ligue1`, `ucl`, `uel`, `eflc`, `nba`, `nfl`, `nhl`, `mlb`, `mls`, `ncaaf`, `cs2`, `lol`, `cod`
 

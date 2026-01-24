@@ -592,14 +592,19 @@ async fn process_book(
 ) {
     let token_hash = fxhash_str(&book.asset_id);
 
-    // Find best ask (lowest price)
-    let (best_ask, ask_size) = book.asks.iter()
+    // Debug: log raw orderbook data
+    let asks_debug: Vec<(u16, u16)> = book.asks.iter()
         .filter_map(|l| {
             let price = parse_price(&l.price);
             let size = parse_size(&l.size);
             if price > 0 { Some((price, size)) } else { None }
         })
+        .collect();
+
+    // Find best ask (lowest price)
+    let (best_ask, ask_size) = asks_debug.iter()
         .min_by_key(|(p, _)| *p)
+        .copied()
         .unwrap_or((0, 0));
 
     // A token can be YES for one market AND NO for another (e.g., esports where
@@ -611,13 +616,17 @@ async fn process_book(
     // Check if YES token
     let yes_market_id = state.poly_yes_to_id.read().get(&token_hash).copied();
     if let Some(market_id) = yes_market_id {
-        tracing::debug!(
-            "[POLY] YES matched: asset={}... price={} size={}",
-            &book.asset_id[..book.asset_id.len().min(16)],
-            best_ask,
-            ask_size
-        );
         let market = &state.markets[market_id as usize];
+        let ticker = market.pair()
+            .map(|p| p.kalshi_market_ticker.to_string())
+            .unwrap_or_else(|| format!("market_{}", market_id));
+
+        // Debug: log raw asks and computed best ask
+        tracing::debug!(
+            "[POLY-SNAP] {} | YES asks: {:?} | best_yes_ask: {}¢ size={}",
+            ticker, asks_debug, best_ask, ask_size
+        );
+
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -642,13 +651,17 @@ async fn process_book(
     // Check if NO token (same token can be NO for a different market)
     let no_market_id = state.poly_no_to_id.read().get(&token_hash).copied();
     if let Some(market_id) = no_market_id {
-        tracing::debug!(
-            "[POLY] NO matched: asset={}... price={} size={}",
-            &book.asset_id[..book.asset_id.len().min(16)],
-            best_ask,
-            ask_size
-        );
         let market = &state.markets[market_id as usize];
+        let ticker = market.pair()
+            .map(|p| p.kalshi_market_ticker.to_string())
+            .unwrap_or_else(|| format!("market_{}", market_id));
+
+        // Debug: log raw asks and computed best ask
+        tracing::debug!(
+            "[POLY-SNAP] {} | NO asks: {:?} | best_no_ask: {}¢ size={}",
+            ticker, asks_debug, best_ask, ask_size
+        );
+
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -709,7 +722,11 @@ async fn process_price_change(
     let yes_market_id = state.poly_yes_to_id.read().get(&token_hash).copied();
     if let Some(market_id) = yes_market_id {
         let market = &state.markets[market_id as usize];
-        let (current_yes, _, current_yes_size, _) = market.poly.load();
+        let (current_yes, current_no, current_yes_size, _) = market.poly.load();
+        let ticker = market.pair()
+            .map(|p| p.kalshi_market_ticker.to_string())
+            .unwrap_or_else(|| format!("market_{}", market_id));
+
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -719,6 +736,12 @@ async fn process_price_change(
         market.poly.update_yes(price, current_yes_size);
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
+
+        // Debug: log price change
+        tracing::debug!(
+            "[POLY-DELTA] {} | YES: yes_ask={}¢ no_ask={}¢ (was yes={}¢ no={}¢)",
+            ticker, price, current_no, current_yes, current_no
+        );
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_yes || current_yes == 0 {
@@ -738,7 +761,11 @@ async fn process_price_change(
     let no_market_id = state.poly_no_to_id.read().get(&token_hash).copied();
     if let Some(market_id) = no_market_id {
         let market = &state.markets[market_id as usize];
-        let (_, current_no, _, current_no_size) = market.poly.load();
+        let (current_yes, current_no, _, current_no_size) = market.poly.load();
+        let ticker = market.pair()
+            .map(|p| p.kalshi_market_ticker.to_string())
+            .unwrap_or_else(|| format!("market_{}", market_id));
+
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -748,6 +775,12 @@ async fn process_price_change(
         market.poly.update_no(price, current_no_size);
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
+
+        // Debug: log price change
+        tracing::debug!(
+            "[POLY-DELTA] {} | NO: yes_ask={}¢ no_ask={}¢ (was yes={}¢ no={}¢)",
+            ticker, current_yes, price, current_yes, current_no
+        );
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_no || current_no == 0 {
