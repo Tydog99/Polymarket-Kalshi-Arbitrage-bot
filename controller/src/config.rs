@@ -409,7 +409,7 @@ pub fn get_league_configs() -> Vec<LeagueConfig> {
             kalshi_series_total: Some("KXNCAAMBTOTAL"),
             kalshi_series_btts: None,
             poly_series_id: None,
-            kalshi_web_slug: "ncaamb-game",
+            kalshi_web_slug: "mens-college-basketball-mens-game",
             home_team_first: false,
             confirm_mode: true,
         },

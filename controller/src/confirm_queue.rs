@@ -33,7 +33,14 @@ pub struct PendingArb {
 
 impl PendingArb {
     pub fn new(request: ArbOpportunity, pair: Arc<MarketPair>) -> Self {
-        let kalshi_url = format!("{}/{}", KALSHI_WEB_BASE, pair.kalshi_market_ticker);
+        // Build Kalshi URL: https://kalshi.com/markets/{series}/{slug}/{event_ticker}
+        let kalshi_series = pair.kalshi_event_ticker
+            .split('-')
+            .next()
+            .unwrap_or(&pair.kalshi_event_ticker)
+            .to_lowercase();
+        let kalshi_event_ticker_lower = pair.kalshi_event_ticker.to_lowercase();
+        let kalshi_url = format!("{}/{}/{}/{}", KALSHI_WEB_BASE, kalshi_series, pair.kalshi_event_slug, kalshi_event_ticker_lower);
         let poly_url = build_polymarket_url(&pair.league, &pair.poly_slug);
         let now = Instant::now();
 
