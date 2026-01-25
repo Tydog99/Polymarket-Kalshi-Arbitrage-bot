@@ -414,8 +414,10 @@ mod tests {
         let request = test_request(40, 50, 400, 600);
         let pending = PendingArb::new(request, test_market_pair());
 
-        // Kalshi URL should contain the market ticker
-        assert!(pending.kalshi_url.contains("KXNBA-TEST-MKT"));
+        // Kalshi URL should contain the event ticker (lowercase) and event slug
+        // Format: {base}/{series}/{slug}/{event_ticker}
+        assert!(pending.kalshi_url.contains("kxnba-test"), "Expected kxnba-test in {}", pending.kalshi_url);
+        assert!(pending.kalshi_url.contains("test-event"), "Expected test-event in {}", pending.kalshi_url);
 
         // Polymarket URL should be built from league and slug
         assert!(pending.poly_url.contains("nba"));

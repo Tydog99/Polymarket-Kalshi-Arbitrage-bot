@@ -398,11 +398,13 @@ fn draw_confirm_pane(f: &mut Frame, state: &TuiState, pending: Option<&PendingAr
             .split(inner);
 
         // Market info
+        let yes_price = arb.request.yes_price;
+        let no_price = arb.request.no_price;
         let arb_type_str = match arb.request.arb_type {
-            crate::types::ArbType::PolyYesKalshiNo => "BUY Poly YES + BUY Kalshi NO",
-            crate::types::ArbType::KalshiYesPolyNo => "BUY Kalshi YES + BUY Poly NO",
-            crate::types::ArbType::PolyOnly => "BUY Poly YES + BUY Poly NO",
-            crate::types::ArbType::KalshiOnly => "BUY Kalshi YES + BUY Kalshi NO",
+            crate::types::ArbType::PolyYesKalshiNo => format!("BUY Poly YES ({}c) + BUY Kalshi NO ({}c)", yes_price, no_price),
+            crate::types::ArbType::KalshiYesPolyNo => format!("BUY Kalshi YES ({}c) + BUY Poly NO ({}c)", yes_price, no_price),
+            crate::types::ArbType::PolyOnly => format!("BUY Poly YES ({}c) + BUY Poly NO ({}c)", yes_price, no_price),
+            crate::types::ArbType::KalshiOnly => format!("BUY Kalshi YES ({}c) + BUY Kalshi NO ({}c)", yes_price, no_price),
         };
 
         let info_text = format!(
