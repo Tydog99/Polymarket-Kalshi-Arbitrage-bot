@@ -1,0 +1,13 @@
+app = "arb-controller"
+primary_region = "ams"
+
+[build]
+
+[mounts]
+  source = "arb_data"
+  destination = "/data"
+
+[vm]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
