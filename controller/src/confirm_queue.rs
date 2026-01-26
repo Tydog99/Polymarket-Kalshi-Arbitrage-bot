@@ -33,7 +33,14 @@ pub struct PendingArb {
 
 impl PendingArb {
     pub fn new(request: ArbOpportunity, pair: Arc<MarketPair>) -> Self {
-        let kalshi_url = format!("{}/{}", KALSHI_WEB_BASE, pair.kalshi_market_ticker);
+        // Build Kalshi URL: https://kalshi.com/markets/{series}/{slug}/{event_ticker}
+        let kalshi_series = pair.kalshi_event_ticker
+            .split('-')
+            .next()
+            .unwrap_or(&pair.kalshi_event_ticker)
+            .to_lowercase();
+        let kalshi_event_ticker_lower = pair.kalshi_event_ticker.to_lowercase();
+        let kalshi_url = format!("{}/{}/{}/{}", KALSHI_WEB_BASE, kalshi_series, pair.kalshi_event_slug, kalshi_event_ticker_lower);
         let poly_url = build_polymarket_url(&pair.league, &pair.poly_slug);
         let now = Instant::now();
 
@@ -407,8 +414,10 @@ mod tests {
         let request = test_request(40, 50, 400, 600);
         let pending = PendingArb::new(request, test_market_pair());
 
-        // Kalshi URL should contain the market ticker
-        assert!(pending.kalshi_url.contains("KXNBA-TEST-MKT"));
+        // Kalshi URL should contain the event ticker (lowercase) and event slug
+        // Format: {base}/{series}/{slug}/{event_ticker}
+        assert!(pending.kalshi_url.contains("kxnba-test"), "Expected kxnba-test in {}", pending.kalshi_url);
+        assert!(pending.kalshi_url.contains("test-event"), "Expected test-event in {}", pending.kalshi_url);
 
         // Polymarket URL should be built from league and slug
         assert!(pending.poly_url.contains("nba"));

@@ -4,7 +4,6 @@
 //! position reconciliation, and automatic exposure management.
 
 use anyhow::{Result, anyhow};
-use chrono::Local;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -303,12 +302,8 @@ impl ExecutionEngine {
         let kalshi_event_ticker_lower = pair.kalshi_event_ticker.to_lowercase();
         let poly_url = build_polymarket_url(&pair.league, &pair.poly_slug);
         let kalshi_url = format!("{}/{}/{}/{}", KALSHI_WEB_BASE, kalshi_series, pair.kalshi_event_slug, kalshi_event_ticker_lower);
-        // OSC 8 hyperlinks (must use print! as tracing escapes control chars)
-        println!("[{}]  \x1b[32mINFO\x1b[0m controller::execution: [EXEC] 🔗 \x1b]8;;{}\x07Kalshi\x1b]8;;\x07 | \x1b]8;;{}\x07Polymarket\x1b]8;;\x07",
-            Local::now().format("%H:%M:%S"),
-            kalshi_url,
-            poly_url
-        );
+        // Log URLs (tracing routes to TUI when active)
+        info!("[EXEC] 🔗 Kalshi: {} | Polymarket: {}", kalshi_url, poly_url);
 
         if self.dry_run {
             info!("[EXEC] 🏃 DRY RUN - would execute {} contracts", max_contracts);

@@ -71,6 +71,16 @@ Parallel: Heartbeat Monitoring (main.rs, every 10s) - logs status, does NOT trig
 - **`confirm_tui.rs`** - Split-pane TUI for manual arb confirmation with TUI-aware log routing
 - **`confirm_queue.rs`** - Queue of pending arbs awaiting user confirmation
 
+### Finding CLI Flags & Environment Variables
+
+**When asked about CLI flags or env vars, check these locations BEFORE suggesting new ones:**
+
+1. **`README.md`** - Full documentation of all CLI flags and env vars with examples
+2. **`main.rs:575-650`** - CLI argument parsing (`cli_arg_value`, `cli_has_flag` calls)
+3. **`config.rs`** - Env var readers (search for `std::env::var`)
+
+Common pattern: env vars often have corresponding CLI flags (e.g., `CONFIRM_MODE_SKIP` ↔ `--confirm-mode-skip`).
+
 ### Detailed Documentation
 
 **Read these docs BEFORE modifying the related subsystems:**
@@ -224,7 +234,7 @@ ws_port = 9001       # WebSocket port
 
 ## Supported Markets
 
-Soccer (EPL, Bundesliga, La Liga, Serie A, Ligue 1, UCL, UEL, EFL Championship), NBA, NFL, NHL, MLB, MLS, NCAAF, Esports (CS2, LoL, CoD)
+Soccer (EPL, Bundesliga, La Liga, Serie A, Ligue 1, UCL, UEL, EFL Championship), NBA, NFL, NHL, MLB, MLS, NCAAF, NCAAMB (College Basketball), Esports (CS2, LoL, CoD)
 
 ## Market Pairing: Kalshi ↔ Polymarket Slug Mapping
 

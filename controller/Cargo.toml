@@ -17,6 +17,14 @@ path = "src/bin/generate_aliases.rs"
 name = "generate-team-cache"
 path = "src/bin/generate_team_cache.rs"
 
+[[bin]]
+name = "generate-ncaamb-cache"
+path = "src/bin/generate_ncaamb_cache.rs"
+
+[[bin]]
+name = "fetch-poly-cbb"
+path = "src/bin/fetch_poly_cbb.rs"
+
 [dependencies]
 anyhow = "1.0"
 arrayvec = "0.7"
