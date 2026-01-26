@@ -26,7 +26,11 @@ primary_region = 'ams'
   CB_MAX_CONSECUTIVE_ERRORS = "5"
   CB_COOLDOWN_SECS = "300"
 
-# No http_service - this is a background daemon, not a web app
+# Background daemon - restart always to keep running 24/7
+[[restart]]
+  policy = "always"
+  processes = ["app"]
+
 [processes]
   app = "/usr/local/bin/fly-entrypoint.sh"
 

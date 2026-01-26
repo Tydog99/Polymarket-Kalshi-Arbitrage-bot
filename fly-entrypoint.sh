@@ -10,6 +10,7 @@ fi
 # Write env vars to profile so SSH sessions inherit them
 cat > /etc/profile.d/arb-env.sh << 'EOF'
 export KALSHI_PRIVATE_KEY_PATH="/data/kalshi.pem"
+export KALSHI_PRIVATE_KEY=$(echo "$KALSHI_KEY_B64" | base64 -d)
 EOF
 
 # Start Tailscale daemon

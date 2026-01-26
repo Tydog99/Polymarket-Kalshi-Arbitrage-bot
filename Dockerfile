@@ -31,6 +31,9 @@ COPY --from=builder /app/target/release/remote-trader /usr/local/bin/trader
 RUN mkdir -p /data
 WORKDIR /data
 
+# Copy team cache (static asset needed at runtime)
+COPY controller/kalshi_team_cache.json /data/kalshi_team_cache.json
+
 # Startup script
 COPY fly-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/fly-entrypoint.sh
