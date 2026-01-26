@@ -31,14 +31,8 @@ primary_region = 'ams'
   policy = "always"
   processes = ["app"]
 
-# Use min_machines_running to keep at least 1 running
-[http_service]
-  internal_port = 8080
-  force_https = false
-  auto_stop_machines = "stop"
-  auto_start_machines = true
-  min_machines_running = 1
-  processes = ["app"]
+# No http_service - this is a background daemon without HTTP
+# The restart policy handles keeping it running
 
 [processes]
   app = "/usr/local/bin/fly-entrypoint.sh"
