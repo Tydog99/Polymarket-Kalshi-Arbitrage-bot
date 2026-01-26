@@ -1,9 +1,20 @@
-FROM rust:1.75-bookworm AS builder
+FROM rust:latest AS chef
+RUN cargo install cargo-chef
 WORKDIR /app
-COPY . .
-RUN cargo build --release -p controller
 
-FROM debian:bookworm-slim
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+# Build dependencies (cached unless Cargo.toml/Cargo.lock change)
+RUN cargo chef cook --release --recipe-path recipe.json -p controller -p remote-trader
+# Build applications
+COPY . .
+RUN cargo build --release -p controller -p remote-trader
+
+FROM debian:sid-slim
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
@@ -12,8 +23,9 @@ RUN apt-get update && apt-get install -y \
 # Install Tailscale
 RUN curl -fsSL https://tailscale.com/install.sh | sh
 
-# Copy binary
+# Copy binaries
 COPY --from=builder /app/target/release/controller /usr/local/bin/controller
+COPY --from=builder /app/target/release/remote-trader /usr/local/bin/trader
 
 # Volume mount point for persistent data
 RUN mkdir -p /data

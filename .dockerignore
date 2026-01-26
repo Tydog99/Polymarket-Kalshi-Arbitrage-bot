@@ -1,0 +1,19 @@
+# flyctl launch added from .gitignore
+**/target
+**/.env
+**/.env.keys
+**/kalshi_private_key.txt
+**/claude.md
+**/.DS_Store
+**/positions.json
+**/.discovery_cache.json
+**/*.pem
+**/.worktrees
+**/.logs
+
+# HTTP capture sessions (use fixtures/ for test data)
+**/.captures
+
+# Confirmation logs
+**/.confirmations
+fly.toml

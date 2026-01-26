@@ -1,12 +1,16 @@
 #!/bin/bash
 set -e
 
-# Decode Kalshi private key from base64 secret
+# Decode Kalshi private key from base64 secret to persistent volume
 if [ -n "$KALSHI_KEY_B64" ]; then
-    echo "$KALSHI_KEY_B64" | base64 -d > /tmp/kalshi.pem
-    chmod 600 /tmp/kalshi.pem
-    export KALSHI_PRIVATE_KEY_PATH="/tmp/kalshi.pem"
+    echo "$KALSHI_KEY_B64" | base64 -d > /data/kalshi.pem
+    chmod 600 /data/kalshi.pem
 fi
+
+# Write env vars to profile so SSH sessions inherit them
+cat > /etc/profile.d/arb-env.sh << 'EOF'
+export KALSHI_PRIVATE_KEY_PATH="/data/kalshi.pem"
+EOF
 
 # Start Tailscale daemon
 tailscaled --state=/data/tailscale.state &
