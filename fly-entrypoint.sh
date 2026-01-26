@@ -1,6 +1,12 @@
 #!/bin/bash
 set -e
 
+# Copy static assets from image to volume (if not already present)
+if [ ! -f /data/kalshi_team_cache.json ]; then
+    echo "Copying team cache to volume..."
+    cp /usr/local/share/arb/kalshi_team_cache.json /data/kalshi_team_cache.json
+fi
+
 # Decode Kalshi private key from base64 secret to persistent volume
 if [ -n "$KALSHI_KEY_B64" ]; then
     echo "$KALSHI_KEY_B64" | base64 -d > /data/kalshi.pem

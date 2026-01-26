@@ -31,8 +31,9 @@ COPY --from=builder /app/target/release/remote-trader /usr/local/bin/trader
 RUN mkdir -p /data
 WORKDIR /data
 
-# Copy team cache (static asset needed at runtime)
-COPY controller/kalshi_team_cache.json /data/kalshi_team_cache.json
+# Copy static assets (will be copied to volume by entrypoint if needed)
+RUN mkdir -p /usr/local/share/arb
+COPY controller/kalshi_team_cache.json /usr/local/share/arb/kalshi_team_cache.json
 
 # Startup script
 COPY fly-entrypoint.sh /usr/local/bin/
