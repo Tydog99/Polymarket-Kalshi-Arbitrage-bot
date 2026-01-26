@@ -12,6 +12,69 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
+// =============================================================================
+// TRADE HISTORY TYPES
+// =============================================================================
+
+/// Reason for a trade attempt (for audit trail)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TradeReason {
+    /// Initial YES leg of an arbitrage
+    ArbLegYes,
+    /// Initial NO leg of an arbitrage
+    ArbLegNo,
+    /// Automatic position unwind due to leg mismatch
+    AutoClose,
+    /// Retry attempt during auto-close (at lower price)
+    AutoCloseRetry,
+    /// Blocked by circuit breaker before exchange
+    CircuitBreakerBlock,
+    /// User-initiated close (future use)
+    ManualClose,
+}
+
+/// Status of a trade attempt
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TradeStatus {
+    /// Trade completed successfully (full fill)
+    Success,
+    /// Trade failed completely
+    Failed,
+    /// Trade partially filled
+    PartialFill,
+    /// Trade blocked before reaching exchange
+    Blocked,
+}
+
+/// A single trade attempt record for audit trail
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeRecord {
+    /// Sequence number within this position (for ordering)
+    pub sequence: u32,
+    /// ISO 8601 timestamp of the trade attempt
+    pub timestamp: String,
+    /// Why this trade was attempted
+    pub reason: TradeReason,
+    /// Platform: "kalshi" or "polymarket"
+    pub platform: String,
+    /// Side: "yes" or "no"
+    pub side: String,
+    /// Number of contracts requested (negative for sells/closes)
+    pub requested_contracts: f64,
+    /// Number of contracts actually filled (negative for sells/closes)
+    pub filled_contracts: f64,
+    /// Price per contract (0.0 to 1.0)
+    pub price: f64,
+    /// Outcome of the trade attempt
+    pub status: TradeStatus,
+    /// If failed/blocked, the reason why
+    pub failure_reason: Option<String>,
+    /// Exchange order ID (if available)
+    pub order_id: Option<String>,
+}
+
 const POSITION_FILE: &str = "positions.json";
 
 /// A single position leg on one platform
@@ -58,33 +121,41 @@ impl PositionLeg {
 pub struct ArbPosition {
     /// Market identifier (Kalshi ticker)
     pub market_id: String,
-    
+
     /// Description for logging
     pub description: String,
-    
+
     /// Kalshi YES position
     pub kalshi_yes: PositionLeg,
-    
-    /// Kalshi NO position  
+
+    /// Kalshi NO position
     pub kalshi_no: PositionLeg,
-    
+
     /// Polymarket YES position
     pub poly_yes: PositionLeg,
-    
+
     /// Polymarket NO position
     pub poly_no: PositionLeg,
-    
+
     /// Total fees paid (Kalshi fees)
     pub total_fees: f64,
-    
+
     /// Timestamp when position was opened
     pub opened_at: String,
-    
+
     /// Status: "open", "closed", "resolved"
     pub status: String,
-    
+
     /// Realized P&L (set when position closes/resolves)
     pub realized_pnl: Option<f64>,
+
+    /// Complete trade history for audit trail
+    #[serde(default)]
+    pub trades: Vec<TradeRecord>,
+
+    /// Internal counter for trade sequence numbers
+    #[serde(default)]
+    next_sequence: u32,
 }
 
 #[allow(dead_code)]
@@ -97,6 +168,40 @@ impl ArbPosition {
             opened_at: chrono::Utc::now().to_rfc3339(),
             ..Default::default()
         }
+    }
+
+    /// Record a trade in the history and return the sequence number assigned.
+    pub fn record_trade(
+        &mut self,
+        reason: TradeReason,
+        platform: &str,
+        side: &str,
+        requested_contracts: f64,
+        filled_contracts: f64,
+        price: f64,
+        status: TradeStatus,
+        failure_reason: Option<String>,
+        order_id: Option<String>,
+    ) -> u32 {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+
+        let trade = TradeRecord {
+            sequence,
+            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            reason,
+            platform: platform.to_string(),
+            side: side.to_string(),
+            requested_contracts,
+            filled_contracts,
+            price,
+            status,
+            failure_reason,
+            order_id,
+        };
+
+        self.trades.push(trade);
+        sequence
     }
     
     /// Total contracts across all legs
@@ -301,19 +406,36 @@ impl PositionTracker {
             .entry(fill.market_id.clone())
             .or_insert_with(|| ArbPosition::new(&fill.market_id, &fill.description));
 
-        match (fill.platform.as_str(), fill.side.as_str()) {
-            ("kalshi", "yes") => position.kalshi_yes.add(fill.contracts, fill.price),
-            ("kalshi", "no") => position.kalshi_no.add(fill.contracts, fill.price),
-            ("polymarket", "yes") => position.poly_yes.add(fill.contracts, fill.price),
-            ("polymarket", "no") => position.poly_no.add(fill.contracts, fill.price),
-            _ => warn!("[POSITIONS] Unknown platform/side: {}/{}", fill.platform, fill.side),
+        // Update the position leg (only if actually filled)
+        if fill.contracts.abs() > 0.0 {
+            match (fill.platform.as_str(), fill.side.as_str()) {
+                ("kalshi", "yes") => position.kalshi_yes.add(fill.contracts, fill.price),
+                ("kalshi", "no") => position.kalshi_no.add(fill.contracts, fill.price),
+                ("polymarket", "yes") => position.poly_yes.add(fill.contracts, fill.price),
+                ("polymarket", "no") => position.poly_no.add(fill.contracts, fill.price),
+                _ => warn!("[POSITIONS] Unknown platform/side: {}/{}", fill.platform, fill.side),
+            }
         }
 
         position.total_fees += fill.fees;
 
-        info!("[POSITIONS] Recorded fill: {} {} {} @{:.1}¢ x{:.0} (fees: ${:.4})",
+        // Record in trade history
+        position.record_trade(
+            fill.reason.clone(),
+            &fill.platform,
+            &fill.side,
+            fill.requested_contracts,
+            fill.contracts,
+            fill.price,
+            fill.status.clone(),
+            fill.failure_reason.clone(),
+            if fill.order_id.is_empty() { None } else { Some(fill.order_id.clone()) },
+        );
+
+        info!("[POSITIONS] Recorded fill: {} {} {} @{:.1}¢ x{:.0} (fees: ${:.4}) [reason={:?}, status={:?}]",
               fill.platform, fill.side, fill.market_id,
-              fill.price * 100.0, fill.contracts, fill.fees);
+              fill.price * 100.0, fill.contracts, fill.fees,
+              fill.reason, fill.status);
     }
     
     /// Get or create position for a market
@@ -391,24 +513,33 @@ impl PositionTracker {
     }
 }
 
-/// Record of a single fill
+/// Record of a single fill (used for position updates and trade history)
 #[derive(Debug, Clone)]
 pub struct FillRecord {
     pub market_id: String,
     pub description: String,
     pub platform: String,   // "kalshi" or "polymarket"
     pub side: String,       // "yes" or "no"
-    pub contracts: f64,
+    pub contracts: f64,     // filled contracts (negative for sells/closes)
     pub price: f64,
     pub fees: f64,
-    #[allow(dead_code)]
     pub order_id: String,
     #[allow(dead_code)]
     pub timestamp: String,
+    /// Why this trade was attempted
+    pub reason: TradeReason,
+    /// Number of contracts originally requested (may differ from filled)
+    pub requested_contracts: f64,
+    /// Status of the trade
+    pub status: TradeStatus,
+    /// If failed/blocked, the reason why
+    pub failure_reason: Option<String>,
 }
 
 impl FillRecord {
+    /// Create a new FillRecord for a successful fill (legacy API for backward compatibility)
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub fn new(
         market_id: &str,
         description: &str,
@@ -419,6 +550,16 @@ impl FillRecord {
         fees: f64,
         order_id: &str,
     ) -> Self {
+        // Determine reason based on contracts sign and context
+        // Negative contracts = close/sell, positive = buy
+        let reason = if contracts < 0.0 {
+            TradeReason::AutoClose
+        } else if side == "yes" {
+            TradeReason::ArbLegYes
+        } else {
+            TradeReason::ArbLegNo
+        };
+
         Self {
             market_id: market_id.to_string(),
             description: description.to_string(),
@@ -428,7 +569,44 @@ impl FillRecord {
             price,
             fees,
             order_id: order_id.to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            reason,
+            requested_contracts: contracts, // For legacy API, assume requested = filled
+            status: if contracts.abs() > 0.0 { TradeStatus::Success } else { TradeStatus::Failed },
+            failure_reason: None,
+        }
+    }
+
+    /// Create a FillRecord with full trade history details
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_details(
+        market_id: &str,
+        description: &str,
+        platform: &str,
+        side: &str,
+        requested_contracts: f64,
+        filled_contracts: f64,
+        price: f64,
+        fees: f64,
+        order_id: &str,
+        reason: TradeReason,
+        status: TradeStatus,
+        failure_reason: Option<String>,
+    ) -> Self {
+        Self {
+            market_id: market_id.to_string(),
+            description: description.to_string(),
+            platform: platform.to_string(),
+            side: side.to_string(),
+            contracts: filled_contracts,
+            price,
+            fees,
+            order_id: order_id.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            reason,
+            requested_contracts,
+            status,
+            failure_reason,
         }
     }
 }
@@ -563,14 +741,307 @@ mod tests {
         let mut pos = ArbPosition::new("TEST-MARKET", "Test");
         pos.poly_yes.add(10.0, 0.45);
         pos.kalshi_no.add(10.0, 0.50);
-        
+
         // YES wins
         pos.resolve(true);
-        
+
         // Payout: 10 (poly_yes wins)
         // Cost: 9.50
         // P&L: +0.50
         assert!((pos.realized_pnl.unwrap() - 0.50).abs() < 0.001);
         assert_eq!(pos.status, "resolved");
+    }
+
+    // =========================================================================
+    // TRADE HISTORY TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_trade_history_records_success() {
+        let mut pos = ArbPosition::new("TEST-MARKET", "Test");
+
+        let seq = pos.record_trade(
+            TradeReason::ArbLegYes,
+            "polymarket",
+            "yes",
+            10.0,  // requested
+            10.0,  // filled
+            0.45,  // price
+            TradeStatus::Success,
+            None,
+            Some("order-123".to_string()),
+        );
+
+        assert_eq!(seq, 0, "First trade should have sequence 0");
+        assert_eq!(pos.trades.len(), 1);
+
+        let trade = &pos.trades[0];
+        assert_eq!(trade.sequence, 0);
+        assert_eq!(trade.reason, TradeReason::ArbLegYes);
+        assert_eq!(trade.platform, "polymarket");
+        assert_eq!(trade.side, "yes");
+        assert_eq!(trade.requested_contracts, 10.0);
+        assert_eq!(trade.filled_contracts, 10.0);
+        assert!((trade.price - 0.45).abs() < 0.001);
+        assert_eq!(trade.status, TradeStatus::Success);
+        assert!(trade.failure_reason.is_none());
+        assert_eq!(trade.order_id, Some("order-123".to_string()));
+    }
+
+    #[test]
+    fn test_trade_history_records_failure() {
+        let mut pos = ArbPosition::new("TEST-MARKET", "Test");
+
+        pos.record_trade(
+            TradeReason::ArbLegNo,
+            "kalshi",
+            "no",
+            10.0,  // requested
+            0.0,   // filled (failed)
+            0.50,  // price
+            TradeStatus::Failed,
+            Some("Insufficient balance".to_string()),
+            None,
+        );
+
+        assert_eq!(pos.trades.len(), 1);
+
+        let trade = &pos.trades[0];
+        assert_eq!(trade.reason, TradeReason::ArbLegNo);
+        assert_eq!(trade.status, TradeStatus::Failed);
+        assert_eq!(trade.filled_contracts, 0.0);
+        assert_eq!(trade.failure_reason, Some("Insufficient balance".to_string()));
+        assert!(trade.order_id.is_none());
+    }
+
+    #[test]
+    fn test_trade_history_records_partial_fill() {
+        let mut pos = ArbPosition::new("TEST-MARKET", "Test");
+
+        pos.record_trade(
+            TradeReason::ArbLegYes,
+            "polymarket",
+            "yes",
+            10.0,  // requested
+            7.0,   // filled (partial)
+            0.45,
+            TradeStatus::PartialFill,
+            None,
+            Some("order-456".to_string()),
+        );
+
+        let trade = &pos.trades[0];
+        assert_eq!(trade.status, TradeStatus::PartialFill);
+        assert_eq!(trade.requested_contracts, 10.0);
+        assert_eq!(trade.filled_contracts, 7.0);
+    }
+
+    #[test]
+    fn test_trade_history_records_auto_close_retries() {
+        let mut pos = ArbPosition::new("TEST-MARKET", "Test");
+
+        // First close attempt (partial)
+        pos.record_trade(
+            TradeReason::AutoClose,
+            "kalshi",
+            "no",
+            -10.0,  // negative = closing
+            -7.0,   // partial fill
+            0.18,
+            TradeStatus::PartialFill,
+            None,
+            Some("order-100".to_string()),
+        );
+
+        // Retry at lower price
+        pos.record_trade(
+            TradeReason::AutoCloseRetry,
+            "kalshi",
+            "no",
+            -3.0,   // remaining
+            -3.0,   // filled
+            0.17,
+            TradeStatus::Success,
+            None,
+            Some("order-101".to_string()),
+        );
+
+        assert_eq!(pos.trades.len(), 2);
+
+        let first = &pos.trades[0];
+        assert_eq!(first.reason, TradeReason::AutoClose);
+        assert_eq!(first.sequence, 0);
+
+        let retry = &pos.trades[1];
+        assert_eq!(retry.reason, TradeReason::AutoCloseRetry);
+        assert_eq!(retry.sequence, 1);
+        assert!((retry.price - 0.17).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_trade_history_records_circuit_breaker_block() {
+        let mut pos = ArbPosition::new("TEST-MARKET", "Test");
+
+        pos.record_trade(
+            TradeReason::CircuitBreakerBlock,
+            "kalshi",
+            "no",
+            50.0,  // requested
+            0.0,   // blocked, nothing filled
+            0.19,
+            TradeStatus::Blocked,
+            Some("max_position_per_market exceeded (limit: 10)".to_string()),
+            None,
+        );
+
+        let trade = &pos.trades[0];
+        assert_eq!(trade.reason, TradeReason::CircuitBreakerBlock);
+        assert_eq!(trade.status, TradeStatus::Blocked);
+        assert_eq!(trade.filled_contracts, 0.0);
+        assert!(trade.failure_reason.is_some());
+    }
+
+    #[test]
+    fn test_trade_history_sequence_incrementing() {
+        let mut pos = ArbPosition::new("TEST-MARKET", "Test");
+
+        for i in 0..5 {
+            let seq = pos.record_trade(
+                TradeReason::ArbLegYes,
+                "polymarket",
+                "yes",
+                1.0, 1.0, 0.50,
+                TradeStatus::Success,
+                None, None,
+            );
+            assert_eq!(seq, i as u32, "Sequence should increment");
+        }
+
+        assert_eq!(pos.trades.len(), 5);
+        for (i, trade) in pos.trades.iter().enumerate() {
+            assert_eq!(trade.sequence, i as u32);
+        }
+    }
+
+    #[test]
+    fn test_trade_history_persists_via_fill_record() {
+        let mut tracker = PositionTracker::new();
+
+        // Record a fill with full details
+        let fill = FillRecord::with_details(
+            "TEST-MARKET",
+            "Test Market",
+            "polymarket",
+            "yes",
+            10.0,  // requested
+            10.0,  // filled
+            0.45,
+            0.0,   // fees
+            "order-123",
+            TradeReason::ArbLegYes,
+            TradeStatus::Success,
+            None,
+        );
+        tracker.record_fill_internal(&fill);
+
+        let pos = tracker.get("TEST-MARKET").expect("Position should exist");
+        assert_eq!(pos.trades.len(), 1);
+
+        let trade = &pos.trades[0];
+        assert_eq!(trade.reason, TradeReason::ArbLegYes);
+        assert_eq!(trade.status, TradeStatus::Success);
+        assert_eq!(trade.filled_contracts, 10.0);
+    }
+
+    #[test]
+    fn test_trade_history_records_zero_fills() {
+        let mut tracker = PositionTracker::new();
+
+        // Record a failed fill (0 contracts)
+        let fill = FillRecord::with_details(
+            "TEST-MARKET",
+            "Test Market",
+            "kalshi",
+            "no",
+            10.0,  // requested
+            0.0,   // filled (failed)
+            0.50,
+            0.0,
+            "",
+            TradeReason::ArbLegNo,
+            TradeStatus::Failed,
+            Some("No fill".to_string()),
+        );
+        tracker.record_fill_internal(&fill);
+
+        let pos = tracker.get("TEST-MARKET").expect("Position should exist");
+
+        // Trade history should have the record even though no contracts filled
+        assert_eq!(pos.trades.len(), 1);
+        assert_eq!(pos.trades[0].status, TradeStatus::Failed);
+        assert_eq!(pos.trades[0].filled_contracts, 0.0);
+
+        // Position leg should NOT be updated for zero-fill
+        assert_eq!(pos.kalshi_no.contracts, 0.0);
+    }
+
+    #[test]
+    fn test_trade_history_complete_arb_scenario() {
+        let mut tracker = PositionTracker::new();
+
+        // Scenario: Arb attempt where YES fills but NO fails, then auto-close
+        // 1. Poly YES fills 10
+        let yes_fill = FillRecord::with_details(
+            "TEST-MARKET", "Test", "polymarket", "yes",
+            10.0, 10.0, 0.45, 0.0, "order-1",
+            TradeReason::ArbLegYes, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&yes_fill);
+
+        // 2. Kalshi NO fails
+        let no_fill = FillRecord::with_details(
+            "TEST-MARKET", "Test", "kalshi", "no",
+            10.0, 0.0, 0.50, 0.0, "",
+            TradeReason::ArbLegNo, TradeStatus::Failed, Some("No liquidity".to_string()),
+        );
+        tracker.record_fill_internal(&no_fill);
+
+        // 3. Auto-close attempt 1 (partial)
+        let close1 = FillRecord::with_details(
+            "TEST-MARKET", "Test", "polymarket", "yes",
+            -10.0, -7.0, 0.44, 0.0, "order-2",
+            TradeReason::AutoClose, TradeStatus::PartialFill, None,
+        );
+        tracker.record_fill_internal(&close1);
+
+        // 4. Auto-close retry (complete)
+        let close2 = FillRecord::with_details(
+            "TEST-MARKET", "Test", "polymarket", "yes",
+            -3.0, -3.0, 0.43, 0.0, "order-3",
+            TradeReason::AutoCloseRetry, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&close2);
+
+        let pos = tracker.get("TEST-MARKET").expect("Position should exist");
+
+        // Should have 4 trades in history
+        assert_eq!(pos.trades.len(), 4);
+
+        // Verify sequence order
+        assert_eq!(pos.trades[0].sequence, 0);
+        assert_eq!(pos.trades[1].sequence, 1);
+        assert_eq!(pos.trades[2].sequence, 2);
+        assert_eq!(pos.trades[3].sequence, 3);
+
+        // Verify reasons
+        assert_eq!(pos.trades[0].reason, TradeReason::ArbLegYes);
+        assert_eq!(pos.trades[1].reason, TradeReason::ArbLegNo);
+        assert_eq!(pos.trades[2].reason, TradeReason::AutoClose);
+        assert_eq!(pos.trades[3].reason, TradeReason::AutoCloseRetry);
+
+        // Net position should be 0 after auto-close
+        // +10 - 7 - 3 = 0
+        let net = pos.poly_yes.contracts;
+        assert!(net.abs() < 0.001, "Net position should be 0, got {}", net);
     }
 }
