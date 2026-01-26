@@ -6,7 +6,7 @@
 //! 3. Calculates guaranteed profit for arb positions
 //! 4. Persists and loads state from JSON
 
-use arb_bot::position_tracker::{FillRecord, PositionTracker};
+use arb_bot::position_tracker::{FillRecord, PositionTracker, TradeReason, TradeStatus};
 use std::fs;
 use tempfile::NamedTempFile;
 
@@ -552,4 +552,158 @@ fn test_position_tracker_all_leg_types() {
 
     // Unmatched: |4 - 6| = 2
     assert!((pos.unmatched_exposure() - 2.0).abs() < 0.001, "Should have 2 unmatched contracts");
+}
+
+// ============================================================================
+// TEST: TRADE HISTORY PERSISTENCE
+// ============================================================================
+
+/// Test that trade history survives save/load cycle.
+#[test]
+fn test_trade_history_persists_to_json() {
+    // Create a temporary file for the test
+    let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+    let path = temp_file.path();
+
+    // Create tracker and add a position with trade history
+    let mut tracker = PositionTracker::new();
+
+    // Record fills using with_details to include full trade history
+    let fill1 = FillRecord::with_details(
+        "KXNBA-26-SAS",
+        "Test Market",
+        "polymarket",
+        "yes",
+        10.0,  // requested
+        10.0,  // filled
+        0.45,  // price
+        0.0,   // fees
+        "order-123",
+        TradeReason::ArbLegYes,
+        TradeStatus::Success,
+        None,
+    );
+    tracker.record_fill_internal(&fill1);
+
+    let fill2 = FillRecord::with_details(
+        "KXNBA-26-SAS",
+        "Test Market",
+        "kalshi",
+        "no",
+        10.0,  // requested
+        0.0,   // filled (failed)
+        0.50,  // price
+        0.0,   // fees
+        "",
+        TradeReason::ArbLegNo,
+        TradeStatus::Failed,
+        Some("No liquidity".to_string()),
+    );
+    tracker.record_fill_internal(&fill2);
+
+    let fill3 = FillRecord::with_details(
+        "KXNBA-26-SAS",
+        "Test Market",
+        "polymarket",
+        "yes",
+        -10.0,  // requested (negative = close)
+        -10.0,  // filled
+        0.44,   // price
+        0.0,    // fees
+        "order-456",
+        TradeReason::AutoClose,
+        TradeStatus::Success,
+        None,
+    );
+    tracker.record_fill_internal(&fill3);
+
+    // Verify trade history before save
+    let pos_before = tracker.get("KXNBA-26-SAS").expect("Position should exist");
+    assert_eq!(pos_before.trades.len(), 3, "Should have 3 trades before save");
+
+    // Save to temp file
+    tracker.save_to(path).expect("Failed to save tracker");
+
+    // Verify the JSON contains trade history
+    let contents = fs::read_to_string(path).expect("Failed to read saved file");
+    assert!(contents.contains("trades"), "JSON should contain trades field");
+    assert!(contents.contains("arb_leg_yes"), "JSON should contain arb_leg_yes reason");
+    assert!(contents.contains("arb_leg_no"), "JSON should contain arb_leg_no reason");
+    assert!(contents.contains("auto_close"), "JSON should contain auto_close reason");
+    assert!(contents.contains("No liquidity"), "JSON should contain failure reason");
+
+    // Load from temp file
+    let loaded_tracker = PositionTracker::load_from(path);
+
+    // Verify loaded trade history matches original
+    let loaded_pos = loaded_tracker.get("KXNBA-26-SAS").expect("Position should exist after load");
+    assert_eq!(loaded_pos.trades.len(), 3, "Should have 3 trades after load");
+
+    // Verify first trade (successful arb leg)
+    let trade1 = &loaded_pos.trades[0];
+    assert_eq!(trade1.sequence, 0);
+    assert_eq!(trade1.reason, TradeReason::ArbLegYes);
+    assert_eq!(trade1.status, TradeStatus::Success);
+    assert_eq!(trade1.filled_contracts, 10.0);
+    assert!(trade1.failure_reason.is_none());
+
+    // Verify second trade (failed arb leg)
+    let trade2 = &loaded_pos.trades[1];
+    assert_eq!(trade2.sequence, 1);
+    assert_eq!(trade2.reason, TradeReason::ArbLegNo);
+    assert_eq!(trade2.status, TradeStatus::Failed);
+    assert_eq!(trade2.filled_contracts, 0.0);
+    assert_eq!(trade2.failure_reason, Some("No liquidity".to_string()));
+
+    // Verify third trade (auto-close)
+    let trade3 = &loaded_pos.trades[2];
+    assert_eq!(trade3.sequence, 2);
+    assert_eq!(trade3.reason, TradeReason::AutoClose);
+    assert_eq!(trade3.status, TradeStatus::Success);
+    assert_eq!(trade3.filled_contracts, -10.0);
+}
+
+// ============================================================================
+// TEST: BACKWARD COMPATIBILITY - Load positions without trades field
+// ============================================================================
+
+/// Test that loading old positions.json without trades field still works.
+#[test]
+fn test_backward_compatibility_no_trades_field() {
+    // Create a JSON string that simulates old format (no trades field)
+    let old_json = r#"{
+        "positions": {
+            "KXNBA-26-TEST": {
+                "market_id": "KXNBA-26-TEST",
+                "description": "Old Market",
+                "kalshi_yes": { "contracts": 0.0, "cost_basis": 0.0, "avg_price": 0.0 },
+                "kalshi_no": { "contracts": 10.0, "cost_basis": 5.0, "avg_price": 0.5 },
+                "poly_yes": { "contracts": 10.0, "cost_basis": 4.5, "avg_price": 0.45 },
+                "poly_no": { "contracts": 0.0, "cost_basis": 0.0, "avg_price": 0.0 },
+                "total_fees": 0.05,
+                "opened_at": "2026-01-26T08:00:00Z",
+                "status": "open",
+                "realized_pnl": null
+            }
+        },
+        "daily_realized_pnl": 0.0,
+        "trading_date": "2026-01-26",
+        "all_time_pnl": 0.0
+    }"#;
+
+    // Write to temp file
+    let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+    fs::write(temp_file.path(), old_json).expect("Failed to write old format");
+
+    // Load - should succeed with empty trades vec due to #[serde(default)]
+    let tracker = PositionTracker::load_from(temp_file.path());
+
+    let pos = tracker.get("KXNBA-26-TEST").expect("Position should exist");
+
+    // Position data should be intact
+    assert_eq!(pos.kalshi_no.contracts, 10.0);
+    assert_eq!(pos.poly_yes.contracts, 10.0);
+
+    // Trades should be empty (default)
+    assert_eq!(pos.trades.len(), 0, "Old positions should have empty trades vec");
 }

@@ -18,7 +18,7 @@ use crate::types::{
     cents_to_price,
 };
 use crate::circuit_breaker::CircuitBreaker;
-use crate::position_tracker::{FillRecord, PositionChannel};
+use crate::position_tracker::{FillRecord, PositionChannel, TradeReason, TradeStatus};
 use crate::config::{KALSHI_WEB_BASE, build_polymarket_url};
 
 // =============================================================================
@@ -374,25 +374,61 @@ impl ExecutionEngine {
                     self.circuit_breaker.record_success(&pair.pair_id, matched, matched, actual_profit as f64 / 100.0).await;
                 }
 
-                if matched > 0 {
-                    let (platform1, side1, platform2, side2) = match req.arb_type {
-                        ArbType::PolyYesKalshiNo => ("polymarket", "yes", "kalshi", "no"),
-                        ArbType::KalshiYesPolyNo => ("kalshi", "yes", "polymarket", "no"),
-                        ArbType::PolyOnly => ("polymarket", "yes", "polymarket", "no"),
-                        ArbType::KalshiOnly => ("kalshi", "yes", "kalshi", "no"),
-                    };
+                // Record fills for each leg individually (not just matched contracts)
+                // This ensures position tracker is accurate even when one leg fails
+                // and auto-close runs to unwind the other leg
+                //
+                // We also record failed attempts for complete audit trail
+                let (platform1, side1, platform2, side2) = match req.arb_type {
+                    ArbType::PolyYesKalshiNo => ("polymarket", "yes", "kalshi", "no"),
+                    ArbType::KalshiYesPolyNo => ("kalshi", "yes", "polymarket", "no"),
+                    ArbType::PolyOnly => ("polymarket", "yes", "polymarket", "no"),
+                    ArbType::KalshiOnly => ("kalshi", "yes", "kalshi", "no"),
+                };
 
-                    self.position_channel.record_fill(FillRecord::new(
-                        &pair.pair_id, &pair.description, platform1, side1,
-                        matched as f64, yes_cost as f64 / 100.0 / yes_filled.max(1) as f64,
-                        0.0, &yes_order_id,
-                    ));
-                    self.position_channel.record_fill(FillRecord::new(
-                        &pair.pair_id, &pair.description, platform2, side2,
-                        matched as f64, no_cost as f64 / 100.0 / no_filled.max(1) as f64,
-                        0.0, &no_order_id,
-                    ));
-                }
+                // Record YES leg (success, partial, or failed)
+                let yes_requested = max_contracts as f64;
+                let yes_status = if yes_filled == max_contracts {
+                    TradeStatus::Success
+                } else if yes_filled > 0 {
+                    TradeStatus::PartialFill
+                } else {
+                    TradeStatus::Failed
+                };
+                let yes_price = if yes_filled > 0 {
+                    yes_cost as f64 / 100.0 / yes_filled as f64
+                } else {
+                    cents_to_price(req.yes_price)
+                };
+                self.position_channel.record_fill(FillRecord::with_details(
+                    &pair.pair_id, &pair.description, platform1, side1,
+                    yes_requested, yes_filled as f64, yes_price,
+                    0.0, &yes_order_id,
+                    TradeReason::ArbLegYes, yes_status,
+                    if yes_filled == 0 { Some("No fill".to_string()) } else { None },
+                ));
+
+                // Record NO leg (success, partial, or failed)
+                let no_requested = max_contracts as f64;
+                let no_status = if no_filled == max_contracts {
+                    TradeStatus::Success
+                } else if no_filled > 0 {
+                    TradeStatus::PartialFill
+                } else {
+                    TradeStatus::Failed
+                };
+                let no_price = if no_filled > 0 {
+                    no_cost as f64 / 100.0 / no_filled as f64
+                } else {
+                    cents_to_price(req.no_price)
+                };
+                self.position_channel.record_fill(FillRecord::with_details(
+                    &pair.pair_id, &pair.description, platform2, side2,
+                    no_requested, no_filled as f64, no_price,
+                    0.0, &no_order_id,
+                    TradeReason::ArbLegNo, no_status,
+                    if no_filled == 0 { Some("No fill".to_string()) } else { None },
+                ));
 
                 Ok(ExecutionResult {
                     market_id,
@@ -657,17 +693,35 @@ impl ExecutionEngine {
         const PRICE_STEP_CENTS: i64 = 1; // Walk down 1c at a time
         const RETRY_DELAY_MS: u64 = 100; // Brief delay between retries
 
-        // Helper to record close fill (negative contracts to reduce position)
+        // Helper to record close fill with trade history details
+        // attempt: 1 = first close, 2+ = retry
+        // requested: how many we asked to close
+        // closed: how many actually closed
         let record_close = |position_channel: &PositionChannel, platform: &str, side: &str,
-                           closed: f64, price: f64, order_id: &str| {
-            if closed > 0.0 {
-                // Use negative contracts to indicate closing/selling
-                position_channel.record_fill(FillRecord::new(
-                    &pair_id, &description, platform, side,
-                    -closed,  // Negative = closing position
-                    price, 0.0, order_id,
-                ));
-            }
+                           requested: f64, closed: f64, price: f64, order_id: &str, attempt: u32| {
+            let reason = if attempt == 1 {
+                TradeReason::AutoClose
+            } else {
+                TradeReason::AutoCloseRetry
+            };
+
+            let status = if closed >= requested {
+                TradeStatus::Success
+            } else if closed > 0.0 {
+                TradeStatus::PartialFill
+            } else {
+                TradeStatus::Failed
+            };
+
+            // Record even zero fills for complete audit trail
+            position_channel.record_fill(FillRecord::with_details(
+                &pair_id, &description, platform, side,
+                -requested,  // Negative = closing position
+                -closed,     // Negative = closing position
+                price, 0.0, order_id,
+                reason, status,
+                if closed == 0.0 { Some("No fill".to_string()) } else { None },
+            ));
         };
 
         // Helper to log final P&L after close attempts
@@ -774,49 +828,52 @@ impl ExecutionEngine {
         log_final_result: G,
     )
     where
-        F: Fn(&PositionChannel, &str, &str, f64, f64, &str),
+        F: Fn(&PositionChannel, &str, &str, f64, f64, f64, &str, u32),
         G: Fn(&str, i64, i64, i64),
     {
         let mut remaining = total_to_close;
         let mut current_price_cents = (start_price_cents as i64).saturating_sub(1).max(min_price_cents);
         let mut total_closed: i64 = 0;
         let mut total_proceeds_cents: i64 = 0;
-        let mut attempt = 0;
+        let mut attempt = 0u32;
 
         while remaining > 0 && current_price_cents >= min_price_cents {
             attempt += 1;
             let price_decimal = cents_to_price(current_price_cents as u16);
+            let requested = remaining as f64;
 
-            match poly_async.sell_fak(token, price_decimal, remaining as f64).await {
+            match poly_async.sell_fak(token, price_decimal, requested).await {
                 Ok(fill) => {
                     let filled = fill.filled_size as i64;
                     let proceeds_cents = (fill.fill_cost * 100.0) as i64;
 
+                    info!(
+                        "[EXEC] 🔄 Poly close attempt #{}: filled {}/{} @ {}c (total: {}/{})",
+                        attempt, filled, remaining, current_price_cents, total_closed + filled, total_to_close
+                    );
+
+                    // Record every attempt (even zero fills) for complete audit trail
+                    record_close(
+                        position_channel, "polymarket", side,
+                        requested, fill.filled_size, fill.fill_cost / fill.filled_size.max(0.001),
+                        &fill.order_id, attempt
+                    );
+
                     if filled > 0 {
-                        info!(
-                            "[EXEC] 🔄 Poly close attempt #{}: filled {}/{} @ {}c (total: {}/{})",
-                            attempt, filled, remaining, current_price_cents, total_closed + filled, total_to_close
-                        );
-
-                        record_close(
-                            position_channel, "polymarket", side,
-                            fill.filled_size, fill.fill_cost / fill.filled_size.max(0.001), &fill.order_id
-                        );
-
                         total_closed += filled;
                         total_proceeds_cents += proceeds_cents;
                         remaining -= filled;
-                    } else {
-                        info!(
-                            "[EXEC] 🔄 Poly close attempt #{}: 0 filled @ {}c, stepping down",
-                            attempt, current_price_cents
-                        );
                     }
                 }
                 Err(e) => {
                     warn!(
                         "[EXEC] ⚠️ Poly close attempt #{} failed @ {}c: {}",
                         attempt, current_price_cents, e
+                    );
+                    // Record the failed attempt
+                    record_close(
+                        position_channel, "polymarket", side,
+                        requested, 0.0, price_decimal, "", attempt
                     );
                 }
             }
@@ -852,17 +909,19 @@ impl ExecutionEngine {
         log_final_result: G,
     )
     where
-        F: Fn(&PositionChannel, &str, &str, f64, f64, &str),
+        F: Fn(&PositionChannel, &str, &str, f64, f64, f64, &str, u32),
         G: Fn(&str, i64, i64, i64),
     {
         let mut remaining = total_to_close;
         let mut current_price_cents = start_price_cents.saturating_sub(1).max(min_price_cents);
         let mut total_closed: i64 = 0;
         let mut total_proceeds_cents: i64 = 0;
-        let mut attempt = 0;
+        let mut attempt = 0u32;
 
         while remaining > 0 && current_price_cents >= min_price_cents {
             attempt += 1;
+            let requested = remaining as f64;
+            let price_decimal = current_price_cents as f64 / 100.0;
 
             match kalshi.sell_ioc(ticker, side, current_price_cents, remaining).await {
                 Ok(resp) => {
@@ -870,32 +929,33 @@ impl ExecutionEngine {
                     let proceeds_cents = resp.order.taker_fill_cost.unwrap_or(0)
                         + resp.order.maker_fill_cost.unwrap_or(0);
 
+                    info!(
+                        "[EXEC] 🔄 Kalshi close attempt #{}: filled {}/{} @ {}c (total: {}/{})",
+                        attempt, filled, remaining, current_price_cents, total_closed + filled, total_to_close
+                    );
+
+                    // Record every attempt (even zero fills) for complete audit trail
+                    record_close(
+                        position_channel, "kalshi", side,
+                        requested, filled as f64, proceeds_cents as f64 / 100.0 / filled.max(1) as f64,
+                        &resp.order.order_id, attempt
+                    );
+
                     if filled > 0 {
-                        info!(
-                            "[EXEC] 🔄 Kalshi close attempt #{}: filled {}/{} @ {}c (total: {}/{})",
-                            attempt, filled, remaining, current_price_cents, total_closed + filled, total_to_close
-                        );
-
-                        record_close(
-                            position_channel, "kalshi", side,
-                            filled as f64, proceeds_cents as f64 / 100.0 / filled.max(1) as f64,
-                            &resp.order.order_id
-                        );
-
                         total_closed += filled;
                         total_proceeds_cents += proceeds_cents;
                         remaining -= filled;
-                    } else {
-                        info!(
-                            "[EXEC] 🔄 Kalshi close attempt #{}: 0 filled @ {}c, stepping down",
-                            attempt, current_price_cents
-                        );
                     }
                 }
                 Err(e) => {
                     warn!(
                         "[EXEC] ⚠️ Kalshi close attempt #{} failed @ {}c: {}",
                         attempt, current_price_cents, e
+                    );
+                    // Record the failed attempt
+                    record_close(
+                        position_channel, "kalshi", side,
+                        requested, 0.0, price_decimal, "", attempt
                     );
                 }
             }

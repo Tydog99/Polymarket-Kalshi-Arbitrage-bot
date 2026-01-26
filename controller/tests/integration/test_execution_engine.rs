@@ -227,7 +227,8 @@ async fn test_engine_both_full_fill() {
 
 /// Test: Both sides partial fill.
 ///
-/// Expected: FillRecords reflect the actual partial quantities from APIs.
+/// Expected: FillRecords reflect the ACTUAL partial quantities from APIs (not just matched).
+/// Each leg records its own fill count for accurate position tracking.
 #[tokio::test]
 async fn test_engine_partial_fills() {
     let kalshi_server = MockServer::start().await;
@@ -264,30 +265,31 @@ async fn test_engine_partial_fills() {
 
     assert!(result.is_ok(), "Execution should succeed");
 
-    // Verify fills reflect partial amounts
+    // Verify fills reflect ACTUAL partial amounts (not just matched)
     let fills = drain_fills(&mut fill_rx).await;
 
-    // Should have fills for the matched amount (min of both sides)
-    let kalshi_fill = fills.iter().find(|f| f.platform == "kalshi");
-    let poly_fill = fills.iter().find(|f| f.platform == "polymarket");
+    let kalshi_fill = fills.iter().find(|f| f.platform == "kalshi" && f.contracts > 0.0);
+    let poly_fill = fills.iter().find(|f| f.platform == "polymarket" && f.contracts > 0.0);
 
-    // The matched contracts should be min(kalshi_filled, poly_filled)
-    // Kalshi fixture has 114 filled, Poly fixture has 5 filled
-    // So matched = 5
-    if let (Some(k), Some(p)) = (kalshi_fill, poly_fill) {
-        let matched = k.contracts.min(p.contracts);
-        assert!(matched > 0.0, "Should have some matched contracts");
-        // Both fills should record the matched amount
-        assert_eq!(k.contracts, matched, "Kalshi fill should be matched amount");
-        assert_eq!(p.contracts, matched, "Poly fill should be matched amount");
-    }
+    // Each leg should record its ACTUAL fill count for accurate position tracking
+    // Kalshi fixture has 114 filled, Poly has 5 filled
+    assert!(kalshi_fill.is_some(), "Should have Kalshi fill");
+    assert!(poly_fill.is_some(), "Should have Poly fill");
+
+    let k = kalshi_fill.unwrap();
+    let p = poly_fill.unwrap();
+
+    // Kalshi should record 114 (its actual fill), not 5 (matched)
+    assert_eq!(k.contracts, 114.0, "Kalshi fill should be ACTUAL fill count (114)");
+    // Poly should record 5 (its actual fill)
+    assert_eq!(p.contracts, 5.0, "Poly fill should be ACTUAL fill count (5)");
 }
 
 /// Test: Kalshi fills but Poly fails.
 ///
 /// Expected:
-/// - No matched position fills (matched = 0 when one leg fails)
-/// - Auto-close records a close fill with negative contracts
+/// - Original Kalshi fill IS recorded (positive contracts)
+/// - Auto-close records a close fill (negative contracts)
 /// - Net position is 0 after auto-close
 #[tokio::test]
 async fn test_engine_kalshi_fills_poly_fails() {
@@ -354,16 +356,16 @@ async fn test_engine_kalshi_fills_poly_fails() {
     let fills = drain_fills(&mut fill_rx).await;
 
     // When one leg fails and one succeeds:
-    // - matched = min(kalshi_filled, poly_filled) = min(1, 0) = 0
-    // - No matched position fills (positive contracts)
-    // - But auto-close records a close fill (negative contracts)
+    // - Original Kalshi fill SHOULD be recorded (this was the bug - it wasn't before)
+    // - Auto-close records a close fill (negative contracts)
+    // - Net position should be 0
 
-    let matched_fills: Vec<_> = fills.iter().filter(|f| f.contracts > 0.0).collect();
+    let original_fills: Vec<_> = fills.iter().filter(|f| f.contracts > 0.0).collect();
     let close_fills: Vec<_> = fills.iter().filter(|f| f.contracts < 0.0).collect();
 
     assert_eq!(
-        matched_fills.len(), 0,
-        "No matched fills when one leg fails completely"
+        original_fills.len(), 1,
+        "Should have 1 original fill (Kalshi NO that succeeded)"
     );
 
     assert_eq!(
@@ -371,16 +373,52 @@ async fn test_engine_kalshi_fills_poly_fails() {
         "Should have 1 close fill from auto-close"
     );
 
+    // Verify the original fill is on Kalshi NO
+    let original = &original_fills[0];
+    assert_eq!(original.platform, "kalshi");
+    assert_eq!(original.side, "no");
+    assert!(original.contracts > 0.0, "Original fill should have positive contracts");
+
     // Verify the close fill is on Kalshi NO (the side that filled)
     let close = &close_fills[0];
     assert_eq!(close.platform, "kalshi");
     assert_eq!(close.side, "no");
     assert!(close.contracts < 0.0, "Close fill should have negative contracts");
+
+    // Verify net position is 0
+    let net: f64 = fills.iter()
+        .filter(|f| f.platform == "kalshi" && f.side == "no")
+        .map(|f| f.contracts)
+        .sum();
+    assert!(
+        net.abs() < 0.01,
+        "Net Kalshi NO position should be 0, got {}",
+        net
+    );
+
+    // NEW: Verify trade history includes the failed Poly attempt
+    // With trade history, we now record ALL attempts including failures
+    let poly_fills: Vec<_> = fills.iter()
+        .filter(|f| f.platform == "polymarket" && f.side == "yes")
+        .collect();
+
+    assert_eq!(
+        poly_fills.len(), 1,
+        "Should have 1 Poly YES fill record (the failed attempt). Got: {:?}",
+        poly_fills.iter().map(|f| f.contracts).collect::<Vec<_>>()
+    );
+
+    let poly_fill = &poly_fills[0];
+    assert_eq!(
+        poly_fill.contracts, 0.0,
+        "Failed Poly attempt should have 0 contracts"
+    );
 }
 
 /// Test: Both sides get no fill (canceled/expired).
 ///
-/// Expected: No FillRecords created.
+/// Expected: FillRecords created for audit trail, but with 0 filled contracts.
+/// Trade history now records ALL attempts (including failures) for debugging.
 #[tokio::test]
 async fn test_engine_no_fills() {
     let kalshi_server = MockServer::start().await;
@@ -416,9 +454,19 @@ async fn test_engine_no_fills() {
 
     assert!(result.is_ok());
 
-    // Verify no fills recorded
+    // With trade history, we now record ALL attempts for audit trail
+    // Both legs should have records, but with 0 filled contracts
     let fills = drain_fills(&mut fill_rx).await;
-    assert_eq!(fills.len(), 0, "No fills when both legs get 0 quantity");
+    assert_eq!(fills.len(), 2, "Should have 2 fill records (one per leg) even when both get 0 fill");
+
+    // Verify both fills have 0 contracts (no actual positions opened)
+    for fill in &fills {
+        assert_eq!(
+            fill.contracts, 0.0,
+            "Fill for {} {} should have 0 contracts",
+            fill.platform, fill.side
+        );
+    }
 }
 
 // =============================================================================
@@ -529,6 +577,21 @@ async fn test_auto_close_kalshi_excess_sells_on_kalshi() {
     assert_eq!(close.side, "no", "Close should be for NO side");
     assert!(close.contracts < 0.0, "Close fill should have negative contracts");
 
+    // NEW: Verify trade history includes the failed Poly attempt
+    let poly_fills: Vec<_> = fills
+        .iter()
+        .filter(|f| f.platform == "polymarket" && f.side == "yes")
+        .collect();
+
+    assert_eq!(
+        poly_fills.len(), 1,
+        "Should have 1 Poly YES fill record (the failed attempt)"
+    );
+    assert_eq!(
+        poly_fills[0].contracts, 0.0,
+        "Failed Poly attempt should have 0 contracts"
+    );
+
     // Wiremock expect(1) will verify Kalshi sell WAS called when server drops
 }
 
@@ -625,6 +688,21 @@ async fn test_auto_close_poly_excess_sells_on_poly() {
         "Should close 1 contract, got {}",
         close.contracts.abs()
     );
+
+    // NEW: Verify trade history includes the failed Kalshi attempt
+    let kalshi_fills: Vec<_> = fills
+        .iter()
+        .filter(|f| f.platform == "kalshi" && f.side == "no")
+        .collect();
+
+    assert_eq!(
+        kalshi_fills.len(), 1,
+        "Should have 1 Kalshi NO fill record (the failed attempt)"
+    );
+    assert_eq!(
+        kalshi_fills[0].contracts, 0.0,
+        "Failed Kalshi attempt should have 0 contracts"
+    );
 }
 
 // ============================================================================
@@ -716,6 +794,21 @@ async fn test_auto_close_retries_with_price_improvement() {
         "Should have recorded close fill. Fills: {:?}",
         fills.iter().map(|f| (f.platform.as_str(), f.side.as_str(), f.contracts)).collect::<Vec<_>>()
     );
+
+    // NEW: Verify trade history includes the failed Kalshi attempt
+    let kalshi_fills: Vec<_> = fills
+        .iter()
+        .filter(|f| f.platform == "kalshi" && f.side == "no")
+        .collect();
+
+    assert_eq!(
+        kalshi_fills.len(), 1,
+        "Should have 1 Kalshi NO fill record (the failed attempt)"
+    );
+    assert_eq!(
+        kalshi_fills[0].contracts, 0.0,
+        "Failed Kalshi attempt should have 0 contracts"
+    );
 }
 
 /// Test: Auto-close retry verifies multiple attempts with partial fills.
@@ -796,5 +889,166 @@ async fn test_auto_close_retry_starts_at_minus_1c() {
         (close.contracts.abs() - 5.0).abs() < 0.01,
         "Should close 5 contracts, got {}",
         close.contracts.abs()
+    );
+
+    // NEW: Verify trade history includes the failed Kalshi attempt
+    let kalshi_fills: Vec<_> = fills
+        .iter()
+        .filter(|f| f.platform == "kalshi" && f.side == "no")
+        .collect();
+
+    assert_eq!(
+        kalshi_fills.len(), 1,
+        "Should have 1 Kalshi NO fill record (the failed attempt)"
+    );
+    assert_eq!(
+        kalshi_fills[0].contracts, 0.0,
+        "Failed Kalshi attempt should have 0 contracts"
+    );
+}
+
+// =============================================================================
+// NET POSITION TESTS - Verify position tracker shows correct state after auto-close
+// =============================================================================
+
+/// Test: When one leg completely fails and auto-close runs, net position should be 0.
+///
+/// This is a regression test for a bug where:
+/// - Kalshi NO filled (10 contracts)
+/// - Poly YES failed completely (0 contracts)
+/// - Auto-close sold 10 Kalshi NO contracts
+/// - BUT: Only the close fill (-10) was recorded, not the original buy (+10)
+/// - Result: Position tracker showed -10 instead of 0
+///
+/// The bug was in execution.rs line 377: `if matched > 0 {`
+/// Original fills were only recorded when matched > 0, but auto-close always recorded.
+///
+/// Expected behavior:
+/// - Original Kalshi NO fill recorded: +10 contracts
+/// - Auto-close fill recorded: -10 contracts
+/// - Net position: 0 contracts
+#[tokio::test]
+async fn test_auto_close_results_in_net_zero_position() {
+    let kalshi_server = MockServer::start().await;
+
+    // Mount Kalshi BUY with full fill (1 contract for simplicity)
+    let buy_exchange = load_fixture(fixture_path("kalshi_full_fill_real.json"))
+        .expect("Failed to load fixture");
+
+    let mut buy_response = ResponseTemplate::new(buy_exchange.response.status)
+        .set_body_raw(buy_exchange.response.body_raw.clone(), "application/json");
+
+    for (key, value) in &buy_exchange.response.headers {
+        if key.to_lowercase() != "content-length" && key.to_lowercase() != "transfer-encoding" {
+            buy_response = buy_response.append_header(key.as_str(), value.as_str());
+        }
+    }
+
+    // Mount Kalshi SELL response for the auto-close order
+    let sell_exchange = load_fixture(fixture_path("kalshi_sell_full_fill_real.json"))
+        .expect("Failed to load sell fixture");
+
+    let mut sell_response = ResponseTemplate::new(sell_exchange.response.status)
+        .set_body_raw(sell_exchange.response.body_raw.clone(), "application/json");
+
+    for (key, value) in &sell_exchange.response.headers {
+        if key.to_lowercase() != "content-length" && key.to_lowercase() != "transfer-encoding" {
+            sell_response = sell_response.append_header(key.as_str(), value.as_str());
+        }
+    }
+
+    // First request = buy order
+    Mock::given(method("POST"))
+        .and(path_regex(".*portfolio/orders.*"))
+        .respond_with(buy_response)
+        .up_to_n_times(1)
+        .mount(&kalshi_server)
+        .await;
+
+    // Second request = sell order (auto-close)
+    Mock::given(method("POST"))
+        .and(path_regex(".*portfolio/orders.*"))
+        .respond_with(sell_response)
+        .mount(&kalshi_server)
+        .await;
+
+    // Configure mock Poly to FAIL - this creates the mismatch
+    let mock_poly = Arc::new(MockPolyClient::new());
+    mock_poly.set_error("poly-yes-token-12345", "Insufficient balance");
+
+    let (engine, mut fill_rx) = create_test_engine(&kalshi_server, mock_poly);
+
+    // Execute the arb
+    let req = create_test_request(ArbType::PolyYesKalshiNo);
+    let result = engine.process(req).await;
+    assert!(result.is_ok());
+
+    // Wait for auto-close background task
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Collect all fills
+    let fills = drain_fills(&mut fill_rx).await;
+
+    // Calculate net position for Kalshi NO
+    let kalshi_no_net: f64 = fills
+        .iter()
+        .filter(|f| f.platform == "kalshi" && f.side == "no")
+        .map(|f| f.contracts)
+        .sum();
+
+    // THE KEY ASSERTION: Net position should be 0 after auto-close
+    assert!(
+        kalshi_no_net.abs() < 0.01,
+        "Net Kalshi NO position should be 0 after auto-close, but got {}. \
+         Fills: {:?}",
+        kalshi_no_net,
+        fills.iter()
+            .map(|f| (f.platform.as_str(), f.side.as_str(), f.contracts))
+            .collect::<Vec<_>>()
+    );
+
+    // Also verify we have both fills recorded (not just the close)
+    let kalshi_fills: Vec<_> = fills
+        .iter()
+        .filter(|f| f.platform == "kalshi" && f.side == "no")
+        .collect();
+
+    assert_eq!(
+        kalshi_fills.len(),
+        2,
+        "Should have 2 Kalshi NO fills (original buy + auto-close sell), got {}. \
+         Fills: {:?}",
+        kalshi_fills.len(),
+        kalshi_fills.iter()
+            .map(|f| (f.platform.as_str(), f.side.as_str(), f.contracts))
+            .collect::<Vec<_>>()
+    );
+
+    // Verify one is positive (buy) and one is negative (close)
+    let positive_fills = kalshi_fills.iter().filter(|f| f.contracts > 0.0).count();
+    let negative_fills = kalshi_fills.iter().filter(|f| f.contracts < 0.0).count();
+
+    assert_eq!(
+        positive_fills, 1,
+        "Should have 1 positive fill (original buy)"
+    );
+    assert_eq!(
+        negative_fills, 1,
+        "Should have 1 negative fill (auto-close sell)"
+    );
+
+    // NEW: Verify trade history includes the failed Poly attempt
+    let poly_fills: Vec<_> = fills
+        .iter()
+        .filter(|f| f.platform == "polymarket" && f.side == "yes")
+        .collect();
+
+    assert_eq!(
+        poly_fills.len(), 1,
+        "Should have 1 Poly YES fill record (the failed attempt)"
+    );
+    assert_eq!(
+        poly_fills[0].contracts, 0.0,
+        "Failed Poly attempt should have 0 contracts"
     );
 }
