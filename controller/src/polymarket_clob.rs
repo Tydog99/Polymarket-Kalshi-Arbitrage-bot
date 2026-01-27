@@ -651,47 +651,43 @@ impl SharedAsyncClient {
         let resp_json: serde_json::Value = serde_json::from_str(&resp_body)
             .map_err(|e| anyhow!("Failed to parse order response: {} (body: {})", e, resp_body))?;
         let order_id = resp_json["orderID"].as_str().unwrap_or("unknown").to_string();
+        let order_status = resp_json["status"].as_str().unwrap_or("unknown");
 
-        tracing::info!("[POLY] Order placed: {}", order_id);
-
-        // Query fill status with retry (Polymarket API may have indexing delay)
-        let order_info = {
-            let mut attempts = 0;
-            const MAX_ATTEMPTS: u32 = 3;
-            const RETRY_DELAY_MS: u64 = 200;
-
-            loop {
-                attempts += 1;
-                match self.inner.get_order_async(&order_id, &self.creds).await {
-                    Ok(info) => break info,
-                    Err(e) if attempts < MAX_ATTEMPTS => {
-                        tracing::debug!(
-                            "[POLY] get_order attempt {}/{} failed: {}, retrying in {}ms",
-                            attempts, MAX_ATTEMPTS, e, RETRY_DELAY_MS
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
-                    }
-                    Err(e) => {
-                        return Err(anyhow!(
-                            "Failed to get order {} after {} attempts: {}",
-                            order_id, attempts, e
-                        ));
-                    }
-                }
-            }
+        // Extract fill info directly from POST response (no need to call get_order)
+        // For BUY: takingAmount = shares received, makingAmount = USDC spent
+        // For SELL: takingAmount = USDC received, makingAmount = shares sold
+        let (filled_size, fill_cost) = if side.eq_ignore_ascii_case("BUY") {
+            let shares: f64 = resp_json["takingAmount"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let cost: f64 = resp_json["makingAmount"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            (shares, cost)
+        } else {
+            // SELL: makingAmount is shares sold, takingAmount is USDC received
+            let shares: f64 = resp_json["makingAmount"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let cost: f64 = resp_json["takingAmount"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            (shares, cost)
         };
-        let filled_size: f64 = order_info.size_matched.parse().unwrap_or(0.0);
-        let order_price: f64 = order_info.price.parse().unwrap_or(price);
 
-        tracing::debug!(
-            "[POLY-ASYNC] FAK {} {}: status={}, filled={:.2}/{:.2}, price={:.4}",
-            side, order_id, order_info.status, filled_size, size, order_price
+        tracing::info!(
+            "[POLY] FAK {} {}: status={}, filled={:.2}/{:.2}, cost=${:.2}",
+            side, order_id, order_status, filled_size, size, fill_cost
         );
 
         Ok(PolyFillAsync {
             order_id,
             filled_size,
-            fill_cost: filled_size * order_price,
+            fill_cost,
         })
     }
 
@@ -904,5 +900,118 @@ mod tests {
                 response
             );
         }
+    }
+
+    #[test]
+    fn test_post_response_fill_extraction_buy() {
+        // Real POST response from Polymarket for a BUY order
+        let json = r#"{
+            "errorMsg": "",
+            "orderID": "0x8b416d01048aea99086ea6c1e4510cad2d0bb881a0def312b9b81b7ac732ad8e",
+            "takingAmount": "5",
+            "makingAmount": "2.35",
+            "status": "matched",
+            "transactionsHashes": ["0xfa6dc3d89588e8024a8c729a3380f7a4ec1be0ba6788894fd8c9a2fb5329b706"],
+            "success": true
+        }"#;
+
+        let resp_json: serde_json::Value = serde_json::from_str(json).unwrap();
+
+        // For BUY: takingAmount = shares received, makingAmount = USDC spent
+        let shares: f64 = resp_json["takingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let cost: f64 = resp_json["makingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+
+        assert_eq!(shares, 5.0, "Should extract 5 shares from takingAmount");
+        assert_eq!(cost, 2.35, "Should extract $2.35 cost from makingAmount");
+    }
+
+    #[test]
+    fn test_post_response_fill_extraction_sell() {
+        // POST response for a SELL order (hypothetical - amounts are reversed)
+        let json = r#"{
+            "errorMsg": "",
+            "orderID": "0xabc123",
+            "takingAmount": "3.50",
+            "makingAmount": "5",
+            "status": "matched",
+            "transactionsHashes": [],
+            "success": true
+        }"#;
+
+        let resp_json: serde_json::Value = serde_json::from_str(json).unwrap();
+
+        // For SELL: makingAmount = shares sold, takingAmount = USDC received
+        let shares: f64 = resp_json["makingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let cost: f64 = resp_json["takingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+
+        assert_eq!(shares, 5.0, "Should extract 5 shares from makingAmount");
+        assert_eq!(cost, 3.50, "Should extract $3.50 from takingAmount");
+    }
+
+    #[test]
+    fn test_post_response_fill_extraction_no_fill() {
+        // POST response when order doesn't fill (FAK with no match)
+        let json = r#"{
+            "errorMsg": "",
+            "orderID": "0xdef456",
+            "status": "LIVE",
+            "success": true
+        }"#;
+
+        let resp_json: serde_json::Value = serde_json::from_str(json).unwrap();
+
+        // Missing takingAmount/makingAmount should default to 0.0
+        let shares: f64 = resp_json["takingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let cost: f64 = resp_json["makingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+
+        assert_eq!(shares, 0.0, "Missing takingAmount should default to 0");
+        assert_eq!(cost, 0.0, "Missing makingAmount should default to 0");
+    }
+
+    #[test]
+    fn test_post_response_fill_extraction_partial_fill() {
+        // POST response for partial fill
+        let json = r#"{
+            "errorMsg": "",
+            "orderID": "0x789ghi",
+            "takingAmount": "3",
+            "makingAmount": "1.47",
+            "status": "matched",
+            "success": true
+        }"#;
+
+        let resp_json: serde_json::Value = serde_json::from_str(json).unwrap();
+        let order_status = resp_json["status"].as_str().unwrap_or("unknown");
+
+        let shares: f64 = resp_json["takingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let cost: f64 = resp_json["makingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+
+        assert_eq!(order_status, "matched");
+        assert_eq!(shares, 3.0, "Should extract partial fill of 3 shares");
+        assert_eq!(cost, 1.47, "Should extract cost of $1.47");
     }
 }
