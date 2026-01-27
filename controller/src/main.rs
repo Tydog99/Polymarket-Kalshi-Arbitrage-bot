@@ -71,7 +71,7 @@ use crate::remote_execution::{HybridExecutor, run_hybrid_execution_loop};
 use crate::remote_protocol::Platform as WsPlatform;
 use crate::remote_trader::RemoteTraderServer;
 use trading::execution::Platform as TradingPlatform;
-use types::{ArbOpportunity, DiscoveryResult, GlobalState, MarketPair, MarketType, PriceCents};
+use types::{ArbOpportunity, DiscoveryResult, GlobalState, MarketPair, MarketType, PriceCents, LOCK_STATS};
 
 /// Polymarket CLOB API host
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
@@ -1548,8 +1548,8 @@ async fn main() -> Result<()> {
             let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, bool, u16, u16)> = None;
 
             for market in heartbeat_state.markets.iter().take(market_count) {
-                let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
-                let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.load();
+                let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.read().top_of_book();
+                let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.read().top_of_book();
                 let (k_upd, p_upd) = market.load_update_counts();
                 let (k_last_ms, p_last_ms) = market.last_updates_unix_ms();
 
@@ -1920,6 +1920,17 @@ async fn main() -> Result<()> {
                 for (key, &(_, k_upd, p_upd)) in &league_type_stats {
                     prev_league_type_stats.insert(key.clone(), (k_upd, p_upd));
                 }
+            }
+
+            // Log lock contention stats
+            let (contention, total_ops, wait_ns) = LOCK_STATS.take_snapshot();
+            if total_ops > 0 {
+                let contention_pct = 100.0 * contention as f64 / total_ops as f64;
+                let avg_wait_us = if contention > 0 { wait_ns / contention / 1000 } else { 0 };
+                log_line(format!(
+                    "[LOCK] ops={} contention={} ({:.2}%) avg_wait={}µs",
+                    total_ops, contention, contention_pct, avg_wait_us
+                ));
             }
         }
     });

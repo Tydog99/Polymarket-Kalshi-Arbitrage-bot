@@ -1231,16 +1231,24 @@ mod tests {
 
         // Update Kalshi prices
         let market = state.get_by_id(id).unwrap();
-        market.kalshi.store(45, 55, 500, 600);
+        {
+            let mut guard = market.kalshi.write();
+            guard.yes_levels[0] = PriceLevel { price: 45, size: 500 };
+            guard.no_levels[0] = PriceLevel { price: 55, size: 600 };
+        }
 
         // Update Poly prices
-        market.poly.store(44, 56, 700, 800);
+        {
+            let mut guard = market.poly.write();
+            guard.yes_levels[0] = PriceLevel { price: 44, size: 700 };
+            guard.no_levels[0] = PriceLevel { price: 56, size: 800 };
+        }
 
         // Verify prices
-        let (k_yes, k_no, k_yes_sz, k_no_sz) = market.kalshi.load();
+        let (k_yes, k_no, k_yes_sz, k_no_sz) = market.kalshi.read().top_of_book();
         assert_eq!((k_yes, k_no, k_yes_sz, k_no_sz), (45, 55, 500, 600));
 
-        let (p_yes, p_no, p_yes_sz, p_no_sz) = market.poly.load();
+        let (p_yes, p_no, p_yes_sz, p_no_sz) = market.poly.read().top_of_book();
         assert_eq!((p_yes, p_no, p_yes_sz, p_no_sz), (44, 56, 700, 800));
     }
 
@@ -1563,19 +1571,23 @@ mod tests {
         // Kalshi update
         let kalshi_hash = fxhash_str(&kalshi_ticker);
         if let Some(id) = state.kalshi_to_id.read().get(&kalshi_hash).copied() {
-            state.markets[id as usize].kalshi.store(55, 50, 500, 600);
+            let mut guard = state.markets[id as usize].kalshi.write();
+            guard.yes_levels[0] = PriceLevel { price: 55, size: 500 };
+            guard.no_levels[0] = PriceLevel { price: 50, size: 600 };
         }
 
         // Polymarket update
         let poly_hash = fxhash_str(&poly_yes_token);
         if let Some(id) = state.poly_yes_to_id.read().get(&poly_hash).copied() {
-            state.markets[id as usize].poly.store(40, 65, 700, 800);
+            let mut guard = state.markets[id as usize].poly.write();
+            guard.yes_levels[0] = PriceLevel { price: 40, size: 700 };
+            guard.no_levels[0] = PriceLevel { price: 65, size: 800 };
         }
 
         // 3. Check for arbs using ArbOpportunity::detect()
         let market = state.get_by_id(market_id).unwrap();
-        let kalshi_data = market.kalshi.load();
-        let poly_data = market.poly.load();
+        let kalshi_data = market.kalshi.read().top_of_book();
+        let poly_data = market.poly.read().top_of_book();
         let req = ArbOpportunity::detect(
             market_id,
             kalshi_data,
@@ -1599,8 +1611,16 @@ mod tests {
 
         // Pre-populate with a market
         let market = &state.markets[0];
-        market.kalshi.store(50, 50, 1000, 1000);
-        market.poly.store(50, 50, 1000, 1000);
+        {
+            let mut guard = market.kalshi.write();
+            guard.yes_levels[0] = PriceLevel { price: 50, size: 1000 };
+            guard.no_levels[0] = PriceLevel { price: 50, size: 1000 };
+        }
+        {
+            let mut guard = market.poly.write();
+            guard.yes_levels[0] = PriceLevel { price: 50, size: 1000 };
+            guard.no_levels[0] = PriceLevel { price: 50, size: 1000 };
+        }
 
         let handles: Vec<_> = (0..4).map(|i| {
             let state = state.clone();
@@ -1609,15 +1629,23 @@ mod tests {
                     let market = &state.markets[0];
                     if i % 2 == 0 {
                         // Simulate Kalshi updates
-                        market.kalshi.update_yes(40 + ((j % 10) as u16), 500 + j as u16);
+                        let mut guard = market.kalshi.write();
+                        guard.yes_levels[0] = PriceLevel {
+                            price: 40 + ((j % 10) as u16),
+                            size: 500 + j as u16,
+                        };
                     } else {
                         // Simulate Poly updates
-                        market.poly.update_no(50 + ((j % 10) as u16), 600 + j as u16);
+                        let mut guard = market.poly.write();
+                        guard.no_levels[0] = PriceLevel {
+                            price: 50 + ((j % 10) as u16),
+                            size: 600 + j as u16,
+                        };
                     }
 
                     // Check arbs using ArbOpportunity::detect() (should never panic)
-                    let kalshi_data = market.kalshi.load();
-                    let poly_data = market.poly.load();
+                    let kalshi_data = market.kalshi.read().top_of_book();
+                    let poly_data = market.poly.read().top_of_book();
                     let _ = ArbOpportunity::detect(
                         market.market_id,
                         kalshi_data,
@@ -1635,8 +1663,8 @@ mod tests {
 
         // Final state should be valid
         let market = &state.markets[0];
-        let (k_yes, k_no, _, _) = market.kalshi.load();
-        let (p_yes, p_no, _, _) = market.poly.load();
+        let (k_yes, k_no, _, _) = market.kalshi.read().top_of_book();
+        let (p_yes, p_no, _, _) = market.poly.read().top_of_book();
 
         assert!(k_yes > 0 && k_yes < 100);
         assert!(k_no > 0 && k_no < 100);
