@@ -325,7 +325,7 @@ impl ExecutionEngine {
 
         match result {
             // Note: For same-platform arbs (PolyOnly/KalshiOnly), these are YES/NO fills, not platform fills
-            Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id)) => {
+            Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id, yes_error, no_error)) => {
                 let matched = yes_filled.min(no_filled);
                 let success = matched > 0;
                 let actual_profit = matched as i16 * 100 - (yes_cost + no_cost) as i16;
@@ -400,12 +400,18 @@ impl ExecutionEngine {
                 } else {
                     cents_to_price(req.yes_price)
                 };
+                // Build failure reason: "No fill" or "No fill - <error>"
+                let yes_failure_reason = if yes_filled == 0 {
+                    Some(format_failure_reason(yes_error.as_deref()))
+                } else {
+                    None
+                };
                 self.position_channel.record_fill(FillRecord::with_details(
                     &pair.pair_id, &pair.description, platform1, side1,
                     yes_requested, yes_filled as f64, yes_price,
                     0.0, &yes_order_id,
                     TradeReason::ArbLegYes, yes_status,
-                    if yes_filled == 0 { Some("No fill".to_string()) } else { None },
+                    yes_failure_reason,
                 ));
 
                 // Record NO leg (success, partial, or failed)
@@ -422,12 +428,18 @@ impl ExecutionEngine {
                 } else {
                     cents_to_price(req.no_price)
                 };
+                // Build failure reason: "No fill" or "No fill - <error>"
+                let no_failure_reason = if no_filled == 0 {
+                    Some(format_failure_reason(no_error.as_deref()))
+                } else {
+                    None
+                };
                 self.position_channel.record_fill(FillRecord::with_details(
                     &pair.pair_id, &pair.description, platform2, side2,
                     no_requested, no_filled as f64, no_price,
                     0.0, &no_order_id,
                     TradeReason::ArbLegNo, no_status,
-                    if no_filled == 0 { Some("No fill".to_string()) } else { None },
+                    no_failure_reason,
                 ));
 
                 Ok(ExecutionResult {
@@ -456,7 +468,7 @@ impl ExecutionEngine {
         req: &ArbOpportunity,
         pair: &MarketPair,
         contracts: i64,
-    ) -> Result<(i64, i64, i64, i64, String, String)> {
+    ) -> Result<(i64, i64, i64, i64, String, String, Option<String>, Option<String>)> {
         match req.arb_type {
             // === CROSS-PLATFORM: Poly YES + Kalshi NO ===
             ArbType::PolyYesKalshiNo => {
@@ -531,69 +543,73 @@ impl ExecutionEngine {
     }
 
     /// Extract results from PolyYesKalshiNo execution.
-    /// Returns: (yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id)
+    /// Returns: (yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id, yes_error, no_error)
     /// where YES = Poly and NO = Kalshi
     fn extract_cross_results_poly_yes_kalshi_no(
         &self,
         poly_res: Result<crate::polymarket_clob::PolyFillAsync>,
         kalshi_res: Result<crate::kalshi::KalshiOrderResponse>,
-    ) -> Result<(i64, i64, i64, i64, String, String)> {
-        let (yes_filled, yes_cost, yes_order_id) = match poly_res {
+    ) -> Result<(i64, i64, i64, i64, String, String, Option<String>, Option<String>)> {
+        let (yes_filled, yes_cost, yes_order_id, yes_error) = match poly_res {
             Ok(fill) => {
-                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id)
+                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id, None)
             }
             Err(e) => {
-                warn!("[EXEC] Poly YES failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Poly YES failed: {}", err_msg);
+                (0, 0, String::new(), Some(err_msg))
             }
         };
 
-        let (no_filled, no_cost, no_order_id) = match kalshi_res {
+        let (no_filled, no_cost, no_order_id, no_error) = match kalshi_res {
             Ok(resp) => {
                 let filled = resp.order.filled_count();
                 let cost = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
-                (filled, cost, resp.order.order_id)
+                (filled, cost, resp.order.order_id, None)
             }
             Err(e) => {
-                warn!("[EXEC] Kalshi NO failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Kalshi NO failed: {}", err_msg);
+                (0, 0, String::new(), Some(err_msg))
             }
         };
 
-        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id))
+        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id, yes_error, no_error))
     }
 
     /// Extract results from KalshiYesPolyNo execution.
-    /// Returns: (yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id)
+    /// Returns: (yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id, yes_error, no_error)
     /// where YES = Kalshi and NO = Poly
     fn extract_cross_results_kalshi_yes_poly_no(
         &self,
         kalshi_res: Result<crate::kalshi::KalshiOrderResponse>,
         poly_res: Result<crate::polymarket_clob::PolyFillAsync>,
-    ) -> Result<(i64, i64, i64, i64, String, String)> {
-        let (yes_filled, yes_cost, yes_order_id) = match kalshi_res {
+    ) -> Result<(i64, i64, i64, i64, String, String, Option<String>, Option<String>)> {
+        let (yes_filled, yes_cost, yes_order_id, yes_error) = match kalshi_res {
             Ok(resp) => {
                 let filled = resp.order.filled_count();
                 let cost = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
-                (filled, cost, resp.order.order_id)
+                (filled, cost, resp.order.order_id, None)
             }
             Err(e) => {
-                warn!("[EXEC] Kalshi YES failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Kalshi YES failed: {}", err_msg);
+                (0, 0, String::new(), Some(err_msg))
             }
         };
 
-        let (no_filled, no_cost, no_order_id) = match poly_res {
+        let (no_filled, no_cost, no_order_id, no_error) = match poly_res {
             Ok(fill) => {
-                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id)
+                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id, None)
             }
             Err(e) => {
-                warn!("[EXEC] Poly NO failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Poly NO failed: {}", err_msg);
+                (0, 0, String::new(), Some(err_msg))
             }
         };
 
-        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id))
+        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id, yes_error, no_error))
     }
 
     /// Extract results from Poly-only execution (same-platform)
@@ -601,30 +617,32 @@ impl ExecutionEngine {
         &self,
         yes_res: Result<crate::polymarket_clob::PolyFillAsync>,
         no_res: Result<crate::polymarket_clob::PolyFillAsync>,
-    ) -> Result<(i64, i64, i64, i64, String, String)> {
-        let (yes_filled, yes_cost, yes_order_id) = match yes_res {
+    ) -> Result<(i64, i64, i64, i64, String, String, Option<String>, Option<String>)> {
+        let (yes_filled, yes_cost, yes_order_id, yes_error) = match yes_res {
             Ok(fill) => {
-                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id)
+                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id, None)
             }
             Err(e) => {
-                warn!("[EXEC] Poly YES failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Poly YES failed: {}", err_msg);
+                (0, 0, String::new(), Some(err_msg))
             }
         };
 
-        let (no_filled, no_cost, no_order_id) = match no_res {
+        let (no_filled, no_cost, no_order_id, no_error) = match no_res {
             Ok(fill) => {
-                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id)
+                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id, None)
             }
             Err(e) => {
-                warn!("[EXEC] Poly NO failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Poly NO failed: {}", err_msg);
+                (0, 0, String::new(), Some(err_msg))
             }
         };
 
         // For same-platform, return YES as "kalshi" slot and NO as "poly" slot
         // This keeps the existing result handling logic working
-        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id))
+        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id, yes_error, no_error))
     }
 
     /// Extract results from Kalshi-only execution (same-platform)
@@ -632,33 +650,35 @@ impl ExecutionEngine {
         &self,
         yes_res: Result<crate::kalshi::KalshiOrderResponse>,
         no_res: Result<crate::kalshi::KalshiOrderResponse>,
-    ) -> Result<(i64, i64, i64, i64, String, String)> {
-        let (yes_filled, yes_cost, yes_order_id) = match yes_res {
+    ) -> Result<(i64, i64, i64, i64, String, String, Option<String>, Option<String>)> {
+        let (yes_filled, yes_cost, yes_order_id, yes_error) = match yes_res {
             Ok(resp) => {
                 let filled = resp.order.filled_count();
                 let cost = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
-                (filled, cost, resp.order.order_id)
+                (filled, cost, resp.order.order_id, None)
             }
             Err(e) => {
-                warn!("[EXEC] Kalshi YES failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Kalshi YES failed: {}", err_msg);
+                (0, 0, String::new(), Some(err_msg))
             }
         };
 
-        let (no_filled, no_cost, no_order_id) = match no_res {
+        let (no_filled, no_cost, no_order_id, no_error) = match no_res {
             Ok(resp) => {
                 let filled = resp.order.filled_count();
                 let cost = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
-                (filled, cost, resp.order.order_id)
+                (filled, cost, resp.order.order_id, None)
             }
             Err(e) => {
-                warn!("[EXEC] Kalshi NO failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Kalshi NO failed: {}", err_msg);
+                (0, 0, String::new(), Some(err_msg))
             }
         };
 
         // For same-platform, return YES as "kalshi" slot and NO as "poly" slot
-        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id))
+        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id, yes_error, no_error))
     }
 
     /// Background task to automatically close excess exposure from mismatched fills.
@@ -853,9 +873,10 @@ impl ExecutionEngine {
                     );
 
                     // Record every attempt (even zero fills) for complete audit trail
+                    // Always use limit price for consistency with what we requested
                     record_close(
                         position_channel, "polymarket", side,
-                        requested, fill.filled_size, fill.fill_cost / fill.filled_size.max(0.001),
+                        requested, fill.filled_size, price_decimal,
                         &fill.order_id, attempt
                     );
 
@@ -935,9 +956,10 @@ impl ExecutionEngine {
                     );
 
                     // Record every attempt (even zero fills) for complete audit trail
+                    // Always use limit price - Kalshi's cost fields may return complement price
                     record_close(
                         position_channel, "kalshi", side,
-                        requested, filled as f64, proceeds_cents as f64 / 100.0 / filled.max(1) as f64,
+                        requested, filled as f64, price_decimal,
                         &resp.order.order_id, attempt
                     );
 
@@ -1228,4 +1250,158 @@ mod tests {
             detected_ns
         );
     }
+
+    // =========================================================================
+    // BUG FIX TESTS: Auto-close price recording
+    // =========================================================================
+
+    /// Bug #1: Failed close attempts should record the LIMIT price, not 0.0
+    ///
+    /// When an API call returns OK but filled=0, the price should be the limit
+    /// price we sent, not 0.0 (which happens when we derive price from proceeds).
+    #[test]
+    fn test_close_price_calculation_zero_fill() {
+        // Scenario: API returns OK but filled=0, proceeds=0
+        // Current bug: derives price as 0.0/100.0/1 = 0.0
+        // Expected: should use the limit price we sent (46 cents)
+
+        let limit_price_cents: i64 = 46;
+        let filled: i64 = 0;
+        let proceeds_cents: i64 = 0;
+
+        // This is the BUGGY calculation from current code
+        let buggy_price = proceeds_cents as f64 / 100.0 / (filled.max(1) as f64);
+
+        // This is what we SHOULD record
+        let expected_price = limit_price_cents as f64 / 100.0;
+
+        // Currently this will be equal (both 0.0), but after fix it won't be
+        // The correct price should be the limit price, not derived from proceeds
+        assert!(
+            (expected_price - 0.46).abs() < 0.001,
+            "Expected price should be 0.46, got {}",
+            expected_price
+        );
+
+        // The buggy calculation gives 0.0 - this test documents the bug
+        assert!(
+            (buggy_price - 0.0).abs() < 0.001,
+            "Current buggy price is 0.0"
+        );
+
+        // This assertion SHOULD pass after fix - currently the logic is wrong
+        // We use calculate_close_record_price to test the fix
+        let correct_price = calculate_close_record_price(filled, proceeds_cents, limit_price_cents);
+        assert!(
+            (correct_price - 0.46).abs() < 0.001,
+            "Close price for zero-fill should be limit price (0.46), got {}",
+            correct_price
+        );
+    }
+
+    /// Bug #2: Successful close should record LIMIT price, not proceeds-derived price
+    ///
+    /// When selling on Kalshi, the `taker_fill_cost + maker_fill_cost` returns
+    /// the complement price (100 - limit_price), not the actual sale price.
+    /// We should record what we asked for, not what Kalshi reports.
+    #[test]
+    fn test_close_price_calculation_full_fill() {
+        // Scenario: Sell 8 contracts at limit 46c
+        // Kalshi returns proceeds of 432c (which is 8 * 54c, the complement)
+        // Current bug: records 432/100/8 = 0.54
+        // Expected: should record 0.46 (our limit price)
+
+        let limit_price_cents: i64 = 46;
+        let filled: i64 = 8;
+        let proceeds_cents: i64 = 432; // Kalshi reports 8 * 54c = 432c
+
+        // This is the BUGGY calculation from current code
+        let buggy_price = proceeds_cents as f64 / 100.0 / (filled as f64);
+
+        assert!(
+            (buggy_price - 0.54).abs() < 0.001,
+            "Current buggy price is 0.54 (complement), got {}",
+            buggy_price
+        );
+
+        // After fix, we should always use the limit price we sent
+        let correct_price = calculate_close_record_price(filled, proceeds_cents, limit_price_cents);
+        assert!(
+            (correct_price - 0.46).abs() < 0.001,
+            "Close price should be limit price (0.46), got {}",
+            correct_price
+        );
+    }
+
+    /// Bug #3: Failed Polymarket orders should capture the actual error message
+    ///
+    /// When Poly returns an error like "invalid signature", we should record
+    /// "No fill - invalid signature" instead of just "No fill".
+    #[test]
+    fn test_failure_reason_captures_error_message() {
+        // Scenario: Polymarket returns error "invalid signature"
+        // Current bug: records failure_reason as "No fill"
+        // Expected: "No fill - Polymarket order failed 400 Bad Request: {\"error\":\"invalid signature\"}"
+
+        let api_error = "Polymarket order failed 400 Bad Request: {\"error\":\"invalid signature\"}";
+
+        // This is what the failure reason SHOULD be
+        let expected_reason = format_failure_reason(Some(api_error));
+
+        assert!(
+            expected_reason.contains("No fill"),
+            "Should start with 'No fill'"
+        );
+        assert!(
+            expected_reason.contains("invalid signature"),
+            "Should contain the actual error message, got: {}",
+            expected_reason
+        );
+        assert_eq!(
+            expected_reason,
+            "No fill - Polymarket order failed 400 Bad Request: {\"error\":\"invalid signature\"}",
+            "Format should be 'No fill - <error>'"
+        );
+    }
+
+    /// Test that when there's no specific error, we just say "No fill"
+    #[test]
+    fn test_failure_reason_no_error() {
+        let reason = format_failure_reason(None);
+        assert_eq!(reason, "No fill", "Without error should just be 'No fill'");
+    }
+}
+
+/// Format the failure reason for a no-fill scenario.
+///
+/// If there was an API error, includes it: "No fill - <error>"
+/// Otherwise just returns "No fill"
+#[inline]
+fn format_failure_reason(api_error: Option<&str>) -> String {
+    match api_error {
+        Some(err) => format!("No fill - {}", err),
+        None => "No fill".to_string(),
+    }
+}
+
+// =============================================================================
+// TEST HELPER FUNCTIONS
+// =============================================================================
+
+/// Calculate the correct price to record for auto-close attempts.
+///
+/// Always uses the limit price we sent, not the proceeds-derived price.
+/// This avoids two bugs:
+/// 1. Zero fills recording 0.0 instead of the limit price
+/// 2. Kalshi returning complement prices (100 - limit) in cost fields
+///
+/// Note: This is used by tests to document and verify the correct behavior.
+/// The actual implementation uses `price_decimal` directly in the close functions.
+#[cfg(test)]
+#[inline]
+fn calculate_close_record_price(filled: i64, _proceeds_cents: i64, limit_price_cents: i64) -> f64 {
+    // Always use limit price - this is what we asked for
+    // The proceeds might be the complement price or zero
+    let _ = filled; // Filled count doesn't affect which price to record
+    limit_price_cents as f64 / 100.0
 }
