@@ -505,7 +505,7 @@ impl PolymarketAsyncClient {
         Ok(resp)
     }
 
-    /// Get order by ID 
+    /// Get order by ID
     pub async fn get_order_async(&self, order_id: &str, creds: &PreparedCreds) -> Result<PolymarketOrderResponse> {
         let path = format!("/data/order/{}", order_id);
         let url = format!("{}{}", self.host, path);
@@ -517,13 +517,23 @@ impl PolymarketAsyncClient {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+
+        if !status.is_success() {
             return Err(anyhow!("get_order failed {}: {}", status, body));
         }
 
-        Ok(resp.json().await?)
+        // Log raw response for debugging order status issues
+        tracing::debug!("[POLY] get_order {} response: {}", order_id, body);
+
+        // Handle null response (order doesn't exist or was rejected)
+        if body.trim() == "null" || body.trim().is_empty() {
+            return Err(anyhow!("get_order {} returned null - order may have been rejected", order_id));
+        }
+
+        serde_json::from_str(&body)
+            .map_err(|e| anyhow!("get_order {} parse error: {} (body: {})", order_id, e, body))
     }
 
     /// Check neg_risk for token - with caching
@@ -623,19 +633,53 @@ impl SharedAsyncClient {
         let body = signed.post_body(&self.creds.api_key, PolyOrderType::FAK.as_str());
 
         // Post order
-        let resp = self.inner.post_order_async(body, &self.creds).await?;
+        tracing::info!(
+            "[POLY] Posting {} order: token={}, price={:.4}, size={:.2}, neg_risk={}",
+            side, token_id, price, size, neg_risk
+        );
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Polymarket order failed {}: {}", status, body));
+        let resp = self.inner.post_order_async(body, &self.creds).await?;
+        let status = resp.status();
+        let resp_body = resp.text().await.unwrap_or_default();
+
+        tracing::debug!("[POLY] POST /order response {}: {}", status, resp_body);
+
+        if !status.is_success() {
+            return Err(anyhow!("Polymarket order failed {}: {}", status, resp_body));
         }
 
-        let resp_json: serde_json::Value = resp.json().await?;
+        let resp_json: serde_json::Value = serde_json::from_str(&resp_body)
+            .map_err(|e| anyhow!("Failed to parse order response: {} (body: {})", e, resp_body))?;
         let order_id = resp_json["orderID"].as_str().unwrap_or("unknown").to_string();
 
-        // Query fill status
-        let order_info = self.inner.get_order_async(&order_id, &self.creds).await?;
+        tracing::info!("[POLY] Order placed: {}", order_id);
+
+        // Query fill status with retry (Polymarket API may have indexing delay)
+        let order_info = {
+            let mut attempts = 0;
+            const MAX_ATTEMPTS: u32 = 3;
+            const RETRY_DELAY_MS: u64 = 200;
+
+            loop {
+                attempts += 1;
+                match self.inner.get_order_async(&order_id, &self.creds).await {
+                    Ok(info) => break info,
+                    Err(e) if attempts < MAX_ATTEMPTS => {
+                        tracing::debug!(
+                            "[POLY] get_order attempt {}/{} failed: {}, retrying in {}ms",
+                            attempts, MAX_ATTEMPTS, e, RETRY_DELAY_MS
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                    }
+                    Err(e) => {
+                        return Err(anyhow!(
+                            "Failed to get order {} after {} attempts: {}",
+                            order_id, attempts, e
+                        ));
+                    }
+                }
+            }
+        };
         let filled_size: f64 = order_info.size_matched.parse().unwrap_or(0.0);
         let order_price: f64 = order_info.price.parse().unwrap_or(price);
 
