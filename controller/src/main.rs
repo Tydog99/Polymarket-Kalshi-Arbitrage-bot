@@ -754,14 +754,20 @@ async fn main() -> Result<()> {
         .context("POLY_PRIVATE_KEY not set")?;
     let poly_funder = std::env::var("POLY_FUNDER")
         .context("POLY_FUNDER not set (your wallet address)")?;
+    // Signature type: 0=EOA, 1=poly proxy, 2=gnosis safe
+    let poly_signature_type: i32 = std::env::var("POLY_SIGNATURE_TYPE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     // Create async Polymarket client and derive API credentials
-    info!("[POLYMARKET] Creating async client and deriving API credentials...");
+    info!("[POLYMARKET] Creating async client and deriving API credentials (signature_type={})...", poly_signature_type);
     let poly_async_client = PolymarketAsyncClient::new(
         POLY_CLOB_HOST,
         POLYGON_CHAIN_ID,
         &poly_private_key,
         &poly_funder,
+        poly_signature_type,
     )?;
     let api_creds = poly_async_client.derive_api_key(0).await?;
     let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
@@ -896,12 +902,13 @@ async fn main() -> Result<()> {
 
         let trading_poly: Option<Arc<trading::polymarket::SharedAsyncClient>> =
             if local_platforms.contains(&TradingPlatform::Polymarket) {
-                info!("[HYBRID] Creating Polymarket client for local execution");
-                let client = trading::polymarket::PolymarketAsyncClient::new(
+                info!("[HYBRID] Creating Polymarket client for local execution (signature_type={})", poly_signature_type);
+                let client = trading::polymarket::PolymarketAsyncClient::new_with_signature_type(
                     POLY_CLOB_HOST,
                     POLYGON_CHAIN_ID,
                     &poly_private_key,
                     &poly_funder,
+                    poly_signature_type,
                 )?;
                 let api_creds = client.derive_api_key(0).await?;
                 let prepared = trading::polymarket::PreparedCreds::from_api_creds(&api_creds)?;

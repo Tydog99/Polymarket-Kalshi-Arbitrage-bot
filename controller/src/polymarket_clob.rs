@@ -411,10 +411,12 @@ pub struct PolymarketAsyncClient {
     funder: String,
     wallet_address_str: String,
     address_header: HeaderValue,
+    /// Signature type for order signing (0=EOA, 1=poly proxy, 2=gnosis safe)
+    signature_type: i32,
 }
 
 impl PolymarketAsyncClient {
-    pub fn new(host: &str, chain_id: u64, private_key: &str, funder: &str) -> Result<Self> {
+    pub fn new(host: &str, chain_id: u64, private_key: &str, funder: &str, signature_type: i32) -> Result<Self> {
         let wallet = private_key.parse::<LocalWallet>()?.with_chain_id(chain_id);
         let wallet_address_str = format!("{:?}", wallet.address());
         let address_header = HeaderValue::from_str(&wallet_address_str)
@@ -437,6 +439,7 @@ impl PolymarketAsyncClient {
             funder: funder.to_string(),
             wallet_address_str,
             address_header,
+            signature_type,
         })
     }
 
@@ -502,7 +505,7 @@ impl PolymarketAsyncClient {
         Ok(resp)
     }
 
-    /// Get order by ID 
+    /// Get order by ID
     pub async fn get_order_async(&self, order_id: &str, creds: &PreparedCreds) -> Result<PolymarketOrderResponse> {
         let path = format!("/data/order/{}", order_id);
         let url = format!("{}{}", self.host, path);
@@ -514,13 +517,23 @@ impl PolymarketAsyncClient {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+
+        if !status.is_success() {
             return Err(anyhow!("get_order failed {}: {}", status, body));
         }
 
-        Ok(resp.json().await?)
+        // Log raw response for debugging order status issues
+        tracing::debug!("[POLY] get_order {} response: {}", order_id, body);
+
+        // Handle null response (order doesn't exist or was rejected)
+        if body.trim() == "null" || body.trim().is_empty() {
+            return Err(anyhow!("get_order {} returned null - order may have been rejected", order_id));
+        }
+
+        serde_json::from_str(&body)
+            .map_err(|e| anyhow!("get_order {} parse error: {} (body: {})", order_id, e, body))
     }
 
     /// Check neg_risk for token - with caching
@@ -620,19 +633,53 @@ impl SharedAsyncClient {
         let body = signed.post_body(&self.creds.api_key, PolyOrderType::FAK.as_str());
 
         // Post order
-        let resp = self.inner.post_order_async(body, &self.creds).await?;
+        tracing::info!(
+            "[POLY] Posting {} order: token={}, price={:.4}, size={:.2}, neg_risk={}",
+            side, token_id, price, size, neg_risk
+        );
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Polymarket order failed {}: {}", status, body));
+        let resp = self.inner.post_order_async(body, &self.creds).await?;
+        let status = resp.status();
+        let resp_body = resp.text().await.unwrap_or_default();
+
+        tracing::debug!("[POLY] POST /order response {}: {}", status, resp_body);
+
+        if !status.is_success() {
+            return Err(anyhow!("Polymarket order failed {}: {}", status, resp_body));
         }
 
-        let resp_json: serde_json::Value = resp.json().await?;
+        let resp_json: serde_json::Value = serde_json::from_str(&resp_body)
+            .map_err(|e| anyhow!("Failed to parse order response: {} (body: {})", e, resp_body))?;
         let order_id = resp_json["orderID"].as_str().unwrap_or("unknown").to_string();
 
-        // Query fill status
-        let order_info = self.inner.get_order_async(&order_id, &self.creds).await?;
+        tracing::info!("[POLY] Order placed: {}", order_id);
+
+        // Query fill status with retry (Polymarket API may have indexing delay)
+        let order_info = {
+            let mut attempts = 0;
+            const MAX_ATTEMPTS: u32 = 3;
+            const RETRY_DELAY_MS: u64 = 200;
+
+            loop {
+                attempts += 1;
+                match self.inner.get_order_async(&order_id, &self.creds).await {
+                    Ok(info) => break info,
+                    Err(e) if attempts < MAX_ATTEMPTS => {
+                        tracing::debug!(
+                            "[POLY] get_order attempt {}/{} failed: {}, retrying in {}ms",
+                            attempts, MAX_ATTEMPTS, e, RETRY_DELAY_MS
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                    }
+                    Err(e) => {
+                        return Err(anyhow!(
+                            "Failed to get order {} after {} attempts: {}",
+                            order_id, attempts, e
+                        ));
+                    }
+                }
+            }
+        };
         let filled_size: f64 = order_info.size_matched.parse().unwrap_or(0.0);
         let order_price: f64 = order_info.price.parse().unwrap_or(price);
 
@@ -688,7 +735,7 @@ impl SharedAsyncClient {
             nonce: "0",
             signer: &self.inner.wallet_address_str,
             expiration: "0",
-            signature_type: 1,
+            signature_type: self.inner.signature_type,
             salt,
         };
         let exchange = get_exchange_address(self.chain_id, neg_risk)?;
@@ -711,7 +758,7 @@ impl SharedAsyncClient {
                 nonce: "0".to_string(),
                 fee_rate_bps: "0".to_string(),
                 side: side_code,
-                signature_type: 1,
+                signature_type: self.inner.signature_type,
             },
             signature: format!("0x{}", sig),
         })
@@ -738,5 +785,124 @@ impl PolyExecutor for SharedAsyncClient {
 
     async fn sell_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         SharedAsyncClient::sell_fak(self, token_id, price, size).await
+    }
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test private key (DO NOT use in production - this is a well-known test key)
+    const TEST_PRIVATE_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const TEST_FUNDER: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+    #[test]
+    fn test_client_stores_signature_type_eoa() {
+        let client = PolymarketAsyncClient::new(
+            "https://clob.polymarket.com",
+            137,
+            TEST_PRIVATE_KEY,
+            TEST_FUNDER,
+            0, // EOA
+        ).expect("should create client");
+
+        assert_eq!(client.signature_type, 0);
+    }
+
+    #[test]
+    fn test_client_stores_signature_type_poly_proxy() {
+        let client = PolymarketAsyncClient::new(
+            "https://clob.polymarket.com",
+            137,
+            TEST_PRIVATE_KEY,
+            TEST_FUNDER,
+            1, // Poly proxy
+        ).expect("should create client");
+
+        assert_eq!(client.signature_type, 1);
+    }
+
+    #[test]
+    fn test_client_stores_signature_type_gnosis_safe() {
+        let client = PolymarketAsyncClient::new(
+            "https://clob.polymarket.com",
+            137,
+            TEST_PRIVATE_KEY,
+            TEST_FUNDER,
+            2, // Gnosis safe
+        ).expect("should create client");
+
+        assert_eq!(client.signature_type, 2);
+    }
+
+    #[test]
+    fn test_parse_order_response_valid() {
+        let json = r#"{
+            "id": "0x123",
+            "status": "MATCHED",
+            "market": "0xabc",
+            "outcome": "Yes",
+            "price": "0.65",
+            "side": "BUY",
+            "size_matched": "10",
+            "original_size": "10",
+            "maker_address": "0xdef",
+            "asset_id": "12345"
+        }"#;
+
+        let result: Result<PolymarketOrderResponse, _> = serde_json::from_str(json);
+        assert!(result.is_ok());
+        let order = result.unwrap();
+        assert_eq!(order.id, "0x123");
+        assert_eq!(order.status, "MATCHED");
+        assert_eq!(order.size_matched, "10");
+    }
+
+    #[test]
+    fn test_parse_order_response_null_fails() {
+        let json = "null";
+        let result: Result<PolymarketOrderResponse, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("null"), "Error should mention null: {}", err);
+    }
+
+    #[test]
+    fn test_parse_order_response_empty_fails() {
+        let json = "";
+        let result: Result<PolymarketOrderResponse, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_null_response_detection() {
+        // Test the exact null check logic used in get_order_async
+        let null_responses = ["null", " null ", "null\n", "\nnull\n"];
+        for response in null_responses {
+            assert!(
+                response.trim() == "null" || response.trim().is_empty(),
+                "Should detect '{}' as null response",
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn test_valid_response_not_detected_as_null() {
+        let valid_responses = [
+            r#"{"id":"123"}"#,
+            r#"{"id":"123","status":"MATCHED"}"#,
+        ];
+        for response in valid_responses {
+            assert!(
+                response.trim() != "null" && !response.trim().is_empty(),
+                "Should NOT detect '{}' as null response",
+                response
+            );
+        }
     }
 }
