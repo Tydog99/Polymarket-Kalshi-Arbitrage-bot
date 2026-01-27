@@ -58,7 +58,11 @@ impl<T> InstrumentedRwLock<T> {
 
         // Fast path: try non-blocking first
         match self.inner.try_write() {
-            Ok(guard) => guard,
+            Ok(guard) => {
+                // Report to global aggregator: no contention, 1 op, 0 wait
+                LOCK_STATS.record(0, 1, 0);
+                guard
+            }
             Err(std::sync::TryLockError::WouldBlock) => {
                 // Contention detected - measure wait time
                 self.contention_count.fetch_add(1, Ordering::Relaxed);
@@ -66,6 +70,8 @@ impl<T> InstrumentedRwLock<T> {
                 let guard = self.inner.write().unwrap();
                 let wait_ns = start.elapsed().as_nanos() as u64;
                 self.total_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
+                // Report to global aggregator: 1 contention, 1 op, actual wait time
+                LOCK_STATS.record(1, 1, wait_ns);
                 guard
             }
             Err(std::sync::TryLockError::Poisoned(e)) => {
@@ -83,13 +89,19 @@ impl<T> InstrumentedRwLock<T> {
         self.total_reads.fetch_add(1, Ordering::Relaxed);
 
         match self.inner.try_read() {
-            Ok(guard) => guard,
+            Ok(guard) => {
+                // Report to global aggregator: no contention, 1 op, 0 wait
+                LOCK_STATS.record(0, 1, 0);
+                guard
+            }
             Err(std::sync::TryLockError::WouldBlock) => {
                 self.contention_count.fetch_add(1, Ordering::Relaxed);
                 let start = Instant::now();
                 let guard = self.inner.read().unwrap();
                 let wait_ns = start.elapsed().as_nanos() as u64;
                 self.total_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
+                // Report to global aggregator: 1 contention, 1 op, actual wait time
+                LOCK_STATS.record(1, 1, wait_ns);
                 guard
             }
             Err(std::sync::TryLockError::Poisoned(e)) => {
@@ -270,83 +282,6 @@ pub const MAX_MARKETS: usize = 1024;
 /// Used semantically in price checks (e.g., ArbOpportunity::detect checks for 0).
 #[allow(dead_code)]
 pub const NO_PRICE: PriceCents = 0;
-
-/// Pack orderbook state into a single u64 for atomic operations.
-/// Bit layout: [yes_ask:16][no_ask:16][yes_size:16][no_size:16]
-#[inline(always)]
-pub fn pack_orderbook(yes_ask: PriceCents, no_ask: PriceCents, yes_size: SizeCents, no_size: SizeCents) -> u64 {
-    ((yes_ask as u64) << 48) | ((no_ask as u64) << 32) | ((yes_size as u64) << 16) | (no_size as u64)
-}
-
-/// Unpack a u64 orderbook representation back into its component values
-#[inline(always)]
-pub fn unpack_orderbook(packed: u64) -> (PriceCents, PriceCents, SizeCents, SizeCents) {
-    let yes_ask = ((packed >> 48) & 0xFFFF) as PriceCents;
-    let no_ask = ((packed >> 32) & 0xFFFF) as PriceCents;
-    let yes_size = ((packed >> 16) & 0xFFFF) as SizeCents;
-    let no_size = (packed & 0xFFFF) as SizeCents;
-    (yes_ask, no_ask, yes_size, no_size)
-}
-
-/// Lock-free orderbook state for a single trading platform.
-/// Uses atomic operations for thread-safe, zero-copy price updates.
-#[repr(align(64))]
-pub struct AtomicOrderbook {
-    /// Packed orderbook state: [yes_ask:16][no_ask:16][yes_size:16][no_size:16]
-    packed: AtomicU64,
-}
-
-impl AtomicOrderbook {
-    pub const fn new() -> Self {
-        Self { packed: AtomicU64::new(0) }
-    }
-
-    /// Load current state
-    #[inline(always)]
-    pub fn load(&self) -> (PriceCents, PriceCents, SizeCents, SizeCents) {
-        unpack_orderbook(self.packed.load(Ordering::Acquire))
-    }
-
-    /// Store new state
-    #[inline(always)]
-    pub fn store(&self, yes_ask: PriceCents, no_ask: PriceCents, yes_size: SizeCents, no_size: SizeCents) {
-        self.packed.store(pack_orderbook(yes_ask, no_ask, yes_size, no_size), Ordering::Release);
-    }
-
-    /// Update YES side only
-    #[inline(always)]
-    pub fn update_yes(&self, yes_ask: PriceCents, yes_size: SizeCents) {
-        let mut current = self.packed.load(Ordering::Acquire);
-        loop {
-            let (_, no_ask, _, no_size) = unpack_orderbook(current);
-            let new = pack_orderbook(yes_ask, no_ask, yes_size, no_size);
-            match self.packed.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break,
-                Err(c) => current = c,
-            }
-        }
-    }
-
-    /// Update NO side only
-    #[inline(always)]
-    pub fn update_no(&self, no_ask: PriceCents, no_size: SizeCents) {
-        let mut current = self.packed.load(Ordering::Acquire);
-        loop {
-            let (yes_ask, _, yes_size, _) = unpack_orderbook(current);
-            let new = pack_orderbook(yes_ask, no_ask, yes_size, no_size);
-            match self.packed.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break,
-                Err(c) => current = c,
-            }
-        }
-    }
-}
-
-impl Default for AtomicOrderbook {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Complete market state tracking both platforms' orderbooks for a single market
 pub struct AtomicMarketState {
@@ -970,120 +905,77 @@ mod tests {
     }
 
     // =========================================================================
-    // Pack/Unpack Tests - Verify bit manipulation correctness
+    // OrderbookDepth and PriceLevel Edge Case Tests
     // =========================================================================
 
     #[test]
-    fn test_pack_unpack_roundtrip() {
-        // Test various values pack and unpack correctly
-        let test_cases = vec![
-            (50, 50, 1000, 1000),  // Common mid-price
-            (1, 99, 100, 100),      // Edge prices
-            (99, 1, 65535, 65535),  // Max sizes
-            (0, 0, 0, 0),           // All zeros
-            (NO_PRICE, NO_PRICE, 0, 0),  // No prices
-        ];
+    fn test_price_level_default() {
+        let level = PriceLevel::default();
+        assert_eq!(level.price, 0, "Default price should be 0");
+        assert_eq!(level.size, 0, "Default size should be 0");
+    }
 
-        for (yes_ask, no_ask, yes_size, no_size) in test_cases {
-            let packed = pack_orderbook(yes_ask, no_ask, yes_size, no_size);
-            let (y, n, ys, ns) = unpack_orderbook(packed);
-            assert_eq!((y, n, ys, ns), (yes_ask, no_ask, yes_size, no_size),
-                "Roundtrip failed for ({}, {}, {}, {})", yes_ask, no_ask, yes_size, no_size);
+    #[test]
+    fn test_orderbook_depth_default_is_all_zeros() {
+        let depth = OrderbookDepth::default();
+        for level in &depth.yes_levels {
+            assert_eq!(level.price, 0);
+            assert_eq!(level.size, 0);
+        }
+        for level in &depth.no_levels {
+            assert_eq!(level.price, 0);
+            assert_eq!(level.size, 0);
         }
     }
 
     #[test]
-    fn test_pack_bit_layout() {
-        // Verify the exact bit layout: [yes_ask:16][no_ask:16][yes_size:16][no_size:16]
-        let packed = pack_orderbook(0xABCD, 0x1234, 0x5678, 0x9ABC);
-
-        assert_eq!((packed >> 48) & 0xFFFF, 0xABCD, "yes_ask should be in bits 48-63");
-        assert_eq!((packed >> 32) & 0xFFFF, 0x1234, "no_ask should be in bits 32-47");
-        assert_eq!((packed >> 16) & 0xFFFF, 0x5678, "yes_size should be in bits 16-31");
-        assert_eq!(packed & 0xFFFF, 0x9ABC, "no_size should be in bits 0-15");
-    }
-
-    // =========================================================================
-    // AtomicOrderbook Tests
-    // =========================================================================
-
-    #[test]
-    fn test_atomic_orderbook_store_load() {
-        let book = AtomicOrderbook::new();
-
-        // Initially all zeros
-        let (y, n, ys, ns) = book.load();
-        assert_eq!((y, n, ys, ns), (0, 0, 0, 0));
-
-        // Store and load
-        book.store(45, 55, 500, 600);
-        let (y, n, ys, ns) = book.load();
-        assert_eq!((y, n, ys, ns), (45, 55, 500, 600));
+    fn test_orderbook_depth_top_of_book_empty() {
+        let depth = OrderbookDepth::default();
+        let (yes_price, no_price, yes_size, no_size) = depth.top_of_book();
+        assert_eq!((yes_price, no_price, yes_size, no_size), (0, 0, 0, 0));
     }
 
     #[test]
-    fn test_atomic_orderbook_update_yes() {
-        let book = AtomicOrderbook::new();
+    fn test_orderbook_depth_top_of_book_partial() {
+        // Only level 0 is populated, levels 1-2 are zero
+        let mut depth = OrderbookDepth::default();
+        depth.yes_levels[0] = PriceLevel { price: 45, size: 500 };
+        depth.no_levels[0] = PriceLevel { price: 55, size: 600 };
+        // Levels 1-2 remain at default (0, 0)
 
-        // Set initial state
-        book.store(40, 60, 100, 200);
+        let (yes_price, no_price, yes_size, no_size) = depth.top_of_book();
+        assert_eq!(yes_price, 45, "Should return level 0 yes price");
+        assert_eq!(no_price, 55, "Should return level 0 no price");
+        assert_eq!(yes_size, 500, "Should return level 0 yes size");
+        assert_eq!(no_size, 600, "Should return level 0 no size");
 
-        // Update only YES side
-        book.update_yes(42, 150);
-
-        let (y, n, ys, ns) = book.load();
-        assert_eq!(y, 42, "YES ask should be updated");
-        assert_eq!(ys, 150, "YES size should be updated");
-        assert_eq!(n, 60, "NO ask should be unchanged");
-        assert_eq!(ns, 200, "NO size should be unchanged");
+        // Verify other levels are still zero (shouldn't affect top_of_book)
+        assert_eq!(depth.yes_levels[1].price, 0);
+        assert_eq!(depth.yes_levels[2].price, 0);
+        assert_eq!(depth.no_levels[1].price, 0);
+        assert_eq!(depth.no_levels[2].price, 0);
     }
 
     #[test]
-    fn test_atomic_orderbook_update_no() {
-        let book = AtomicOrderbook::new();
+    fn test_orderbook_depth_top_of_book_full() {
+        // All 3 levels are populated, top_of_book should return level 0
+        let mut depth = OrderbookDepth::default();
 
-        // Set initial state
-        book.store(40, 60, 100, 200);
+        // YES side: ascending prices (best ask first)
+        depth.yes_levels[0] = PriceLevel { price: 45, size: 500 };
+        depth.yes_levels[1] = PriceLevel { price: 46, size: 300 };
+        depth.yes_levels[2] = PriceLevel { price: 47, size: 200 };
 
-        // Update only NO side
-        book.update_no(58, 250);
+        // NO side: ascending prices (best ask first)
+        depth.no_levels[0] = PriceLevel { price: 55, size: 600 };
+        depth.no_levels[1] = PriceLevel { price: 56, size: 400 };
+        depth.no_levels[2] = PriceLevel { price: 57, size: 250 };
 
-        let (y, n, ys, ns) = book.load();
-        assert_eq!(y, 40, "YES ask should be unchanged");
-        assert_eq!(ys, 100, "YES size should be unchanged");
-        assert_eq!(n, 58, "NO ask should be updated");
-        assert_eq!(ns, 250, "NO size should be updated");
-    }
-
-    #[test]
-    fn test_atomic_orderbook_concurrent_updates() {
-        // Verify correctness under concurrent access
-        let book = Arc::new(AtomicOrderbook::new());
-        book.store(50, 50, 1000, 1000);
-
-        let handles: Vec<_> = (0..4).map(|i| {
-            let book = book.clone();
-            thread::spawn(move || {
-                for _ in 0..1000 {
-                    if i % 2 == 0 {
-                        book.update_yes(45 + (i as u16), 500);
-                    } else {
-                        book.update_no(55 + (i as u16), 500);
-                    }
-                }
-            })
-        }).collect();
-
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        // State should be consistent (not corrupted)
-        let (y, n, ys, ns) = book.load();
-        assert!(y > 0 && y < 100, "YES ask should be valid");
-        assert!(n > 0 && n < 100, "NO ask should be valid");
-        assert_eq!(ys, 500, "YES size should be consistent");
-        assert_eq!(ns, 500, "NO size should be consistent");
+        let (yes_price, no_price, yes_size, no_size) = depth.top_of_book();
+        assert_eq!(yes_price, 45, "Should return level 0 yes price");
+        assert_eq!(no_price, 55, "Should return level 0 no price");
+        assert_eq!(yes_size, 500, "Should return level 0 yes size");
+        assert_eq!(no_size, 600, "Should return level 0 no size");
     }
 
     // =========================================================================
