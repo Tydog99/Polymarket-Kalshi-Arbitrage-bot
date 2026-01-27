@@ -7,10 +7,161 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
+use std::time::Instant;
 use rustc_hash::FxHashMap;
 use parking_lot::RwLock;
+use lazy_static::lazy_static;
 
 use crate::arb::{ArbConfig, kalshi_fee};
+
+// =============================================================================
+// LOCK INSTRUMENTATION
+// =============================================================================
+
+/// An instrumented wrapper around `std::sync::RwLock<T>` that tracks contention metrics.
+///
+/// This wrapper provides lock contention monitoring by:
+/// - Attempting non-blocking acquisition first (fast path)
+/// - Only measuring wait time when contention is detected
+/// - Recording statistics to a global aggregator for periodic reporting
+///
+/// # Performance
+/// The fast path (no contention) adds minimal overhead - just an atomic increment.
+/// Only when `try_write()`/`try_read()` fails do we measure actual wait time.
+pub struct InstrumentedRwLock<T> {
+    inner: StdRwLock<T>,
+    contention_count: AtomicU64,   // Times try_write/try_read failed
+    total_writes: AtomicU64,       // Total write acquisitions
+    total_reads: AtomicU64,        // Total read acquisitions
+    total_wait_ns: AtomicU64,      // Cumulative wait time when contended
+}
+
+impl<T> InstrumentedRwLock<T> {
+    /// Create a new instrumented lock wrapping the given value.
+    pub fn new(value: T) -> Self {
+        Self {
+            inner: StdRwLock::new(value),
+            contention_count: AtomicU64::new(0),
+            total_writes: AtomicU64::new(0),
+            total_reads: AtomicU64::new(0),
+            total_wait_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// Acquire a write lock, tracking contention if the fast path fails.
+    ///
+    /// # Panics
+    /// Panics if the lock is poisoned (a thread panicked while holding the lock).
+    pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, T> {
+        self.total_writes.fetch_add(1, Ordering::Relaxed);
+
+        // Fast path: try non-blocking first
+        match self.inner.try_write() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // Contention detected - measure wait time
+                self.contention_count.fetch_add(1, Ordering::Relaxed);
+                let start = Instant::now();
+                let guard = self.inner.write().unwrap();
+                let wait_ns = start.elapsed().as_nanos() as u64;
+                self.total_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
+                guard
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                // Lock is poisoned - propagate the panic
+                panic!("InstrumentedRwLock poisoned: {}", e);
+            }
+        }
+    }
+
+    /// Acquire a read lock, tracking contention if the fast path fails.
+    ///
+    /// # Panics
+    /// Panics if the lock is poisoned (a thread panicked while holding the lock).
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, T> {
+        self.total_reads.fetch_add(1, Ordering::Relaxed);
+
+        match self.inner.try_read() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.contention_count.fetch_add(1, Ordering::Relaxed);
+                let start = Instant::now();
+                let guard = self.inner.read().unwrap();
+                let wait_ns = start.elapsed().as_nanos() as u64;
+                self.total_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
+                guard
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                panic!("InstrumentedRwLock poisoned: {}", e);
+            }
+        }
+    }
+
+    /// Returns (contention_count, total_ops, total_wait_ns) and resets counters.
+    ///
+    /// This is useful for periodic reporting - take a snapshot of stats and reset
+    /// so the next snapshot only includes new activity.
+    pub fn take_stats(&self) -> (u64, u64, u64) {
+        let contention = self.contention_count.swap(0, Ordering::Relaxed);
+        let writes = self.total_writes.swap(0, Ordering::Relaxed);
+        let reads = self.total_reads.swap(0, Ordering::Relaxed);
+        let wait_ns = self.total_wait_ns.swap(0, Ordering::Relaxed);
+        (contention, writes + reads, wait_ns)
+    }
+}
+
+/// Global aggregator for lock contention statistics.
+///
+/// Multiple `InstrumentedRwLock` instances can report their stats here,
+/// and a monitoring thread can periodically take snapshots for logging.
+pub struct LockStatsAggregator {
+    total_contention: AtomicU64,
+    total_ops: AtomicU64,
+    total_wait_ns: AtomicU64,
+}
+
+impl LockStatsAggregator {
+    /// Create a new aggregator with zeroed counters.
+    pub const fn new() -> Self {
+        Self {
+            total_contention: AtomicU64::new(0),
+            total_ops: AtomicU64::new(0),
+            total_wait_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// Record statistics from an instrumented lock.
+    ///
+    /// This is typically called after `InstrumentedRwLock::take_stats()`.
+    pub fn record(&self, contention: u64, ops: u64, wait_ns: u64) {
+        self.total_contention.fetch_add(contention, Ordering::Relaxed);
+        self.total_ops.fetch_add(ops, Ordering::Relaxed);
+        self.total_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
+    }
+
+    /// Take a snapshot of all stats and reset counters to zero.
+    ///
+    /// Returns (total_contention, total_ops, total_wait_ns).
+    pub fn take_snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.total_contention.swap(0, Ordering::Relaxed),
+            self.total_ops.swap(0, Ordering::Relaxed),
+            self.total_wait_ns.swap(0, Ordering::Relaxed),
+        )
+    }
+}
+
+impl Default for LockStatsAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+lazy_static! {
+    /// Global lock statistics aggregator for monitoring lock contention across the system.
+    pub static ref LOCK_STATS: LockStatsAggregator = LockStatsAggregator::new();
+}
 
 // === Market Types ===
 
@@ -75,6 +226,42 @@ pub type PriceCents = u16;
 
 /// Size representation in cents (dollar amount × 100), maximum ~$655k per side
 pub type SizeCents = u16;
+
+/// Number of price levels to track in orderbook depth
+pub const DEPTH_LEVELS: usize = 3;
+
+/// A single price level in the orderbook (price + size at that level)
+#[derive(Clone, Copy, Default, Debug)]
+pub struct PriceLevel {
+    /// Ask price in cents (1-99 for $0.01-$0.99)
+    pub price: PriceCents,
+    /// Size in cents at this price level
+    pub size: SizeCents,
+}
+
+/// Orderbook depth for both YES and NO sides, tracking multiple price levels.
+/// Used for EV-maximizing arbitrage detection that considers walking the book.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct OrderbookDepth {
+    /// YES side ask levels, sorted by price ascending (best ask first)
+    pub yes_levels: [PriceLevel; DEPTH_LEVELS],
+    /// NO side ask levels, sorted by price ascending (best ask first)
+    pub no_levels: [PriceLevel; DEPTH_LEVELS],
+}
+
+impl OrderbookDepth {
+    /// Returns top-of-book prices and sizes for backward compatibility.
+    /// Format: (yes_price, no_price, yes_size, no_size)
+    #[inline]
+    pub fn top_of_book(&self) -> (PriceCents, PriceCents, SizeCents, SizeCents) {
+        (
+            self.yes_levels[0].price,
+            self.no_levels[0].price,
+            self.yes_levels[0].size,
+            self.no_levels[0].size,
+        )
+    }
+}
 
 /// Maximum number of concurrently tracked markets
 pub const MAX_MARKETS: usize = 1024;

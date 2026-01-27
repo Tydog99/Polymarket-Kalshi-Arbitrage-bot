@@ -628,6 +628,7 @@ dependencies = [
  "governor",
  "hex",
  "hmac",
+ "lazy_static",
  "nonzero_ext",
  "parking_lot",
  "pkcs1",

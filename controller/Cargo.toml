@@ -37,6 +37,7 @@ ethers = { version = "2.0", features = ["legacy"] }
 futures-util = "0.3"
 governor = "0.6"
 hmac = "0.12"
+lazy_static = "1.4"
 nonzero_ext = "0.3"
 pkcs1 = { version = "0.7", features = ["pem"] }
 rand = "0.8"
