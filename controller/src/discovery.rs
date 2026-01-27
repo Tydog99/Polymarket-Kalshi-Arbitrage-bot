@@ -1600,6 +1600,7 @@ impl DiscoveryClient {
         }
 
         let mut pairs = Vec::new();
+        let mut alias_gap_count = 0usize;
 
         for event in &kalshi_events {
             if let Some((team1, team2)) = parse_esports_kalshi_title(&event.title) {
@@ -1649,6 +1650,8 @@ impl DiscoveryClient {
                                         poly_team1, kalshi_team_norm,
                                         poly_team2, kalshi_team_norm
                                     );
+                                    alias_gap_count += 1;
+                                    continue;
                                 }
                             }
 
@@ -1691,8 +1694,18 @@ impl DiscoveryClient {
             }
         }
 
-        if !pairs.is_empty() {
-            info!("  ✅ {} {}: matched {} pairs", config.league_code, "esports", pairs.len());
+        if !pairs.is_empty() || alias_gap_count > 0 {
+            info!(
+                "  ✅ {} {}: matched {} pairs{}",
+                config.league_code,
+                "esports",
+                pairs.len(),
+                if alias_gap_count > 0 {
+                    format!(" (skipped {} due to alias gaps)", alias_gap_count)
+                } else {
+                    String::new()
+                }
+            );
         }
 
         // Record stats for esports (moneyline only)
