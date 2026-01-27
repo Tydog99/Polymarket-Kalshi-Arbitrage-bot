@@ -26,7 +26,7 @@ use crate::execution::NanoClock;
 use crate::types::{
     KalshiEventsResponse, KalshiMarketsResponse, KalshiEvent, KalshiMarket,
     GlobalState, ArbOpportunity, PriceCents, SizeCents, fxhash_str,
-    MarketPair,
+    MarketPair, OrderbookDepth, PriceLevel, DEPTH_LEVELS,
 };
 use crate::debug_socket::{DebugBroadcaster, build_market_update_json};
 
@@ -633,8 +633,8 @@ pub async fn run_ws(
                                             // Check for arbs using ArbOpportunity::detect()
                                             if let Some(req) = ArbOpportunity::detect(
                                                 market_id,
-                                                market.kalshi.load(),
-                                                market.poly.load(),
+                                                market.kalshi.read().top_of_book(),
+                                                market.poly.read().top_of_book(),
                                                 state.arb_config(),
                                                 clock.now_ns(),
                                             ) {
@@ -659,8 +659,8 @@ pub async fn run_ws(
                                             // Check for arbs using ArbOpportunity::detect()
                                             if let Some(req) = ArbOpportunity::detect(
                                                 market_id,
-                                                market.kalshi.load(),
-                                                market.poly.load(),
+                                                market.kalshi.read().top_of_book(),
+                                                market.poly.read().top_of_book(),
                                                 state.arb_config(),
                                                 clock.now_ns(),
                                             ) {
@@ -702,6 +702,7 @@ pub async fn run_ws(
 
 /// Process Kalshi orderbook snapshot
 /// Note: Kalshi sends BIDS - to buy YES you pay (100 - best_NO_bid), to buy NO you pay (100 - best_YES_bid)
+/// Collects top 3 price levels for depth-aware arbitrage detection.
 #[inline]
 fn process_kalshi_snapshot(market: &crate::types::AtomicMarketState, body: &KalshiWsMsgBody) {
     let ticker = body.market_ticker.as_deref().unwrap_or("unknown");
@@ -726,66 +727,75 @@ fn process_kalshi_snapshot(market: &crate::types::AtomicMarketState, body: &Kals
         );
     }
 
-    // Find best YES bid (highest price) - this determines NO ask
-    let (no_ask, no_size) = body.yes.as_ref()
-        .and_then(|levels| {
-            levels.iter()
-                .filter_map(|l| {
-                    if l.len() >= 2 && l[1] > 0 {  // Has quantity
-                        Some((l[0], l[1]))  // (price, qty)
-                    } else {
-                        None
-                    }
-                })
-                .max_by_key(|(p, _)| *p)  // Highest bid
-                .map(|(price, qty)| {
-                    let ask = (100 - price) as PriceCents;  // To buy NO, pay 100 - YES_bid
-                    let size = (qty * price / 100) as SizeCents;
-                    (ask, size)
-                })
-        })
-        .unwrap_or((0, 0));
+    // Collect top 3 YES bids (highest prices) - these determine NO asks
+    // Sort by bid price descending (best bid first), then convert to asks (ascending order)
+    let mut no_levels = [PriceLevel::default(); DEPTH_LEVELS];
+    if let Some(levels) = body.yes.as_ref() {
+        let mut bids: Vec<_> = levels.iter()
+            .filter_map(|l| {
+                if l.len() >= 2 && l[1] > 0 {
+                    Some((l[0], l[1]))  // (price, qty)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Sort by price descending (best bid = highest price first)
+        bids.sort_by(|a, b| b.0.cmp(&a.0));
 
-    // Find best NO bid (highest price) - this determines YES ask
-    let (yes_ask, yes_size) = body.no.as_ref()
-        .and_then(|levels| {
-            levels.iter()
-                .filter_map(|l| {
-                    if l.len() >= 2 && l[1] > 0 {
-                        Some((l[0], l[1]))
-                    } else {
-                        None
-                    }
-                })
-                .max_by_key(|(p, _)| *p)
-                .map(|(price, qty)| {
-                    let ask = (100 - price) as PriceCents;  // To buy YES, pay 100 - NO_bid
-                    let size = (qty * price / 100) as SizeCents;
-                    (ask, size)
-                })
-        })
-        .unwrap_or((0, 0));
+        for (i, (bid_price, qty)) in bids.iter().take(DEPTH_LEVELS).enumerate() {
+            let ask_price = (100 - bid_price) as PriceCents;  // To buy NO, pay 100 - YES_bid
+            let size = (qty * bid_price / 100) as SizeCents;
+            no_levels[i] = PriceLevel { price: ask_price, size };
+        }
+    }
+
+    // Collect top 3 NO bids (highest prices) - these determine YES asks
+    // Sort by bid price descending (best bid first), then convert to asks (ascending order)
+    let mut yes_levels = [PriceLevel::default(); DEPTH_LEVELS];
+    if let Some(levels) = body.no.as_ref() {
+        let mut bids: Vec<_> = levels.iter()
+            .filter_map(|l| {
+                if l.len() >= 2 && l[1] > 0 {
+                    Some((l[0], l[1]))  // (price, qty)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Sort by price descending (best bid = highest price first)
+        bids.sort_by(|a, b| b.0.cmp(&a.0));
+
+        for (i, (bid_price, qty)) in bids.iter().take(DEPTH_LEVELS).enumerate() {
+            let ask_price = (100 - bid_price) as PriceCents;  // To buy YES, pay 100 - NO_bid
+            let size = (qty * bid_price / 100) as SizeCents;
+            yes_levels[i] = PriceLevel { price: ask_price, size };
+        }
+    }
 
     // Debug: log computed prices
     tracing::debug!(
-        "[KALSHI-SNAP] {} | COMPUTED: yes_ask={}¢ no_ask={}¢ yes_size={}¢ no_size={}¢",
-        ticker, yes_ask, no_ask, yes_size, no_size
+        "[KALSHI-SNAP] {} | COMPUTED: yes_ask={}¢ no_ask={}¢ yes_size={}¢ no_size={}¢ (top-of-book)",
+        ticker, yes_levels[0].price, no_levels[0].price, yes_levels[0].size, no_levels[0].size
     );
 
-    // Store
-    market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
+    // Store depth using write lock
+    let depth = OrderbookDepth { yes_levels, no_levels };
+    *market.kalshi.write() = depth;
     market.inc_kalshi_updates();
 }
 
 /// Process Kalshi orderbook delta
-/// Note: Deltas update bid levels; we recompute asks from best bids
+/// Note: Deltas update bid levels; we recompute asks from best bids.
+/// Collects top 3 price levels for depth-aware arbitrage detection.
+/// If a side has no delta, we preserve the current levels for that side.
 #[inline]
 fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiWsMsgBody) {
     let ticker = body.market_ticker.as_deref().unwrap_or("unknown");
 
-    // For deltas, recompute from snapshot-like format
-    // Kalshi deltas have yes/no as arrays of [price, new_qty]
-    let (current_yes, current_no, current_yes_size, current_no_size) = market.kalshi.load();
+    // Read current depth state
+    let current_depth = { *market.kalshi.read() };
+    let (current_yes, current_no) = (current_depth.yes_levels[0].price, current_depth.no_levels[0].price);
 
     // Debug: log delta updates
     if body.yes.is_some() || body.no.is_some() {
@@ -795,56 +805,66 @@ fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiW
         );
     }
 
-    // Process YES bid updates (affects NO ask)
-    let (no_ask, no_size) = if let Some(levels) = &body.yes {
-        // Find best (highest) YES bid with non-zero quantity
-        levels.iter()
+    // Process YES bid updates (affects NO asks)
+    let no_levels = if let Some(levels) = &body.yes {
+        let mut bids: Vec<_> = levels.iter()
             .filter_map(|l| {
                 if l.len() >= 2 && l[1] > 0 {
-                    Some((l[0], l[1]))
+                    Some((l[0], l[1]))  // (price, qty)
                 } else {
                     None
                 }
             })
-            .max_by_key(|(p, _)| *p)
-            .map(|(price, qty)| {
-                let ask = (100 - price) as PriceCents;
-                let size = (qty * price / 100) as SizeCents;
-                (ask, size)
-            })
-            .unwrap_or((current_no, current_no_size))
+            .collect();
+        // Sort by price descending (best bid = highest price first)
+        bids.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut no_lvls = [PriceLevel::default(); DEPTH_LEVELS];
+        for (i, (bid_price, qty)) in bids.iter().take(DEPTH_LEVELS).enumerate() {
+            let ask_price = (100 - bid_price) as PriceCents;
+            let size = (qty * bid_price / 100) as SizeCents;
+            no_lvls[i] = PriceLevel { price: ask_price, size };
+        }
+        // If delta has fewer levels than DEPTH_LEVELS, the rest stay at default (0, 0)
+        no_lvls
     } else {
-        (current_no, current_no_size)
+        current_depth.no_levels
     };
 
-    // Process NO bid updates (affects YES ask)
-    let (yes_ask, yes_size) = if let Some(levels) = &body.no {
-        levels.iter()
+    // Process NO bid updates (affects YES asks)
+    let yes_levels = if let Some(levels) = &body.no {
+        let mut bids: Vec<_> = levels.iter()
             .filter_map(|l| {
                 if l.len() >= 2 && l[1] > 0 {
-                    Some((l[0], l[1]))
+                    Some((l[0], l[1]))  // (price, qty)
                 } else {
                     None
                 }
             })
-            .max_by_key(|(p, _)| *p)
-            .map(|(price, qty)| {
-                let ask = (100 - price) as PriceCents;
-                let size = (qty * price / 100) as SizeCents;
-                (ask, size)
-            })
-            .unwrap_or((current_yes, current_yes_size))
+            .collect();
+        // Sort by price descending (best bid = highest price first)
+        bids.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut yes_lvls = [PriceLevel::default(); DEPTH_LEVELS];
+        for (i, (bid_price, qty)) in bids.iter().take(DEPTH_LEVELS).enumerate() {
+            let ask_price = (100 - bid_price) as PriceCents;
+            let size = (qty * bid_price / 100) as SizeCents;
+            yes_lvls[i] = PriceLevel { price: ask_price, size };
+        }
+        yes_lvls
     } else {
-        (current_yes, current_yes_size)
+        current_depth.yes_levels
     };
 
     // Debug: log computed prices after delta
     tracing::debug!(
         "[KALSHI-DELTA] {} | COMPUTED: yes_ask={}¢ no_ask={}¢ (was yes={}¢ no={}¢)",
-        ticker, yes_ask, no_ask, current_yes, current_no
+        ticker, yes_levels[0].price, no_levels[0].price, current_yes, current_no
     );
 
-    market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
+    // Store depth using write lock
+    let depth = OrderbookDepth { yes_levels, no_levels };
+    *market.kalshi.write() = depth;
     market.inc_kalshi_updates();
 }
 
