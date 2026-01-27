@@ -319,8 +319,8 @@ pub fn sweep_markets(
     let market_count = state.market_count();
 
     for market in state.markets.iter().take(market_count) {
-        let (k_yes, k_no, _, _) = market.kalshi.load();
-        let (p_yes, p_no, _, _) = market.poly.load();
+        let (k_yes, k_no, _, _) = market.kalshi.read().top_of_book();
+        let (p_yes, p_no, _, _) = market.poly.read().top_of_book();
 
         // Only check markets with both platforms populated
         if k_yes == 0 || k_no == 0 || p_yes == 0 || p_no == 0 {
@@ -331,8 +331,8 @@ pub fn sweep_markets(
         // Check for arbs using ArbOpportunity::detect()
         if let Some(req) = ArbOpportunity::detect(
             market.market_id,
-            market.kalshi.load(),
-            market.poly.load(),
+            market.kalshi.read().top_of_book(),
+            market.poly.read().top_of_book(),
             state.arb_config(),
             clock_ns,
         ) {

@@ -587,10 +587,13 @@ pub async fn run_ws(
                                             market.mark_kalshi_update_unix_ms(now_ms);
 
                                             // Check for arbs using ArbOpportunity::detect()
+                                            // Extract values before the if-let to avoid holding the read guard across await
+                                            let kalshi_book = market.kalshi.read().top_of_book();
+                                            let poly_book = market.poly.read().top_of_book();
                                             if let Some(req) = ArbOpportunity::detect(
                                                 market_id,
-                                                market.kalshi.read().top_of_book(),
-                                                market.poly.read().top_of_book(),
+                                                kalshi_book,
+                                                poly_book,
                                                 state.arb_config(),
                                                 clock.now_ns(),
                                             ) {
@@ -608,10 +611,13 @@ pub async fn run_ws(
                                             market.mark_kalshi_update_unix_ms(now_ms);
 
                                             // Check for arbs using ArbOpportunity::detect()
+                                            // Extract values before the if-let to avoid holding the read guard across await
+                                            let kalshi_book = market.kalshi.read().top_of_book();
+                                            let poly_book = market.poly.read().top_of_book();
                                             if let Some(req) = ArbOpportunity::detect(
                                                 market_id,
-                                                market.kalshi.read().top_of_book(),
-                                                market.poly.read().top_of_book(),
+                                                kalshi_book,
+                                                poly_book,
                                                 state.arb_config(),
                                                 clock.now_ns(),
                                             ) {

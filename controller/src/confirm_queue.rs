@@ -251,8 +251,8 @@ impl ConfirmationQueue {
         };
 
         // Get current prices from orderbook
-        let (k_yes, k_no, _, _) = market.kalshi.load();
-        let (p_yes, p_no, _, _) = market.poly.load();
+        let (k_yes, k_no, _, _) = market.kalshi.read().top_of_book();
+        let (p_yes, p_no, _, _) = market.poly.read().top_of_book();
 
         // Calculate original cost (from when arb was queued)
         let original_cost = arb.request.yes_price + arb.request.no_price + match arb.request.arb_type {
@@ -291,8 +291,8 @@ impl ConfirmationQueue {
     #[allow(dead_code)]
     pub fn get_current_prices(&self, market_id: u16) -> Option<(PriceCents, PriceCents, PriceCents, PriceCents)> {
         let market = self.state.get_by_id(market_id)?;
-        let (k_yes, k_no, _, _) = market.kalshi.load();
-        let (p_yes, p_no, _, _) = market.poly.load();
+        let (k_yes, k_no, _, _) = market.kalshi.read().top_of_book();
+        let (p_yes, p_no, _, _) = market.poly.read().top_of_book();
         Some((k_yes, k_no, p_yes, p_no))
     }
 }
