@@ -838,4 +838,71 @@ mod tests {
 
         assert_eq!(client.signature_type, 2);
     }
+
+    #[test]
+    fn test_parse_order_response_valid() {
+        let json = r#"{
+            "id": "0x123",
+            "status": "MATCHED",
+            "market": "0xabc",
+            "outcome": "Yes",
+            "price": "0.65",
+            "side": "BUY",
+            "size_matched": "10",
+            "original_size": "10",
+            "maker_address": "0xdef",
+            "asset_id": "12345"
+        }"#;
+
+        let result: Result<PolymarketOrderResponse, _> = serde_json::from_str(json);
+        assert!(result.is_ok());
+        let order = result.unwrap();
+        assert_eq!(order.id, "0x123");
+        assert_eq!(order.status, "MATCHED");
+        assert_eq!(order.size_matched, "10");
+    }
+
+    #[test]
+    fn test_parse_order_response_null_fails() {
+        let json = "null";
+        let result: Result<PolymarketOrderResponse, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("null"), "Error should mention null: {}", err);
+    }
+
+    #[test]
+    fn test_parse_order_response_empty_fails() {
+        let json = "";
+        let result: Result<PolymarketOrderResponse, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_null_response_detection() {
+        // Test the exact null check logic used in get_order_async
+        let null_responses = ["null", " null ", "null\n", "\nnull\n"];
+        for response in null_responses {
+            assert!(
+                response.trim() == "null" || response.trim().is_empty(),
+                "Should detect '{}' as null response",
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn test_valid_response_not_detected_as_null() {
+        let valid_responses = [
+            r#"{"id":"123"}"#,
+            r#"{"id":"123","status":"MATCHED"}"#,
+        ];
+        for response in valid_responses {
+            assert!(
+                response.trim() != "null" && !response.trim().is_empty(),
+                "Should NOT detect '{}' as null response",
+                response
+            );
+        }
+    }
 }

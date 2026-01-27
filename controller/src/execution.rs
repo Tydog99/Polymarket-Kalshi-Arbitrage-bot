@@ -5,10 +5,14 @@
 
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn, error};
+
+/// Global counter for unique position_id generation
+/// Each arb execution gets a unique sequence number
+static ARB_COUNTER: AtomicU32 = AtomicU32::new(1);
 
 use crate::kalshi::KalshiApiClient;
 use crate::poly_executor::PolyExecutor;
@@ -156,6 +160,11 @@ impl ExecutionEngine {
 
         let pair = market.pair()
             .ok_or_else(|| anyhow!("No pair for market_id {}", market_id))?;
+
+        // Generate unique position_id for this arb execution
+        // This ensures each arb is tracked separately even on the same market pair
+        let arb_seq = ARB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let position_id: Arc<str> = format!("{}-{}", pair.pair_id, arb_seq).into();
 
         // Log detection early so we know what arb was found even if checks fail
         let profit_cents = req.profit_cents();
@@ -348,7 +357,7 @@ impl ExecutionEngine {
                     let kalshi = self.kalshi.clone();
                     let poly_async = self.poly_async.clone();
                     let position_channel = self.position_channel.clone();
-                    let pair_id = pair.pair_id.clone();
+                    let position_id_clone = position_id.clone();
                     let description = pair.description.clone();
                     let arb_type = req.arb_type;
                     let yes_price = req.yes_price;
@@ -362,7 +371,7 @@ impl ExecutionEngine {
 
                     tokio::spawn(async move {
                         Self::auto_close_background(
-                            kalshi, poly_async, position_channel, pair_id, description,
+                            kalshi, poly_async, position_channel, position_id_clone, description,
                             arb_type, yes_filled, no_filled,
                             yes_price, no_price, poly_yes_token, poly_no_token,
                             kalshi_ticker, original_cost_per_contract
@@ -407,7 +416,7 @@ impl ExecutionEngine {
                     None
                 };
                 self.position_channel.record_fill(FillRecord::with_details(
-                    &pair.pair_id, &pair.description, platform1, side1,
+                    &position_id, &pair.description, platform1, side1,
                     yes_requested, yes_filled as f64, yes_price,
                     0.0, &yes_order_id,
                     TradeReason::ArbLegYes, yes_status,
@@ -435,7 +444,7 @@ impl ExecutionEngine {
                     None
                 };
                 self.position_channel.record_fill(FillRecord::with_details(
-                    &pair.pair_id, &pair.description, platform2, side2,
+                    &position_id, &pair.description, platform2, side2,
                     no_requested, no_filled as f64, no_price,
                     0.0, &no_order_id,
                     TradeReason::ArbLegNo, no_status,
@@ -691,7 +700,7 @@ impl ExecutionEngine {
         kalshi: Arc<KalshiApiClient>,
         poly_async: Arc<dyn PolyExecutor>,
         position_channel: PositionChannel,
-        pair_id: Arc<str>,
+        position_id: Arc<str>,
         description: Arc<str>,
         arb_type: ArbType,
         yes_filled: i64,
@@ -735,7 +744,7 @@ impl ExecutionEngine {
 
             // Record even zero fills for complete audit trail
             position_channel.record_fill(FillRecord::with_details(
-                &pair_id, &description, platform, side,
+                &position_id, &description, platform, side,
                 -requested,  // Negative = closing position
                 -closed,     // Negative = closing position
                 price, 0.0, order_id,
@@ -1369,6 +1378,80 @@ mod tests {
     fn test_failure_reason_no_error() {
         let reason = format_failure_reason(None);
         assert_eq!(reason, "No fill", "Without error should just be 'No fill'");
+    }
+
+    // =========================================================================
+    // BUG FIX TESTS: Unique position_id per arb execution
+    // =========================================================================
+
+    #[test]
+    fn test_arb_counter_increments() {
+        // Get two sequential counter values
+        let seq1 = ARB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let seq2 = ARB_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        // They should be sequential
+        assert_eq!(seq2, seq1 + 1, "Counter should increment by 1");
+    }
+
+    #[test]
+    fn test_position_id_format() {
+        let pair_id = "nba-lal-bos-2026-01-27-KXNBAGAME-26JAN27LALBOS-LAL";
+        let seq = 42u32;
+
+        let position_id = format!("{}-{}", pair_id, seq);
+
+        assert_eq!(
+            position_id,
+            "nba-lal-bos-2026-01-27-KXNBAGAME-26JAN27LALBOS-LAL-42"
+        );
+    }
+
+    #[test]
+    fn test_position_ids_are_unique() {
+        // Simulate multiple arb executions on the same market
+        let pair_id: Arc<str> = "test-market-pair".into();
+
+        let mut position_ids = Vec::new();
+        for _ in 0..100 {
+            let seq = ARB_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let position_id: Arc<str> = format!("{}-{}", pair_id, seq).into();
+            position_ids.push(position_id);
+        }
+
+        // All position_ids should be unique
+        let unique_count = position_ids.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(unique_count, 100, "All position_ids should be unique");
+    }
+
+    #[test]
+    fn test_position_id_uniqueness_across_threads() {
+        use std::sync::atomic::Ordering;
+
+        let pair_id: Arc<str> = "threaded-test-pair".into();
+        let position_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let pair_id = pair_id.clone();
+            let position_ids = position_ids.clone();
+
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..10 {
+                    let seq = ARB_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let position_id: Arc<str> = format!("{}-{}", pair_id, seq).into();
+                    position_ids.lock().unwrap().push(position_id);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let ids = position_ids.lock().unwrap();
+        let unique_count = ids.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(unique_count, 100, "All position_ids should be unique across threads");
     }
 }
 
