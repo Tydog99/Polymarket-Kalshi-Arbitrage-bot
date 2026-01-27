@@ -368,6 +368,11 @@ impl DiscoveryClient {
                 .collect()
         };
 
+        // Build set of requested league codes for filtering
+        let requested_leagues: std::collections::HashSet<&str> = configs.iter()
+            .map(|c| c.league_code)
+            .collect();
+
         // Discover with filter for known tickers
         let league_futures: Vec<_> = configs.iter()
             .map(|config| self.discover_league(config, Some(&cache), market_type_filter))
@@ -375,7 +380,7 @@ impl DiscoveryClient {
 
         let league_results = futures_util::future::join_all(league_futures).await;
 
-        // Merge cached pairs with newly discovered ones
+        // Merge cached pairs with newly discovered ones (full cache for persistence)
         let mut all_pairs = cache.pairs;
         let mut new_count = 0;
         let mut stats = crate::types::DiscoveryStats::default();
@@ -390,28 +395,35 @@ impl DiscoveryClient {
             stats.merge(league_result.stats);
         }
 
+        // Filter to only requested leagues for return value
+        let filtered_pairs: Vec<_> = all_pairs.iter()
+            .filter(|p| requested_leagues.contains(p.league.as_ref()))
+            .cloned()
+            .collect();
+
         if new_count > 0 {
             info!("🆕 Found {} new market pairs", new_count);
 
-            // Update cache
-            let new_cache = DiscoveryCache::new(all_pairs.clone());
+            // Update cache with ALL pairs (preserve other leagues)
+            let new_cache = DiscoveryCache::new(all_pairs);
             if let Err(e) = Self::save_cache(&new_cache).await {
                 warn!("Failed to update discovery cache: {}", e);
             } else {
-                info!("💾 Updated cache with {} total pairs", all_pairs.len());
+                info!("💾 Updated cache with {} total pairs ({} for requested leagues)",
+                      new_cache.pairs.len(), filtered_pairs.len());
             }
         } else {
-            info!("✅ No new markets found, using {} cached pairs", all_pairs.len());
+            info!("✅ No new markets found, using {} cached pairs for requested leagues", filtered_pairs.len());
 
-            // Just update timestamp to extend TTL
-            let refreshed_cache = DiscoveryCache::new(all_pairs.clone());
+            // Just update timestamp to extend TTL (preserve full cache)
+            let refreshed_cache = DiscoveryCache::new(all_pairs);
             if let Err(e) = Self::save_cache(&refreshed_cache).await {
                 tracing::warn!("[DISCOVERY] Failed to refresh cache TTL: {}", e);
             }
         }
 
         DiscoveryResult {
-            pairs: all_pairs,
+            pairs: filtered_pairs,
             kalshi_events_found: new_count,
             poly_matches: new_count,
             poly_misses: 0,
@@ -3421,5 +3433,170 @@ mod tests {
             markets_by_event.get("KXNBAGAME-26JAN17LALBOS").is_some(),
             "Valid market should be grouped"
         );
+    }
+
+    /// Helper to create a test MarketPair with specified league
+    fn make_test_pair(id: &str, league: &str) -> MarketPair {
+        MarketPair {
+            pair_id: id.into(),
+            league: league.into(),
+            market_type: MarketType::Moneyline,
+            description: format!("{} market", league).into(),
+            kalshi_event_ticker: format!("KX{}-EVT", id).into(),
+            kalshi_market_ticker: format!("KX{}-MKT", id).into(),
+            kalshi_event_slug: format!("{}-game", league).into(),
+            poly_slug: format!("{}-market", league).into(),
+            poly_yes_token: "yes_token".into(),
+            poly_no_token: "no_token".into(),
+            line_value: None,
+            team_suffix: None,
+        }
+    }
+
+    #[test]
+    fn test_filter_pairs_by_leagues_multiple_leagues() {
+        let pairs = vec![
+            make_test_pair("1", "nba"),
+            make_test_pair("2", "epl"),
+            make_test_pair("3", "nfl"),
+            make_test_pair("4", "nba"),
+            make_test_pair("5", "bundesliga"),
+        ];
+
+        // Filter for NBA and NFL only
+        let filtered = filter_pairs_by_leagues(pairs, &["nba", "nfl"]);
+        assert_eq!(filtered.len(), 3);
+        assert!(filtered.iter().all(|p| &*p.league == "nba" || &*p.league == "nfl"));
+    }
+
+    #[test]
+    fn test_filter_pairs_by_leagues_empty_filter_returns_all() {
+        let pairs = vec![
+            make_test_pair("1", "nba"),
+            make_test_pair("2", "epl"),
+            make_test_pair("3", "nfl"),
+        ];
+
+        // Empty filter should return all pairs
+        let filtered = filter_pairs_by_leagues(pairs.clone(), &[]);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn test_filter_pairs_by_leagues_no_matches() {
+        let pairs = vec![
+            make_test_pair("1", "nba"),
+            make_test_pair("2", "epl"),
+        ];
+
+        // Filter for league that doesn't exist
+        let filtered = filter_pairs_by_leagues(pairs, &["mlb"]);
+        assert_eq!(filtered.len(), 0);
+    }
+
+    /// Simulates the incremental discovery filtering logic:
+    /// When a cache contains pairs from multiple leagues but only specific leagues
+    /// are requested, only those leagues should be returned
+    #[test]
+    fn test_incremental_discovery_filters_to_requested_leagues() {
+        // Simulate a cache with pairs from multiple leagues
+        let cached_pairs = vec![
+            make_test_pair("nba1", "nba"),
+            make_test_pair("nba2", "nba"),
+            make_test_pair("epl1", "epl"),
+            make_test_pair("epl2", "epl"),
+            make_test_pair("epl3", "epl"),
+            make_test_pair("nfl1", "nfl"),
+        ];
+
+        // User requests only NBA
+        let requested_leagues: std::collections::HashSet<&str> = ["nba"].into_iter().collect();
+
+        // This simulates the fix in discover_incremental
+        let filtered_pairs: Vec<_> = cached_pairs.iter()
+            .filter(|p| requested_leagues.contains(p.league.as_ref()))
+            .cloned()
+            .collect();
+
+        // Should only return NBA pairs
+        assert_eq!(filtered_pairs.len(), 2);
+        assert!(filtered_pairs.iter().all(|p| &*p.league == "nba"));
+
+        // Original cache should still have all pairs (for persistence)
+        assert_eq!(cached_pairs.len(), 6);
+    }
+
+    /// Verifies that cache preservation works correctly:
+    /// New pairs are added to the cache, but only requested leagues are returned
+    #[test]
+    fn test_incremental_discovery_preserves_cache_adds_new() {
+        // Existing cache with EPL pairs
+        let mut all_pairs = vec![
+            make_test_pair("epl1", "epl"),
+            make_test_pair("epl2", "epl"),
+        ];
+
+        // New NBA pairs discovered
+        let new_pairs = vec![
+            make_test_pair("nba1", "nba"),
+            make_test_pair("nba2", "nba"),
+        ];
+
+        // Merge new pairs into cache (simulating discover_incremental)
+        for pair in new_pairs {
+            if !all_pairs.iter().any(|p| *p.kalshi_market_ticker == *pair.kalshi_market_ticker) {
+                all_pairs.push(pair);
+            }
+        }
+
+        // Cache now has all 4 pairs
+        assert_eq!(all_pairs.len(), 4);
+
+        // But when filtering for NBA only (as would happen in return value)
+        let requested_leagues: std::collections::HashSet<&str> = ["nba"].into_iter().collect();
+        let filtered_pairs: Vec<_> = all_pairs.iter()
+            .filter(|p| requested_leagues.contains(p.league.as_ref()))
+            .cloned()
+            .collect();
+
+        // Only NBA pairs returned
+        assert_eq!(filtered_pairs.len(), 2);
+        assert!(filtered_pairs.iter().all(|p| &*p.league == "nba"));
+    }
+
+    /// Tests the exact bug scenario: cache has 742 pairs from all leagues,
+    /// user requests only NBA, should get only NBA pairs back
+    #[test]
+    fn test_bug_fix_incremental_discovery_with_stale_multi_league_cache() {
+        // Simulate stale cache with many leagues (like the 742 pairs in the bug report)
+        let cached_pairs: Vec<_> = (0..100).map(|i| {
+            let league = match i % 5 {
+                0 => "nba",
+                1 => "epl",
+                2 => "nfl",
+                3 => "bundesliga",
+                4 => "nhl",
+                _ => unreachable!(),
+            };
+            make_test_pair(&format!("pair{}", i), league)
+        }).collect();
+
+        assert_eq!(cached_pairs.len(), 100);
+
+        // User runs with --leagues nba
+        let requested_leagues: std::collections::HashSet<&str> = ["nba"].into_iter().collect();
+
+        // Filter to requested leagues (the fix)
+        let filtered_pairs: Vec<_> = cached_pairs.iter()
+            .filter(|p| requested_leagues.contains(p.league.as_ref()))
+            .cloned()
+            .collect();
+
+        // Should only get NBA pairs (20 of the 100)
+        assert_eq!(filtered_pairs.len(), 20);
+        assert!(filtered_pairs.iter().all(|p| &*p.league == "nba"));
+
+        // Verify we didn't get EPL pairs (which was the bug)
+        assert!(filtered_pairs.iter().all(|p| &*p.league != "epl"));
     }
 }
