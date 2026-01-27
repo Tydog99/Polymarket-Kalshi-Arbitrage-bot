@@ -29,6 +29,7 @@ mod config;
 mod confirm_log;
 mod confirm_queue;
 mod confirm_tui;
+mod debug_socket;
 mod discovery;
 mod execution;
 mod kalshi;
@@ -60,6 +61,7 @@ use config::{ARB_THRESHOLD, enabled_leagues, get_league_configs, parse_controlle
 use confirm_log::{ConfirmationLogger, ConfirmationRecord, ConfirmationStatus};
 use confirm_queue::{ConfirmAction, ConfirmationQueue};
 use confirm_tui::TuiState;
+use debug_socket::DebugBroadcaster;
 use discovery::DiscoveryClient;
 use execution::{ExecutionEngine, NanoClock, create_execution_channel, run_execution_loop};
 use kalshi::{KalshiConfig, KalshiApiClient};
@@ -579,6 +581,8 @@ async fn main() -> Result<()> {
     //   cargo run -p controller -- --leagues nba
     //   cargo run -p controller -- --leagues nba,nfl --pairing-debug --pairing-debug-limit 50
     //   cargo run -p controller -- --verbose-heartbeat --heartbeat-interval 5
+    //   cargo run -p controller -- --verbose-heartbeat --debug-ws
+    //   cargo run -p controller -- --verbose-heartbeat --debug-ws-addr 127.0.0.1:9105
     let args: Vec<String> = std::env::args().skip(1).collect();
     if cli_has_flag(&args, "--verbose-heartbeat") {
         std::env::set_var("VERBOSE_HEARTBEAT", "1");
@@ -600,6 +604,13 @@ async fn main() -> Result<()> {
     }
     if let Some(skip) = cli_arg_value(&args, "--confirm-mode-skip") {
         std::env::set_var("CONFIRM_MODE_SKIP", &skip);
+    }
+    if cli_has_flag(&args, "--debug-ws") {
+        std::env::set_var("DEBUG_WS", "1");
+    }
+    if let Some(addr) = cli_arg_value(&args, "--debug-ws-addr") {
+        std::env::set_var("DEBUG_WS_ADDR", &addr);
+        std::env::set_var("DEBUG_WS", "1");
     }
 
     // Build league list for discovery from CLI/env.
@@ -791,6 +802,28 @@ async fn main() -> Result<()> {
         info!("📡 Global state initialized: tracking {} markets", s.market_count());
         s
     });
+
+    // Optional: stream verbose heartbeat snapshots to a local WebSocket.
+    // Intended for a separate web UI process (see debug_web crate).
+    let debug_broadcaster: Option<DebugBroadcaster> = match config::debug_ws_addr() {
+        Some(addr) => match addr.parse::<std::net::SocketAddr>() {
+            Ok(sock) => match debug_socket::spawn_debug_ws_server(sock).await {
+                Ok(b) => {
+                    info!("[DEBUG_WS] Streaming verbose snapshots on ws://{}", addr);
+                    Some(b)
+                }
+                Err(e) => {
+                    warn!("[DEBUG_WS] Failed to bind ws://{}: {}", addr, e);
+                    None
+                }
+            },
+            Err(e) => {
+                warn!("[DEBUG_WS] Invalid DEBUG_WS_ADDR='{}': {}", addr, e);
+                None
+            }
+        },
+        None => None,
+    };
 
     // Initialize execution infrastructure
     let (exec_tx, exec_rx) = create_execution_channel();
@@ -1325,15 +1358,6 @@ async fn main() -> Result<()> {
         // Helper closure to route log output based on TUI state
         let log_line = |line: String, tui_active: bool| {
             if tui_active {
-                let _ = sweep_log_tx.try_send(line);
-            } else {
-                info!("{}", line);
-            }
-        };
-
-        // Helper closure to route log output based on TUI state
-        let log_line = |line: String, tui_active: bool| {
-            if tui_active {
                 let _ = sweep_log_tx.try_send(format!("[{}]  INFO {}", chrono::Local::now().format("%H:%M:%S"), line));
             } else {
                 info!("{}", line);
@@ -1386,6 +1410,7 @@ async fn main() -> Result<()> {
     let heartbeat_threshold = threshold_cents;
     let heartbeat_tui_state = tui_state.clone();
     let heartbeat_log_tx = tui_log_tx.clone();
+    let heartbeat_debug = debug_broadcaster.clone();
     let heartbeat_handle = tokio::spawn(async move {
         use crate::arb::kalshi_fee;
         use std::collections::HashMap;
@@ -1547,6 +1572,83 @@ async fn main() -> Result<()> {
             let poly_delta = total_poly_updates.saturating_sub(prev_poly_updates);
             prev_kalshi_updates = total_kalshi_updates;
             prev_poly_updates = total_poly_updates;
+
+            // Emit a structured snapshot for external debug consumers (web UI).
+            if verbose {
+                if let Some(ref dbg) = heartbeat_debug {
+                    #[derive(serde::Serialize)]
+                    struct MarketDetailWs<'a> {
+                        description: &'a str,
+                        league: &'a str,
+                        market_type: &'a str,
+                        k_yes: u16,
+                        k_no: u16,
+                        p_yes: u16,
+                        p_no: u16,
+                        gap_cents: Option<i16>,
+                        yes_size: u16,
+                        no_size: u16,
+                        k_updates: u32,
+                        p_updates: u32,
+                        k_last_ms: u64,
+                        p_last_ms: u64,
+                    }
+
+                    #[derive(serde::Serialize)]
+                    struct DebugSnapshot<'a> {
+                        now_ms: u64,
+                        market_count: usize,
+                        threshold_cents: u16,
+                        with_both_prices: usize,
+                        kalshi_total_updates: u64,
+                        polymarket_total_updates: u64,
+                        kalshi_delta: u64,
+                        polymarket_delta: u64,
+                        markets: Vec<MarketDetailWs<'a>>,
+                    }
+
+                    let markets = market_details
+                        .iter()
+                        .map(|m| MarketDetailWs {
+                            description: &m.description,
+                            league: &m.league,
+                            market_type: match m.market_type {
+                                MarketType::Moneyline => "moneyline",
+                                MarketType::Spread => "spread",
+                                MarketType::Total => "total",
+                                MarketType::Btts => "btts",
+                            },
+                            k_yes: m.k_yes,
+                            k_no: m.k_no,
+                            p_yes: m.p_yes,
+                            p_no: m.p_no,
+                            gap_cents: if m.gap == i16::MAX { None } else { Some(m.gap) },
+                            yes_size: m.yes_size,
+                            no_size: m.no_size,
+                            k_updates: m.k_updates,
+                            p_updates: m.p_updates,
+                            k_last_ms: m.k_last_ms,
+                            p_last_ms: m.p_last_ms,
+                        })
+                        .collect::<Vec<_>>();
+
+                    let snapshot = DebugSnapshot {
+                        now_ms,
+                        market_count,
+                        threshold_cents: heartbeat_threshold,
+                        with_both_prices: with_both,
+                        kalshi_total_updates: total_kalshi_updates,
+                        polymarket_total_updates: total_poly_updates,
+                        kalshi_delta,
+                        polymarket_delta: poly_delta,
+                        markets,
+                    };
+
+                    if let Ok(json) = serde_json::to_string(&snapshot) {
+                        dbg.send_json(json);
+                    }
+                }
+            }
 
             if verbose {
                 // Verbose mode: hierarchical tree view

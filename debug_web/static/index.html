@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Controller Verbose Debug</title>
+    <style>
+      :root { color-scheme: dark; }
+      body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background: #0b0e14; color: #e6edf3; }
+      header { padding: 12px 16px; border-bottom: 1px solid #202838; background: #0f1420; position: sticky; top: 0; z-index: 10; }
+      .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+      .pill { padding: 4px 8px; border: 1px solid #2b3754; border-radius: 999px; background: #0b1020; font-size: 12px; color: #b8c2d1; }
+      input { background: #0b1020; color: #e6edf3; border: 1px solid #2b3754; border-radius: 8px; padding: 8px 10px; min-width: 260px; }
+      main { padding: 12px 16px; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { padding: 8px 10px; border-bottom: 1px solid #202838; vertical-align: top; }
+      th { position: sticky; top: 66px; background: #0b0e14; text-align: left; color: #b8c2d1; font-weight: 600; }
+      tr:hover td { background: #0f1420; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+      .good { color: #7ee787; }
+      .bad { color: #ff7b72; }
+      .warn { color: #f2cc60; }
+      .muted { color: #8b949e; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="row">
+        <div class="pill" id="status">connecting…</div>
+        <div class="pill" id="summary">—</div>
+        <div style="flex:1"></div>
+        <input id="filter" placeholder="Filter markets…" />
+      </div>
+    </header>
+    <main>
+      <table>
+        <thead>
+          <tr>
+            <th>League</th>
+            <th>Type</th>
+            <th>Description</th>
+            <th class="mono">Kalshi</th>
+            <th class="mono">Poly</th>
+            <th class="mono">Gap</th>
+            <th class="mono">Size</th>
+            <th class="mono">Updates</th>
+            <th class="mono">Age</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <p class="muted" style="margin-top:12px">
+        Tip: run controller with <span class="mono">--verbose-heartbeat --debug-ws</span>, then run this server with <span class="mono">cargo run -p debug_web</span>.
+      </p>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>
+
