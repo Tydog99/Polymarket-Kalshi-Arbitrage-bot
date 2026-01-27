@@ -1948,7 +1948,7 @@ static ESPORTS_TEAM_ALIASES: &[(&str, &[&str])] = &[
     ("drx", &["drx"]),
     ("kwangdong-freecs", &["kdf", "kwangdong", "freecs"]),
     ("nongshim-redforce", &["ns", "nongshim", "redforce", "nongshim-red-force"]),
-    ("ok-brion", &["bro", "bro2", "brion", "ok brion"]),
+    ("ok-brion", &["bro", "bro2", "brion", "ok brion", "oksavingsbank-brion", "oksavingsbank brion"]),
     ("fearx", &["fox", "fox1", "fearx", "foxy", "bnk-fearx-youth"]),
     ("dn-soopers", &["dnf", "dn soopers"]),
     ("hanjin-brion", &["bro", "bro2", "hanjin", "hanjin brion"]),
@@ -2055,7 +2055,7 @@ static ESPORTS_TEAM_ALIASES: &[(&str, &[&str])] = &[
     ("ecstatic", &["ecstatic"]),
     ("permitta", &["permitta"]),
     ("rebels", &["rebels"]),
-    ("passion-ua", &["passion", "passion ua"]),
+    ("passion-ua", &["passion", "passion ua", "pssnua"]),
     ("tyloo", &["tyloo"]),
     ("lynn-vision", &["lv", "lvg", "lynn vision", "lynnvision"]),
     ("the-mongolz", &["mg", "mongolz", "the mongolz"]),
@@ -2919,6 +2919,29 @@ mod tests {
         assert_eq!(lookup_team_canonical("m-8"), Some("gentle-mates"));
         assert_eq!(lookup_team_canonical("Gentle Mates"), Some("gentle-mates"));
         assert_eq!(lookup_team_canonical("gentle mates"), Some("gentle-mates"));
+    }
+
+    #[test]
+    fn test_oksavingsbank_brion_alias() {
+        // OKSavingsBank BRION (LCK) - sponsor name changed
+        assert_eq!(lookup_team_canonical("bro"), Some("ok-brion"));
+        assert_eq!(lookup_team_canonical("brion"), Some("ok-brion"));
+        assert_eq!(lookup_team_canonical("oksavingsbank-brion"), Some("ok-brion"));
+        assert_eq!(lookup_team_canonical("oksavingsbank brion"), Some("ok-brion"));
+
+        // Test canonical matching
+        assert!(teams_match_canonical("bro", "oksavingsbank-brion"));
+        assert!(teams_match_canonical("oksavingsbank-brion", "bro"));
+    }
+
+    #[test]
+    fn test_passion_ua_alias() {
+        // Passion UA (CS2) - abbreviated as PSSNUA on Kalshi
+        assert_eq!(lookup_team_canonical("passion"), Some("passion-ua"));
+        assert_eq!(lookup_team_canonical("pssnua"), Some("passion-ua"));
+
+        // Test canonical matching
+        assert!(teams_match_canonical("pssnua", "passion-ua"));
     }
 
     #[test]
