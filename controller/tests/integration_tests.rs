@@ -2129,7 +2129,11 @@ mod process_mock_tests {
 mod startup_sweep_tests {
     use arb_bot::types::*;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use tokio::sync::mpsc;
+
+    // Mutex to serialize tests that modify env vars
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// Helper: Create a test MarketPair
     fn make_pair(id: &str) -> MarketPair {
@@ -2323,5 +2327,79 @@ mod startup_sweep_tests {
         // PolyYesKalshiNo is checked first in priority order
         assert!(matches!(arb.arb_type, ArbType::PolyYesKalshiNo),
             "Cross-platform arb should take priority");
+    }
+
+    /// Test: Startup sweep routes arbs to confirm queue when league requires confirmation
+    /// This test calls the actual `arb::sweep_markets` function used by main.rs
+    #[tokio::test]
+    async fn test_startup_sweep_routes_to_confirm_queue() {
+        use arb_bot::arb::sweep_markets;
+
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        // Set up: "nba" skips confirmation, "epl" requires confirmation
+        std::env::set_var("CONFIRM_MODE_SKIP", "nba");
+
+        // Helper to create a pair with specific league
+        fn make_league_pair(id: &str, league: &str) -> MarketPair {
+            MarketPair {
+                pair_id: id.into(),
+                league: league.into(),
+                market_type: MarketType::Moneyline,
+                description: format!("Test Market {}", id).into(),
+                kalshi_event_ticker: format!("KXTEST-{}", id).into(),
+                kalshi_market_ticker: format!("KXTEST-{}-YES", id).into(),
+                kalshi_event_slug: format!("test-{}", id).into(),
+                poly_slug: format!("test-{}", id).into(),
+                poly_yes_token: format!("yes-{}", id).into(),
+                poly_no_token: format!("no-{}", id).into(),
+                line_value: None,
+                team_suffix: None,
+            }
+        }
+
+        let state = GlobalState::default();
+
+        // Market 0: NBA league (skips confirmation) - has arb
+        let id0 = state.add_pair(make_league_pair("nba-game", "nba")).unwrap();
+        let market0 = state.get_by_id(id0).unwrap();
+        market0.kalshi.store(55, 50, 1000, 1000);
+        market0.poly.store(40, 65, 1000, 1000);
+
+        // Market 1: EPL league (requires confirmation) - has arb
+        let id1 = state.add_pair(make_league_pair("epl-game", "epl")).unwrap();
+        let market1 = state.get_by_id(id1).unwrap();
+        market1.kalshi.store(55, 50, 1000, 1000);
+        market1.poly.store(40, 65, 1000, 1000);
+
+        // Two channels: exec for auto-execute, confirm for confirmation required
+        let (exec_tx, mut exec_rx) = mpsc::channel::<ArbOpportunity>(16);
+        let (confirm_tx, mut confirm_rx) = mpsc::channel::<(ArbOpportunity, Arc<MarketPair>)>(16);
+
+        // Call the actual sweep_markets function used by main.rs
+        let result = sweep_markets(&state, 0, &exec_tx, &confirm_tx);
+
+        // Verify sweep result counts
+        assert_eq!(result.markets_scanned, 2, "Should scan 2 markets");
+        assert_eq!(result.arbs_found, 2, "Should find 2 arbs");
+        assert_eq!(result.routed_to_exec, 1, "Should route 1 to exec (NBA)");
+        assert_eq!(result.routed_to_confirm, 1, "Should route 1 to confirm (EPL)");
+
+        // Verify NBA arb went to exec channel (no confirmation needed)
+        let exec_arb = exec_rx.try_recv().expect("NBA arb should go to exec channel");
+        assert_eq!(exec_arb.market_id, id0, "Exec channel should have NBA market");
+
+        // Verify EPL arb went to confirm channel (confirmation required)
+        let (confirm_arb, confirm_pair) = confirm_rx.try_recv()
+            .expect("EPL arb should go to confirm channel");
+        assert_eq!(confirm_arb.market_id, id1, "Confirm channel should have EPL market");
+        assert_eq!(&*confirm_pair.league, "epl", "Confirm pair should be EPL");
+
+        // No more items in either channel
+        assert!(exec_rx.try_recv().is_err(), "Exec channel should be empty");
+        assert!(confirm_rx.try_recv().is_err(), "Confirm channel should be empty");
+
+        // Cleanup
+        std::env::remove_var("CONFIRM_MODE_SKIP");
     }
 }
