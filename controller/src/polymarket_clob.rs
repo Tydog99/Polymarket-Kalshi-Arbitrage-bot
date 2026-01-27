@@ -657,25 +657,49 @@ impl SharedAsyncClient {
         // For BUY: takingAmount = shares received, makingAmount = USDC spent
         // For SELL: takingAmount = USDC received, makingAmount = shares sold
         let (filled_size, fill_cost) = if side.eq_ignore_ascii_case("BUY") {
-            let shares: f64 = resp_json["takingAmount"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.0);
-            let cost: f64 = resp_json["makingAmount"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.0);
+            let shares: f64 = match resp_json["takingAmount"].as_str() {
+                Some(s) => s.parse().unwrap_or_else(|e| {
+                    tracing::warn!("[POLY] Failed to parse takingAmount '{}': {}", s, e);
+                    0.0
+                }),
+                None => {
+                    tracing::warn!("[POLY] takingAmount not present in response: {}", resp_json);
+                    0.0
+                }
+            };
+            let cost: f64 = match resp_json["makingAmount"].as_str() {
+                Some(s) => s.parse().unwrap_or_else(|e| {
+                    tracing::warn!("[POLY] Failed to parse makingAmount '{}': {}", s, e);
+                    0.0
+                }),
+                None => {
+                    tracing::warn!("[POLY] makingAmount not present in response: {}", resp_json);
+                    0.0
+                }
+            };
             (shares, cost)
         } else {
             // SELL: makingAmount is shares sold, takingAmount is USDC received
-            let shares: f64 = resp_json["makingAmount"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.0);
-            let cost: f64 = resp_json["takingAmount"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.0);
+            let shares: f64 = match resp_json["makingAmount"].as_str() {
+                Some(s) => s.parse().unwrap_or_else(|e| {
+                    tracing::warn!("[POLY] Failed to parse makingAmount '{}': {}", s, e);
+                    0.0
+                }),
+                None => {
+                    tracing::warn!("[POLY] makingAmount not present in response: {}", resp_json);
+                    0.0
+                }
+            };
+            let cost: f64 = match resp_json["takingAmount"].as_str() {
+                Some(s) => s.parse().unwrap_or_else(|e| {
+                    tracing::warn!("[POLY] Failed to parse takingAmount '{}': {}", s, e);
+                    0.0
+                }),
+                None => {
+                    tracing::warn!("[POLY] takingAmount not present in response: {}", resp_json);
+                    0.0
+                }
+            };
             (shares, cost)
         };
 
