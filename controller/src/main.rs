@@ -601,6 +601,9 @@ async fn main() -> Result<()> {
     if let Some(skip) = cli_arg_value(&args, "--confirm-mode-skip") {
         std::env::set_var("CONFIRM_MODE_SKIP", &skip);
     }
+    if let Some(platforms) = cli_arg_value(&args, "--controller-platforms") {
+        std::env::set_var("CONTROLLER_PLATFORMS", &platforms);
+    }
 
     // Build league list for discovery from CLI/env.
     // - `--leagues nba,nfl` overrides env.

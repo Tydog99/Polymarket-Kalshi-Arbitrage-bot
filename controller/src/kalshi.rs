@@ -135,6 +135,10 @@ pub struct KalshiOrderDetails {
     pub taker_fill_cost: Option<i64>,
     #[serde(default)]
     pub maker_fill_cost: Option<i64>,
+    #[serde(default)]
+    pub taker_fees: Option<i64>,
+    #[serde(default)]
+    pub maker_fees: Option<i64>,
 }
 
 #[allow(dead_code)]
@@ -155,6 +159,11 @@ impl KalshiOrderDetails {
     /// Check if order was partially filled
     pub fn is_partial(&self) -> bool {
         self.filled_count() > 0 && !self.is_filled()
+    }
+
+    /// Total fees paid (in cents)
+    pub fn total_fees(&self) -> i64 {
+        self.taker_fees.unwrap_or(0) + self.maker_fees.unwrap_or(0)
     }
 }
 
