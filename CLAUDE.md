@@ -140,6 +140,7 @@ When one leg of an arbitrage fills but the other fails (creating unhedged exposu
 **Required credentials:**
 - `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH` (PEM file)
 - `POLY_PRIVATE_KEY` (0x-prefixed), `POLY_FUNDER` (wallet address)
+- `POLY_SIGNATURE_TYPE` (default: 0) - Signature type for Polymarket orders: 0=EOA direct signing, 1=Poly proxy, 2=Gnosis Safe
 
 **Execution:** `DRY_RUN` (default: 1), `RUST_LOG` (default: info)
 
