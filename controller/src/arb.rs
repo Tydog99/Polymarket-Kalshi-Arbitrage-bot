@@ -129,6 +129,61 @@ impl Default for ArbConfig {
 }
 
 // ============================================================================
+// USE_DEPTH Toggle for A/B Testing
+// ============================================================================
+
+use std::sync::OnceLock;
+
+/// Check if depth-aware detection is enabled via USE_DEPTH env var.
+/// Cached on first call for performance.
+///
+/// Set `USE_DEPTH=1` to enable EV-maximizing detection across all depth levels.
+/// Default (unset or any other value) uses top-of-book only detection.
+pub fn use_depth_detection() -> bool {
+    static USE_DEPTH: OnceLock<bool> = OnceLock::new();
+    *USE_DEPTH.get_or_init(|| {
+        let enabled = std::env::var("USE_DEPTH")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+        if enabled {
+            tracing::info!("[ARB] USE_DEPTH=1: Using depth-aware EV-maximizing detection");
+        } else {
+            tracing::debug!("[ARB] USE_DEPTH not set: Using top-of-book detection");
+        }
+        enabled
+    })
+}
+
+/// Detect arbitrage opportunity, routing to depth-aware or top-of-book detection
+/// based on the USE_DEPTH environment variable.
+///
+/// This is the main entry point for arb detection from WebSocket handlers.
+/// - `USE_DEPTH=1`: Uses `detect_best_ev()` to find EV-maximizing arb across all levels
+/// - Default: Uses `ArbOpportunity::detect()` for top-of-book only
+pub fn detect_arb(
+    market_id: u16,
+    kalshi: &OrderbookDepth,
+    poly: &OrderbookDepth,
+    config: &ArbConfig,
+    detected_ns: u64,
+) -> Option<ArbOpportunity> {
+    if use_depth_detection() {
+        detect_best_ev(market_id, kalshi, poly, config, detected_ns)
+    } else {
+        // Use top-of-book for backward-compatible detection
+        let (k_yes, k_no, k_yes_size, k_no_size) = kalshi.top_of_book();
+        let (p_yes, p_no, p_yes_size, p_no_size) = poly.top_of_book();
+        ArbOpportunity::detect(
+            market_id,
+            (k_yes, k_no, k_yes_size, k_no_size),
+            (p_yes, p_no, p_yes_size, p_no_size),
+            config,
+            detected_ns,
+        )
+    }
+}
+
+// ============================================================================
 // EV-Maximizing Depth-Aware Arb Detection
 // ============================================================================
 
