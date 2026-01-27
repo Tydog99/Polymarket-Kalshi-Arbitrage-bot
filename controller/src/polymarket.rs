@@ -13,6 +13,7 @@ use tokio::time::{interval, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
+use crate::arb::detect_arb;
 use crate::config::{self, POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS, GAMMA_API_BASE, POLY_MAX_TOKENS_PER_WS};
 use crate::execution::NanoClock;
 use crate::types::{
@@ -676,14 +677,14 @@ async fn process_book(
             }
         }
 
-        // Check arbs using ArbOpportunity::detect()
-        // Read values before await to avoid holding RwLockReadGuard across await
-        let kalshi_data = market.kalshi.read().top_of_book();
-        let poly_data = market.poly.read().top_of_book();
-        if let Some(req) = ArbOpportunity::detect(
+        // Check arbs using detect_arb() (routes to depth or top-of-book based on USE_DEPTH)
+        // Clone depth data before the if-let to avoid holding RwLockReadGuard across await
+        let kalshi_depth = market.kalshi.read().clone();
+        let poly_depth = market.poly.read().clone();
+        if let Some(req) = detect_arb(
             market_id,
-            kalshi_data,
-            poly_data,
+            &kalshi_depth,
+            &poly_depth,
             state.arb_config(),
             clock.now_ns(),
         ) {
@@ -724,14 +725,14 @@ async fn process_book(
             }
         }
 
-        // Check arbs using ArbOpportunity::detect()
-        // Read values before await to avoid holding RwLockReadGuard across await
-        let kalshi_data = market.kalshi.read().top_of_book();
-        let poly_data = market.poly.read().top_of_book();
-        if let Some(req) = ArbOpportunity::detect(
+        // Check arbs using detect_arb() (routes to depth or top-of-book based on USE_DEPTH)
+        // Clone depth data before the if-let to avoid holding RwLockReadGuard across await
+        let kalshi_depth = market.kalshi.read().clone();
+        let poly_depth = market.poly.read().clone();
+        if let Some(req) = detect_arb(
             market_id,
-            kalshi_data,
-            poly_data,
+            &kalshi_depth,
+            &poly_depth,
             state.arb_config(),
             clock.now_ns(),
         ) {
@@ -815,13 +816,13 @@ async fn process_price_change(
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_yes || current_yes == 0 {
-            // Read values before await to avoid holding RwLockReadGuard across await
-            let kalshi_data = market.kalshi.read().top_of_book();
-            let poly_data = market.poly.read().top_of_book();
-            if let Some(req) = ArbOpportunity::detect(
+            // Clone depth data before the if-let to avoid holding RwLockReadGuard across await
+            let kalshi_depth = market.kalshi.read().clone();
+            let poly_depth = market.poly.read().clone();
+            if let Some(req) = detect_arb(
                 market_id,
-                kalshi_data,
-                poly_data,
+                &kalshi_depth,
+                &poly_depth,
                 state.arb_config(),
                 clock.now_ns(),
             ) {
@@ -869,13 +870,13 @@ async fn process_price_change(
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_no || current_no == 0 {
-            // Read values before await to avoid holding RwLockReadGuard across await
-            let kalshi_data = market.kalshi.read().top_of_book();
-            let poly_data = market.poly.read().top_of_book();
-            if let Some(req) = ArbOpportunity::detect(
+            // Clone depth data before the if-let to avoid holding RwLockReadGuard across await
+            let kalshi_depth = market.kalshi.read().clone();
+            let poly_depth = market.poly.read().clone();
+            if let Some(req) = detect_arb(
                 market_id,
-                kalshi_data,
-                poly_data,
+                &kalshi_depth,
+                &poly_depth,
                 state.arb_config(),
                 clock.now_ns(),
             ) {
