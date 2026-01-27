@@ -350,10 +350,10 @@ impl Default for AtomicOrderbook {
 
 /// Complete market state tracking both platforms' orderbooks for a single market
 pub struct AtomicMarketState {
-    /// Kalshi platform orderbook state
-    pub kalshi: AtomicOrderbook,
-    /// Polymarket platform orderbook state
-    pub poly: AtomicOrderbook,
+    /// Kalshi platform orderbook state with depth levels
+    pub kalshi: InstrumentedRwLock<OrderbookDepth>,
+    /// Polymarket platform orderbook state with depth levels
+    pub poly: InstrumentedRwLock<OrderbookDepth>,
     /// Last known Kalshi update time (unix ms). 0 = unknown / never updated.
     kalshi_last_update_unix_ms: AtomicU64,
     /// Last known Polymarket update time (unix ms). 0 = unknown / never updated.
@@ -371,8 +371,8 @@ pub struct AtomicMarketState {
 impl AtomicMarketState {
     pub fn new(market_id: u16) -> Self {
         Self {
-            kalshi: AtomicOrderbook::new(),
-            poly: AtomicOrderbook::new(),
+            kalshi: InstrumentedRwLock::new(OrderbookDepth::default()),
+            poly: InstrumentedRwLock::new(OrderbookDepth::default()),
             kalshi_last_update_unix_ms: AtomicU64::new(0),
             poly_last_update_unix_ms: AtomicU64::new(0),
             pair: RwLock::new(None),
