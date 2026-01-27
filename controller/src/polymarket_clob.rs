@@ -411,10 +411,12 @@ pub struct PolymarketAsyncClient {
     funder: String,
     wallet_address_str: String,
     address_header: HeaderValue,
+    /// Signature type for order signing (0=EOA, 1=poly proxy, 2=gnosis safe)
+    signature_type: i32,
 }
 
 impl PolymarketAsyncClient {
-    pub fn new(host: &str, chain_id: u64, private_key: &str, funder: &str) -> Result<Self> {
+    pub fn new(host: &str, chain_id: u64, private_key: &str, funder: &str, signature_type: i32) -> Result<Self> {
         let wallet = private_key.parse::<LocalWallet>()?.with_chain_id(chain_id);
         let wallet_address_str = format!("{:?}", wallet.address());
         let address_header = HeaderValue::from_str(&wallet_address_str)
@@ -437,6 +439,7 @@ impl PolymarketAsyncClient {
             funder: funder.to_string(),
             wallet_address_str,
             address_header,
+            signature_type,
         })
     }
 
@@ -688,7 +691,7 @@ impl SharedAsyncClient {
             nonce: "0",
             signer: &self.inner.wallet_address_str,
             expiration: "0",
-            signature_type: 1,
+            signature_type: self.inner.signature_type,
             salt,
         };
         let exchange = get_exchange_address(self.chain_id, neg_risk)?;
@@ -711,7 +714,7 @@ impl SharedAsyncClient {
                 nonce: "0".to_string(),
                 fee_rate_bps: "0".to_string(),
                 side: side_code,
-                signature_type: 1,
+                signature_type: self.inner.signature_type,
             },
             signature: format!("0x{}", sig),
         })
@@ -738,5 +741,57 @@ impl PolyExecutor for SharedAsyncClient {
 
     async fn sell_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         SharedAsyncClient::sell_fak(self, token_id, price, size).await
+    }
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test private key (DO NOT use in production - this is a well-known test key)
+    const TEST_PRIVATE_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const TEST_FUNDER: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+    #[test]
+    fn test_client_stores_signature_type_eoa() {
+        let client = PolymarketAsyncClient::new(
+            "https://clob.polymarket.com",
+            137,
+            TEST_PRIVATE_KEY,
+            TEST_FUNDER,
+            0, // EOA
+        ).expect("should create client");
+
+        assert_eq!(client.signature_type, 0);
+    }
+
+    #[test]
+    fn test_client_stores_signature_type_poly_proxy() {
+        let client = PolymarketAsyncClient::new(
+            "https://clob.polymarket.com",
+            137,
+            TEST_PRIVATE_KEY,
+            TEST_FUNDER,
+            1, // Poly proxy
+        ).expect("should create client");
+
+        assert_eq!(client.signature_type, 1);
+    }
+
+    #[test]
+    fn test_client_stores_signature_type_gnosis_safe() {
+        let client = PolymarketAsyncClient::new(
+            "https://clob.polymarket.com",
+            137,
+            TEST_PRIVATE_KEY,
+            TEST_FUNDER,
+            2, // Gnosis safe
+        ).expect("should create client");
+
+        assert_eq!(client.signature_type, 2);
     }
 }
