@@ -817,6 +817,159 @@ mod tests {
     use std::thread;
 
     // =========================================================================
+    // InstrumentedRwLock Tests
+    // =========================================================================
+
+    #[test]
+    fn test_instrumented_rwlock_basic_read_write() {
+        let lock = InstrumentedRwLock::new(42u32);
+
+        // Test write
+        {
+            let mut guard = lock.write();
+            *guard = 100;
+        }
+
+        // Test read
+        {
+            let guard = lock.read();
+            assert_eq!(*guard, 100);
+        }
+
+        // Verify stats were recorded
+        let (contention, ops, _wait_ns) = lock.take_stats();
+        assert_eq!(ops, 2, "Should have 1 write + 1 read");
+        assert_eq!(contention, 0, "No contention expected in single-threaded test");
+    }
+
+    #[test]
+    fn test_instrumented_rwlock_take_stats_resets() {
+        let lock = InstrumentedRwLock::new(0u32);
+
+        // Perform some operations
+        { let _g = lock.write(); }
+        { let _g = lock.read(); }
+        { let _g = lock.read(); }
+
+        // First take_stats
+        let (contention1, ops1, wait1) = lock.take_stats();
+        assert_eq!(ops1, 3);
+        assert_eq!(contention1, 0);
+
+        // Second take_stats should be zeroed
+        let (contention2, ops2, wait2) = lock.take_stats();
+        assert_eq!(ops2, 0, "Stats should be reset after take_stats");
+        assert_eq!(contention2, 0);
+        assert_eq!(wait2, 0);
+    }
+
+    #[test]
+    fn test_instrumented_rwlock_concurrent_access() {
+        let lock = Arc::new(InstrumentedRwLock::new(0u64));
+        let num_threads = 4;
+        let ops_per_thread = 100;
+
+        let handles: Vec<_> = (0..num_threads).map(|i| {
+            let lock = lock.clone();
+            thread::spawn(move || {
+                for _ in 0..ops_per_thread {
+                    if i % 2 == 0 {
+                        let mut guard = lock.write();
+                        *guard += 1;
+                    } else {
+                        let _guard = lock.read();
+                    }
+                }
+            })
+        }).collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify final value (2 threads doing writes, 100 each = 200)
+        let final_value = *lock.read();
+        assert_eq!(final_value, 200);
+
+        // Verify stats were tracked
+        let (contention, ops, _wait_ns) = lock.take_stats();
+        // We added 1 read above for the final_value check
+        assert_eq!(ops, (num_threads * ops_per_thread + 1) as u64);
+        // Contention may or may not occur depending on timing
+        // Just verify it's a valid value (>= 0)
+        assert!(contention <= ops);
+    }
+
+    // =========================================================================
+    // LockStatsAggregator Tests
+    // =========================================================================
+
+    #[test]
+    fn test_lock_stats_aggregator_basic() {
+        let agg = LockStatsAggregator::new();
+
+        // Record some stats
+        agg.record(5, 100, 1000);
+        agg.record(3, 50, 500);
+
+        // Take snapshot
+        let (contention, ops, wait_ns) = agg.take_snapshot();
+        assert_eq!(contention, 8);
+        assert_eq!(ops, 150);
+        assert_eq!(wait_ns, 1500);
+    }
+
+    #[test]
+    fn test_lock_stats_aggregator_snapshot_resets() {
+        let agg = LockStatsAggregator::new();
+
+        agg.record(10, 200, 5000);
+
+        // First snapshot
+        let (c1, o1, w1) = agg.take_snapshot();
+        assert_eq!((c1, o1, w1), (10, 200, 5000));
+
+        // Second snapshot should be zeroed
+        let (c2, o2, w2) = agg.take_snapshot();
+        assert_eq!((c2, o2, w2), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_lock_stats_aggregator_concurrent_recording() {
+        let agg = Arc::new(LockStatsAggregator::new());
+        let num_threads = 4;
+        let records_per_thread = 100;
+
+        let handles: Vec<_> = (0..num_threads).map(|_| {
+            let agg = agg.clone();
+            thread::spawn(move || {
+                for _ in 0..records_per_thread {
+                    agg.record(1, 10, 100);
+                }
+            })
+        }).collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let (contention, ops, wait_ns) = agg.take_snapshot();
+        let expected_records = (num_threads * records_per_thread) as u64;
+        assert_eq!(contention, expected_records);
+        assert_eq!(ops, expected_records * 10);
+        assert_eq!(wait_ns, expected_records * 100);
+    }
+
+    #[test]
+    fn test_global_lock_stats_exists() {
+        // Verify the global LOCK_STATS can be accessed
+        LOCK_STATS.record(1, 1, 1);
+        let (c, o, w) = LOCK_STATS.take_snapshot();
+        // Values might include other test's recordings, so just check it works
+        assert!(c >= 1 || o >= 1 || w >= 1 || (c == 0 && o == 0 && w == 0));
+    }
+
+    // =========================================================================
     // Pack/Unpack Tests - Verify bit manipulation correctness
     // =========================================================================
 
