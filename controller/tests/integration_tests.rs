@@ -116,21 +116,6 @@ mod position_tracker_tests {
         assert!((pnl - 0.82).abs() < 0.01, "P&L should be ~$0.82, got {}", pnl);
     }
     
-    /// Test: Daily P&L resets
-    #[test]
-    fn test_daily_pnl_persistence() {
-        let mut tracker = PositionTracker::new();
-        
-        // Simulate some activity
-        tracker.all_time_pnl = 100.0;
-        tracker.daily_realized_pnl = 10.0;
-        
-        // Reset daily
-        tracker.reset_daily();
-        
-        assert_eq!(tracker.daily_realized_pnl, 0.0, "Daily should reset");
-        assert_eq!(tracker.all_time_pnl, 100.0, "All-time should persist");
-    }
 }
 
 // ============================================================================

@@ -707,3 +707,147 @@ fn test_backward_compatibility_no_trades_field() {
     // Trades should be empty (default)
     assert_eq!(pos.trades.len(), 0, "Old positions should have empty trades vec");
 }
+
+// ============================================================================
+// TEST: POSITIONS ARE ADDITIVE ACROSS RESTARTS
+// ============================================================================
+
+/// Test that positions.json is always additive across controller restarts.
+/// This verifies that:
+/// 1. Existing positions are preserved when loading
+/// 2. New fills are added to existing positions
+/// 3. New positions can be created alongside existing ones
+/// 4. Cost basis accumulates correctly (never resets)
+/// 5. The file is not overwritten/cleared on restart
+#[test]
+fn test_positions_additive_across_restarts() {
+    let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+    let path = temp_file.path();
+
+    // === FIRST "SESSION" ===
+    // Simulate first run of the controller
+    {
+        let mut tracker = PositionTracker::new();
+
+        // Add a position with some fills
+        let fill1 = create_fill("MARKET-A", "polymarket", "yes", 10.0, 0.45, 0.0);
+        tracker.record_fill_internal(&fill1);
+
+        let fill2 = create_fill("MARKET-A", "kalshi", "no", 10.0, 0.50, 0.05);
+        tracker.record_fill_internal(&fill2);
+
+        // Add a second market
+        let fill3 = create_fill("MARKET-B", "polymarket", "yes", 5.0, 0.60, 0.0);
+        tracker.record_fill_internal(&fill3);
+
+        // Save state (simulating clean shutdown)
+        tracker.save_to(path).expect("Failed to save");
+
+        // Verify initial state
+        let pos_a = tracker.get("MARKET-A").unwrap();
+        assert_eq!(pos_a.poly_yes.contracts, 10.0);
+        assert_eq!(pos_a.kalshi_no.contracts, 10.0);
+        assert!((pos_a.poly_yes.cost_basis - 4.5).abs() < 0.001); // 10 * 0.45
+        assert!((pos_a.kalshi_no.cost_basis - 5.0).abs() < 0.001); // 10 * 0.50
+        assert_eq!(pos_a.trades.len(), 2);
+    }
+
+    // === SECOND "SESSION" (RESTART) ===
+    // Simulate controller restart - load existing state and add more
+    {
+        let mut tracker = PositionTracker::load_from(path);
+
+        // Verify existing positions were loaded correctly
+        let pos_a = tracker.get("MARKET-A").expect("MARKET-A should exist after restart");
+        assert_eq!(pos_a.poly_yes.contracts, 10.0, "Poly YES contracts should persist");
+        assert_eq!(pos_a.kalshi_no.contracts, 10.0, "Kalshi NO contracts should persist");
+        assert!((pos_a.poly_yes.cost_basis - 4.5).abs() < 0.001, "Poly YES cost_basis should persist");
+        assert!((pos_a.kalshi_no.cost_basis - 5.0).abs() < 0.001, "Kalshi NO cost_basis should persist");
+        assert_eq!(pos_a.trades.len(), 2, "Trade history should persist");
+
+        let pos_b = tracker.get("MARKET-B").expect("MARKET-B should exist after restart");
+        assert_eq!(pos_b.poly_yes.contracts, 5.0, "Second market should persist");
+
+        // Add MORE fills to existing position (should accumulate, not replace)
+        let fill4 = create_fill("MARKET-A", "polymarket", "yes", 5.0, 0.48, 0.0);
+        tracker.record_fill_internal(&fill4);
+
+        // Add a completely new market
+        let fill5 = create_fill("MARKET-C", "kalshi", "yes", 20.0, 0.30, 0.10);
+        tracker.record_fill_internal(&fill5);
+
+        // Save state
+        tracker.save_to(path).expect("Failed to save");
+
+        // Verify accumulated state
+        let pos_a = tracker.get("MARKET-A").unwrap();
+        assert_eq!(pos_a.poly_yes.contracts, 15.0, "Poly YES should accumulate: 10 + 5 = 15");
+        assert_eq!(pos_a.kalshi_no.contracts, 10.0, "Kalshi NO unchanged");
+        // cost_basis should accumulate: 4.5 + (5 * 0.48) = 4.5 + 2.4 = 6.9
+        assert!((pos_a.poly_yes.cost_basis - 6.9).abs() < 0.001, "Cost basis should accumulate");
+        assert_eq!(pos_a.trades.len(), 3, "Trade history should grow");
+    }
+
+    // === THIRD "SESSION" (ANOTHER RESTART) ===
+    // Verify everything persisted correctly
+    {
+        let tracker = PositionTracker::load_from(path);
+
+        // MARKET-A: accumulated state
+        let pos_a = tracker.get("MARKET-A").expect("MARKET-A should still exist");
+        assert_eq!(pos_a.poly_yes.contracts, 15.0, "Accumulated contracts should persist");
+        assert_eq!(pos_a.kalshi_no.contracts, 10.0);
+        assert!((pos_a.poly_yes.cost_basis - 6.9).abs() < 0.001, "Accumulated cost_basis should persist");
+        assert!((pos_a.kalshi_no.cost_basis - 5.0).abs() < 0.001);
+        assert_eq!(pos_a.trades.len(), 3, "All trades should persist");
+
+        // MARKET-B: unchanged from first session
+        let pos_b = tracker.get("MARKET-B").expect("MARKET-B should still exist");
+        assert_eq!(pos_b.poly_yes.contracts, 5.0);
+        assert!((pos_b.poly_yes.cost_basis - 3.0).abs() < 0.001); // 5 * 0.60
+
+        // MARKET-C: added in second session
+        let pos_c = tracker.get("MARKET-C").expect("MARKET-C should exist");
+        assert_eq!(pos_c.kalshi_yes.contracts, 20.0);
+        assert!((pos_c.kalshi_yes.cost_basis - 6.0).abs() < 0.001); // 20 * 0.30
+
+        // Summary should reflect all positions
+        let summary = tracker.summary();
+        assert_eq!(summary.open_positions, 3, "All 3 markets should be tracked");
+    }
+}
+
+/// Test that adding sells does NOT reduce cost_basis.
+/// cost_basis should only ever increase (represent total cost paid).
+#[test]
+fn test_cost_basis_never_decreases_on_sells() {
+    let mut tracker = PositionTracker::new();
+
+    // Buy 10 contracts at 50 cents
+    let buy_fill = create_fill("MARKET-X", "kalshi", "no", 10.0, 0.50, 0.05);
+    tracker.record_fill_internal(&buy_fill);
+
+    let pos = tracker.get("MARKET-X").unwrap();
+    assert_eq!(pos.kalshi_no.contracts, 10.0);
+    assert!((pos.kalshi_no.cost_basis - 5.0).abs() < 0.001, "Cost basis = 10 * 0.50 = 5.0");
+
+    // Sell 4 contracts at 46 cents (closing partial position)
+    let sell_fill = create_fill("MARKET-X", "kalshi", "no", -4.0, 0.46, 0.03);
+    tracker.record_fill_internal(&sell_fill);
+
+    let pos = tracker.get("MARKET-X").unwrap();
+    assert_eq!(pos.kalshi_no.contracts, 6.0, "Contracts should decrease: 10 - 4 = 6");
+    // CRITICAL: cost_basis should NOT decrease on sells
+    assert!((pos.kalshi_no.cost_basis - 5.0).abs() < 0.001,
+        "Cost basis should remain 5.0 (never decreases on sells), got {}", pos.kalshi_no.cost_basis);
+
+    // Sell remaining 6 contracts
+    let sell_fill2 = create_fill("MARKET-X", "kalshi", "no", -6.0, 0.45, 0.03);
+    tracker.record_fill_internal(&sell_fill2);
+
+    let pos = tracker.get("MARKET-X").unwrap();
+    assert_eq!(pos.kalshi_no.contracts, 0.0, "Position should be flat");
+    // Cost basis still preserved (represents total historical cost paid)
+    assert!((pos.kalshi_no.cost_basis - 5.0).abs() < 0.001,
+        "Cost basis should still be 5.0 even after fully closing, got {}", pos.kalshi_no.cost_basis);
+}

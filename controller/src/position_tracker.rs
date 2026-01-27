@@ -91,12 +91,18 @@ pub struct PositionLeg {
 #[allow(dead_code)]
 impl PositionLeg {
     pub fn add(&mut self, contracts: f64, price: f64) {
-        let new_cost = contracts * price;
-        self.cost_basis += new_cost;
-        self.contracts += contracts;
-        if self.contracts > 0.0 {
-            self.avg_price = self.cost_basis / self.contracts;
+        // Only accumulate cost_basis on buys (positive contracts)
+        // cost_basis represents total cost paid, never reduced on sells
+        if contracts > 0.0 {
+            let new_cost = contracts * price;
+            self.cost_basis += new_cost;
+            // Update avg_price based on new weighted average
+            let new_contracts = self.contracts + contracts;
+            if new_contracts > 0.0 {
+                self.avg_price = self.cost_basis / new_contracts;
+            }
         }
+        self.contracts += contracts;
     }
     
     /// Unrealized P&L based on current market price
@@ -286,24 +292,12 @@ pub struct PositionSummary {
 pub struct PositionTracker {
     /// All positions keyed by market_id
     positions: HashMap<String, ArbPosition>,
-
-    /// Daily realized P&L
-    pub daily_realized_pnl: f64,
-
-    /// Daily trading date (for reset)
-    pub trading_date: String,
-
-    /// Cumulative all-time P&L
-    pub all_time_pnl: f64,
 }
 
 /// Data structure for serialization
 #[derive(Serialize)]
 struct SaveData {
     positions: HashMap<String, ArbPosition>,
-    daily_realized_pnl: f64,
-    trading_date: String,
-    all_time_pnl: f64,
 }
 
 impl Default for PositionTracker {
@@ -317,9 +311,6 @@ impl PositionTracker {
     pub fn new() -> Self {
         Self {
             positions: HashMap::new(),
-            daily_realized_pnl: 0.0,
-            trading_date: today_string(),
-            all_time_pnl: 0.0,
         }
     }
     
@@ -332,15 +323,8 @@ impl PositionTracker {
         match std::fs::read_to_string(path.as_ref()) {
             Ok(contents) => {
                 match serde_json::from_str::<Self>(&contents) {
-                    Ok(mut tracker) => {
-                        // Check if we need to reset daily P&L
-                        let today = today_string();
-                        if tracker.trading_date != today {
-                            info!("[POSITIONS] New trading day, resetting daily P&L");
-                            tracker.daily_realized_pnl = 0.0;
-                            tracker.trading_date = today;
-                        }
-                        info!("[POSITIONS] Loaded {} positions from {:?}", 
+                    Ok(tracker) => {
+                        info!("[POSITIONS] Loaded {} positions from {:?}",
                               tracker.positions.len(), path.as_ref());
                         tracker
                     }
@@ -373,9 +357,6 @@ impl PositionTracker {
         // Clone data for serialization
         let data = SaveData {
             positions: self.positions.clone(),
-            daily_realized_pnl: self.daily_realized_pnl,
-            trading_date: self.trading_date.clone(),
-            all_time_pnl: self.all_time_pnl,
         };
         // Try to spawn on runtime; if no runtime, save synchronously
         let path = crate::paths::resolve_workspace_file(POSITION_FILE);
@@ -455,13 +436,10 @@ impl PositionTracker {
         if let Some(position) = self.positions.get_mut(market_id) {
             position.resolve(yes_won);
             let pnl = position.realized_pnl.unwrap_or(0.0);
-            
-            self.daily_realized_pnl += pnl;
-            self.all_time_pnl += pnl;
-            
+
             info!("[POSITIONS] Resolved {}: {} won, P&L: ${:.2}",
                   market_id, if yes_won { "YES" } else { "NO" }, pnl);
-            
+
             self.save_async();
             Some(pnl)
         } else {
@@ -500,17 +478,6 @@ impl PositionTracker {
             .collect()
     }
     
-    /// Daily P&L (realized only)
-    pub fn daily_pnl(&self) -> f64 {
-        self.daily_realized_pnl
-    }
-    
-    /// Reset daily counters (call at midnight)
-    pub fn reset_daily(&mut self) {
-        self.daily_realized_pnl = 0.0;
-        self.trading_date = today_string();
-        self.save_async();
-    }
 }
 
 /// Record of a single fill (used for position updates and trade history)
@@ -617,10 +584,6 @@ pub type SharedPositionTracker = Arc<RwLock<PositionTracker>>;
 #[allow(dead_code)]
 pub fn create_position_tracker() -> SharedPositionTracker {
     Arc::new(RwLock::new(PositionTracker::load()))
-}
-
-fn today_string() -> String {
-    chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
 
 #[derive(Clone)]

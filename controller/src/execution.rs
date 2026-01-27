@@ -334,7 +334,7 @@ impl ExecutionEngine {
 
         match result {
             // Note: For same-platform arbs (PolyOnly/KalshiOnly), these are YES/NO fills, not platform fills
-            Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id, yes_error, no_error)) => {
+            Ok((yes_filled, no_filled, yes_cost, no_cost, yes_fees, no_fees, yes_order_id, no_order_id, yes_error, no_error)) => {
                 let matched = yes_filled.min(no_filled);
                 let success = matched > 0;
                 let actual_profit = matched as i16 * 100 - (yes_cost + no_cost) as i16;
@@ -418,7 +418,7 @@ impl ExecutionEngine {
                 self.position_channel.record_fill(FillRecord::with_details(
                     &position_id, &pair.description, platform1, side1,
                     yes_requested, yes_filled as f64, yes_price,
-                    0.0, &yes_order_id,
+                    yes_fees as f64 / 100.0, &yes_order_id,
                     TradeReason::ArbLegYes, yes_status,
                     yes_failure_reason,
                 ));
@@ -446,7 +446,7 @@ impl ExecutionEngine {
                 self.position_channel.record_fill(FillRecord::with_details(
                     &position_id, &pair.description, platform2, side2,
                     no_requested, no_filled as f64, no_price,
-                    0.0, &no_order_id,
+                    no_fees as f64 / 100.0, &no_order_id,
                     TradeReason::ArbLegNo, no_status,
                     no_failure_reason,
                 ));
@@ -477,7 +477,7 @@ impl ExecutionEngine {
         req: &ArbOpportunity,
         pair: &MarketPair,
         contracts: i64,
-    ) -> Result<(i64, i64, i64, i64, String, String, Option<String>, Option<String>)> {
+    ) -> Result<(i64, i64, i64, i64, i64, i64, String, String, Option<String>, Option<String>)> {
         match req.arb_type {
             // === CROSS-PLATFORM: Poly YES + Kalshi NO ===
             ArbType::PolyYesKalshiNo => {
@@ -552,73 +552,75 @@ impl ExecutionEngine {
     }
 
     /// Extract results from PolyYesKalshiNo execution.
-    /// Returns: (yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id, yes_error, no_error)
+    /// Returns: (yes_filled, no_filled, yes_cost, no_cost, yes_fees, no_fees, yes_order_id, no_order_id, yes_error, no_error)
     /// where YES = Poly and NO = Kalshi
     fn extract_cross_results_poly_yes_kalshi_no(
         &self,
         poly_res: Result<crate::polymarket_clob::PolyFillAsync>,
         kalshi_res: Result<crate::kalshi::KalshiOrderResponse>,
-    ) -> Result<(i64, i64, i64, i64, String, String, Option<String>, Option<String>)> {
-        let (yes_filled, yes_cost, yes_order_id, yes_error) = match poly_res {
+    ) -> Result<(i64, i64, i64, i64, i64, i64, String, String, Option<String>, Option<String>)> {
+        let (yes_filled, yes_cost, yes_fees, yes_order_id, yes_error) = match poly_res {
             Ok(fill) => {
-                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id, None)
+                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, 0i64, fill.order_id, None)
             }
             Err(e) => {
                 let err_msg = e.to_string();
                 warn!("[EXEC] Poly YES failed: {}", err_msg);
-                (0, 0, String::new(), Some(err_msg))
+                (0, 0, 0, String::new(), Some(err_msg))
             }
         };
 
-        let (no_filled, no_cost, no_order_id, no_error) = match kalshi_res {
+        let (no_filled, no_cost, no_fees, no_order_id, no_error) = match kalshi_res {
             Ok(resp) => {
                 let filled = resp.order.filled_count();
                 let cost = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
-                (filled, cost, resp.order.order_id, None)
+                let fees = resp.order.total_fees();
+                (filled, cost, fees, resp.order.order_id, None)
             }
             Err(e) => {
                 let err_msg = e.to_string();
                 warn!("[EXEC] Kalshi NO failed: {}", err_msg);
-                (0, 0, String::new(), Some(err_msg))
+                (0, 0, 0, String::new(), Some(err_msg))
             }
         };
 
-        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id, yes_error, no_error))
+        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_fees, no_fees, yes_order_id, no_order_id, yes_error, no_error))
     }
 
     /// Extract results from KalshiYesPolyNo execution.
-    /// Returns: (yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id, yes_error, no_error)
+    /// Returns: (yes_filled, no_filled, yes_cost, no_cost, yes_fees, no_fees, yes_order_id, no_order_id, yes_error, no_error)
     /// where YES = Kalshi and NO = Poly
     fn extract_cross_results_kalshi_yes_poly_no(
         &self,
         kalshi_res: Result<crate::kalshi::KalshiOrderResponse>,
         poly_res: Result<crate::polymarket_clob::PolyFillAsync>,
-    ) -> Result<(i64, i64, i64, i64, String, String, Option<String>, Option<String>)> {
-        let (yes_filled, yes_cost, yes_order_id, yes_error) = match kalshi_res {
+    ) -> Result<(i64, i64, i64, i64, i64, i64, String, String, Option<String>, Option<String>)> {
+        let (yes_filled, yes_cost, yes_fees, yes_order_id, yes_error) = match kalshi_res {
             Ok(resp) => {
                 let filled = resp.order.filled_count();
                 let cost = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
-                (filled, cost, resp.order.order_id, None)
+                let fees = resp.order.total_fees();
+                (filled, cost, fees, resp.order.order_id, None)
             }
             Err(e) => {
                 let err_msg = e.to_string();
                 warn!("[EXEC] Kalshi YES failed: {}", err_msg);
-                (0, 0, String::new(), Some(err_msg))
+                (0, 0, 0, String::new(), Some(err_msg))
             }
         };
 
-        let (no_filled, no_cost, no_order_id, no_error) = match poly_res {
+        let (no_filled, no_cost, no_fees, no_order_id, no_error) = match poly_res {
             Ok(fill) => {
-                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id, None)
+                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, 0i64, fill.order_id, None)
             }
             Err(e) => {
                 let err_msg = e.to_string();
                 warn!("[EXEC] Poly NO failed: {}", err_msg);
-                (0, 0, String::new(), Some(err_msg))
+                (0, 0, 0, String::new(), Some(err_msg))
             }
         };
 
-        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id, yes_error, no_error))
+        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_fees, no_fees, yes_order_id, no_order_id, yes_error, no_error))
     }
 
     /// Extract results from Poly-only execution (same-platform)
@@ -626,7 +628,7 @@ impl ExecutionEngine {
         &self,
         yes_res: Result<crate::polymarket_clob::PolyFillAsync>,
         no_res: Result<crate::polymarket_clob::PolyFillAsync>,
-    ) -> Result<(i64, i64, i64, i64, String, String, Option<String>, Option<String>)> {
+    ) -> Result<(i64, i64, i64, i64, i64, i64, String, String, Option<String>, Option<String>)> {
         let (yes_filled, yes_cost, yes_order_id, yes_error) = match yes_res {
             Ok(fill) => {
                 ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id, None)
@@ -651,7 +653,8 @@ impl ExecutionEngine {
 
         // For same-platform, return YES as "kalshi" slot and NO as "poly" slot
         // This keeps the existing result handling logic working
-        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id, yes_error, no_error))
+        // Polymarket has zero fees
+        Ok((yes_filled, no_filled, yes_cost, no_cost, 0, 0, yes_order_id, no_order_id, yes_error, no_error))
     }
 
     /// Extract results from Kalshi-only execution (same-platform)
@@ -659,35 +662,37 @@ impl ExecutionEngine {
         &self,
         yes_res: Result<crate::kalshi::KalshiOrderResponse>,
         no_res: Result<crate::kalshi::KalshiOrderResponse>,
-    ) -> Result<(i64, i64, i64, i64, String, String, Option<String>, Option<String>)> {
-        let (yes_filled, yes_cost, yes_order_id, yes_error) = match yes_res {
+    ) -> Result<(i64, i64, i64, i64, i64, i64, String, String, Option<String>, Option<String>)> {
+        let (yes_filled, yes_cost, yes_fees, yes_order_id, yes_error) = match yes_res {
             Ok(resp) => {
                 let filled = resp.order.filled_count();
                 let cost = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
-                (filled, cost, resp.order.order_id, None)
+                let fees = resp.order.total_fees();
+                (filled, cost, fees, resp.order.order_id, None)
             }
             Err(e) => {
                 let err_msg = e.to_string();
                 warn!("[EXEC] Kalshi YES failed: {}", err_msg);
-                (0, 0, String::new(), Some(err_msg))
+                (0, 0, 0, String::new(), Some(err_msg))
             }
         };
 
-        let (no_filled, no_cost, no_order_id, no_error) = match no_res {
+        let (no_filled, no_cost, no_fees, no_order_id, no_error) = match no_res {
             Ok(resp) => {
                 let filled = resp.order.filled_count();
                 let cost = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
-                (filled, cost, resp.order.order_id, None)
+                let fees = resp.order.total_fees();
+                (filled, cost, fees, resp.order.order_id, None)
             }
             Err(e) => {
                 let err_msg = e.to_string();
                 warn!("[EXEC] Kalshi NO failed: {}", err_msg);
-                (0, 0, String::new(), Some(err_msg))
+                (0, 0, 0, String::new(), Some(err_msg))
             }
         };
 
         // For same-platform, return YES as "kalshi" slot and NO as "poly" slot
-        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id, yes_error, no_error))
+        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_fees, no_fees, yes_order_id, no_order_id, yes_error, no_error))
     }
 
     /// Background task to automatically close excess exposure from mismatched fills.
