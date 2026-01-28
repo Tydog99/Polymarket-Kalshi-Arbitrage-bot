@@ -612,10 +612,13 @@ impl SharedAsyncClient {
             order_price
         );
 
+        let is_delayed = order_info.status.eq_ignore_ascii_case("delayed");
+
         Ok(PolyFillAsync {
             order_id,
             filled_size,
             fill_cost: filled_size * order_price,
+            is_delayed,
         })
     }
 
