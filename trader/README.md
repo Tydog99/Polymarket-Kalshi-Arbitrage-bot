@@ -131,7 +131,11 @@ cargo run -p remote-trader --release -- manual-trade \
   --side yes \
   --limit-price-cents 60 \
   --spend-usd 5
+
+  TRADER_PLATFORM=polymarket POLY_SIGNATURE_TYPE=2 trader manual-trade   --poly-token 4643411015584103529384949983718980438706543876953886750286883506638610790525   --side yes   --limit-price-cents 68   --spend-usd 1
 ```
+
+
 
 ### Kalshi manual trade examples
 

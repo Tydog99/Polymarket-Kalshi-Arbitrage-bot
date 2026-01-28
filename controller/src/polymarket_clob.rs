@@ -3,7 +3,7 @@
 //! This module provides high-performance order execution for the Polymarket CLOB,
 //! including pre-computed authentication credentials and optimized request handling.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -406,28 +406,24 @@ pub struct PolymarketOrderResponse {
 pub struct PolymarketAsyncClient {
     host: String,
     chain_id: u64,
-    http: reqwest::Client,  // Async client with connection pooling
+    http: reqwest_middleware::ClientWithMiddleware,  // Async client with connection pooling + capture
     wallet: Arc<LocalWallet>,
     funder: String,
     wallet_address_str: String,
     address_header: HeaderValue,
+    /// Signature type for order signing (0=EOA, 1=poly proxy, 2=gnosis safe)
+    signature_type: i32,
 }
 
 impl PolymarketAsyncClient {
-    pub fn new(host: &str, chain_id: u64, private_key: &str, funder: &str) -> Result<Self> {
+    pub fn new(host: &str, chain_id: u64, private_key: &str, funder: &str, signature_type: i32) -> Result<Self> {
         let wallet = private_key.parse::<LocalWallet>()?.with_chain_id(chain_id);
         let wallet_address_str = format!("{:?}", wallet.address());
         let address_header = HeaderValue::from_str(&wallet_address_str)
             .map_err(|e| anyhow!("Invalid wallet address for header: {}", e))?;
 
-        // Build async client with connection pooling and keepalive
-        let http = reqwest::Client::builder()
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .tcp_keepalive(std::time::Duration::from_secs(30))
-            .tcp_nodelay(true)
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?;
+        // Build async client with connection pooling, keepalive, and HTTP capture
+        let http = trading::capture::build_poly_client(std::time::Duration::from_secs(10));
 
         Ok(Self {
             host: host.trim_end_matches('/').to_string(),
@@ -437,6 +433,7 @@ impl PolymarketAsyncClient {
             funder: funder.to_string(),
             wallet_address_str,
             address_header,
+            signature_type,
         })
     }
 
@@ -502,7 +499,7 @@ impl PolymarketAsyncClient {
         Ok(resp)
     }
 
-    /// Get order by ID 
+    /// Get order by ID
     pub async fn get_order_async(&self, order_id: &str, creds: &PreparedCreds) -> Result<PolymarketOrderResponse> {
         let path = format!("/data/order/{}", order_id);
         let url = format!("{}{}", self.host, path);
@@ -514,13 +511,23 @@ impl PolymarketAsyncClient {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+
+        if !status.is_success() {
             return Err(anyhow!("get_order failed {}: {}", status, body));
         }
 
-        Ok(resp.json().await?)
+        // Log raw response for debugging order status issues
+        tracing::debug!("[POLY] get_order {} response: {}", order_id, body);
+
+        // Handle null response (order doesn't exist or was rejected)
+        if body.trim() == "null" || body.trim().is_empty() {
+            return Err(anyhow!("get_order {} returned null - order may have been rejected", order_id));
+        }
+
+        serde_json::from_str(&body)
+            .map_err(|e| anyhow!("get_order {} parse error: {} (body: {})", order_id, e, body))
     }
 
     /// Check neg_risk for token - with caching
@@ -589,12 +596,106 @@ impl SharedAsyncClient {
         self.execute_order(token_id, price, size, "BUY").await
     }
 
-    /// Execute FAK sell order - 
+    /// Execute FAK sell order -
     pub async fn sell_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         debug_assert!(!token_id.is_empty(), "token_id must not be empty");
         debug_assert!(price > 0.0 && price < 1.0, "price must be 0 < p < 1");
         debug_assert!(size >= 1.0, "size must be >= 1");
         self.execute_order(token_id, price, size, "SELL").await
+    }
+
+    /// Poll a delayed order until it reaches a terminal state or times out.
+    ///
+    /// Returns (size_matched, fill_cost) where fill_cost = size_matched * price.
+    /// For canceled/expired orders, returns (0.0, 0.0).
+    pub async fn poll_delayed_order(
+        &self,
+        order_id: &str,
+        price: f64,
+        timeout_ms: u64,
+    ) -> Result<(f64, f64)> {
+        const BACKOFF_MS: [u64; 6] = [100, 200, 500, 1000, 1500, 2000];
+
+        let start = Instant::now();
+        let timeout = Duration::from_millis(timeout_ms);
+        let mut attempt = 0;
+
+        loop {
+            // Check timeout before polling
+            if start.elapsed() >= timeout {
+                return Err(anyhow!(
+                    "Order {} still pending after {}ms",
+                    order_id,
+                    timeout_ms
+                ));
+            }
+
+            // Poll the order
+            match self.inner.get_order_async(order_id, &self.creds).await {
+                Ok(order) => {
+                    let status = order.status.to_lowercase();
+
+                    match status.as_str() {
+                        "matched" | "filled" => {
+                            // Terminal success - parse size_matched and compute fill cost
+                            let size_matched: f64 = order.size_matched.parse().unwrap_or(0.0);
+                            let fill_cost = size_matched * price;
+                            tracing::info!(
+                                "[POLY] Order {} reached terminal state '{}': matched={:.2}, cost=${:.2}",
+                                order_id, status, size_matched, fill_cost
+                            );
+                            return Ok((size_matched, fill_cost));
+                        }
+                        "canceled" | "expired" => {
+                            // Terminal failure - no fill
+                            tracing::info!(
+                                "[POLY] Order {} reached terminal state '{}': no fill",
+                                order_id, status
+                            );
+                            return Ok((0.0, 0.0));
+                        }
+                        "delayed" | "live" => {
+                            // Non-terminal - continue polling
+                            tracing::debug!(
+                                "[POLY] Order {} still in '{}' state, attempt {}",
+                                order_id, status, attempt + 1
+                            );
+                        }
+                        _ => {
+                            // Unknown status - treat as non-terminal and continue
+                            tracing::warn!(
+                                "[POLY] Order {} has unknown status '{}', continuing to poll",
+                                order_id, status
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[POLY] Error polling order {}: {}, continuing",
+                        order_id, e
+                    );
+                }
+            }
+
+            // Calculate backoff delay (use last value if beyond array)
+            let delay_ms = BACKOFF_MS.get(attempt).copied().unwrap_or(BACKOFF_MS[BACKOFF_MS.len() - 1]);
+
+            // Don't sleep if we would exceed timeout
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "Order {} still pending after {}ms",
+                    order_id,
+                    timeout_ms
+                ));
+            }
+
+            let sleep_duration = Duration::from_millis(delay_ms).min(remaining);
+            tokio::time::sleep(sleep_duration).await;
+
+            attempt += 1;
+        }
     }
 
     async fn execute_order(&self, token_id: &str, price: f64, size: f64, side: &str) -> Result<PolyFillAsync> {
@@ -620,31 +721,113 @@ impl SharedAsyncClient {
         let body = signed.post_body(&self.creds.api_key, PolyOrderType::FAK.as_str());
 
         // Post order
-        let resp = self.inner.post_order_async(body, &self.creds).await?;
+        tracing::info!(
+            "[POLY] Posting {} order: token={}, price={:.4}, size={:.2}, neg_risk={}",
+            side, token_id, price, size, neg_risk
+        );
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Polymarket order failed {}: {}", status, body));
+        let resp = self.inner.post_order_async(body, &self.creds).await?;
+        let status = resp.status();
+        let resp_body = resp.text().await.unwrap_or_default();
+
+        tracing::debug!("[POLY] POST /order response {}: {}", status, resp_body);
+
+        if !status.is_success() {
+            return Err(anyhow!("Polymarket order failed {}: {}", status, resp_body));
         }
 
-        let resp_json: serde_json::Value = resp.json().await?;
+        let resp_json: serde_json::Value = serde_json::from_str(&resp_body)
+            .map_err(|e| anyhow!("Failed to parse order response: {} (body: {})", e, resp_body))?;
         let order_id = resp_json["orderID"].as_str().unwrap_or("unknown").to_string();
+        let order_status = resp_json["status"].as_str().unwrap_or("unknown");
+        let is_delayed = order_status == "delayed";
 
-        // Query fill status
-        let order_info = self.inner.get_order_async(&order_id, &self.creds).await?;
-        let filled_size: f64 = order_info.size_matched.parse().unwrap_or(0.0);
-        let order_price: f64 = order_info.price.parse().unwrap_or(price);
+        // Extract fill info directly from POST response (no need to call get_order)
+        // For BUY: takingAmount = shares received, makingAmount = USDC spent
+        // For SELL: takingAmount = USDC received, makingAmount = shares sold
+        // Note: When status="delayed", amounts are empty strings - this is expected
+        let (filled_size, fill_cost) = if side.eq_ignore_ascii_case("BUY") {
+            let shares: f64 = match resp_json["takingAmount"].as_str() {
+                Some(s) if !s.is_empty() => s.parse().unwrap_or_else(|e| {
+                    tracing::warn!("[POLY] Failed to parse takingAmount '{}': {}", s, e);
+                    0.0
+                }),
+                Some(_) if is_delayed => 0.0, // Empty string expected for delayed orders
+                Some(s) => {
+                    tracing::warn!("[POLY] Empty takingAmount in non-delayed response: {}", resp_json);
+                    s.parse().unwrap_or(0.0)
+                }
+                None if is_delayed => 0.0, // Missing expected for delayed orders
+                None => {
+                    tracing::warn!("[POLY] takingAmount not present in response: {}", resp_json);
+                    0.0
+                }
+            };
+            let cost: f64 = match resp_json["makingAmount"].as_str() {
+                Some(s) if !s.is_empty() => s.parse().unwrap_or_else(|e| {
+                    tracing::warn!("[POLY] Failed to parse makingAmount '{}': {}", s, e);
+                    0.0
+                }),
+                Some(_) if is_delayed => 0.0, // Empty string expected for delayed orders
+                Some(s) => {
+                    tracing::warn!("[POLY] Empty makingAmount in non-delayed response: {}", resp_json);
+                    s.parse().unwrap_or(0.0)
+                }
+                None if is_delayed => 0.0, // Missing expected for delayed orders
+                None => {
+                    tracing::warn!("[POLY] makingAmount not present in response: {}", resp_json);
+                    0.0
+                }
+            };
+            (shares, cost)
+        } else {
+            // SELL: makingAmount is shares sold, takingAmount is USDC received
+            let shares: f64 = match resp_json["makingAmount"].as_str() {
+                Some(s) if !s.is_empty() => s.parse().unwrap_or_else(|e| {
+                    tracing::warn!("[POLY] Failed to parse makingAmount '{}': {}", s, e);
+                    0.0
+                }),
+                Some(_) if is_delayed => 0.0, // Empty string expected for delayed orders
+                Some(s) => {
+                    tracing::warn!("[POLY] Empty makingAmount in non-delayed response: {}", resp_json);
+                    s.parse().unwrap_or(0.0)
+                }
+                None if is_delayed => 0.0, // Missing expected for delayed orders
+                None => {
+                    tracing::warn!("[POLY] makingAmount not present in response: {}", resp_json);
+                    0.0
+                }
+            };
+            let cost: f64 = match resp_json["takingAmount"].as_str() {
+                Some(s) if !s.is_empty() => s.parse().unwrap_or_else(|e| {
+                    tracing::warn!("[POLY] Failed to parse takingAmount '{}': {}", s, e);
+                    0.0
+                }),
+                Some(_) if is_delayed => 0.0, // Empty string expected for delayed orders
+                Some(s) => {
+                    tracing::warn!("[POLY] Empty takingAmount in non-delayed response: {}", resp_json);
+                    s.parse().unwrap_or(0.0)
+                }
+                None if is_delayed => 0.0, // Missing expected for delayed orders
+                None => {
+                    tracing::warn!("[POLY] takingAmount not present in response: {}", resp_json);
+                    0.0
+                }
+            };
+            (shares, cost)
+        };
 
-        tracing::debug!(
-            "[POLY-ASYNC] FAK {} {}: status={}, filled={:.2}/{:.2}, price={:.4}",
-            side, order_id, order_info.status, filled_size, size, order_price
+        tracing::info!(
+            "[POLY] FAK {} {}: status={}, filled={:.2}/{:.2}, cost=${:.2}{}",
+            side, order_id, order_status, filled_size, size, fill_cost,
+            if is_delayed { " (DELAYED)" } else { "" }
         );
 
         Ok(PolyFillAsync {
             order_id,
             filled_size,
-            fill_cost: filled_size * order_price,
+            fill_cost,
+            is_delayed,
         })
     }
 
@@ -688,7 +871,7 @@ impl SharedAsyncClient {
             nonce: "0",
             signer: &self.inner.wallet_address_str,
             expiration: "0",
-            signature_type: 1,
+            signature_type: self.inner.signature_type,
             salt,
         };
         let exchange = get_exchange_address(self.chain_id, neg_risk)?;
@@ -711,7 +894,7 @@ impl SharedAsyncClient {
                 nonce: "0".to_string(),
                 fee_rate_bps: "0".to_string(),
                 side: side_code,
-                signature_type: 1,
+                signature_type: self.inner.signature_type,
             },
             signature: format!("0x{}", sig),
         })
@@ -724,6 +907,8 @@ pub struct PolyFillAsync {
     pub order_id: String,
     pub filled_size: f64,
     pub fill_cost: f64,
+    /// True when Polymarket returns status="delayed" - fill may come later
+    pub is_delayed: bool,
 }
 
 // =============================================================================
@@ -738,5 +923,246 @@ impl PolyExecutor for SharedAsyncClient {
 
     async fn sell_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         SharedAsyncClient::sell_fak(self, token_id, price, size).await
+    }
+
+    async fn poll_delayed_order(
+        &self,
+        order_id: &str,
+        price: f64,
+        timeout_ms: u64,
+    ) -> Result<(f64, f64)> {
+        SharedAsyncClient::poll_delayed_order(self, order_id, price, timeout_ms).await
+    }
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test private key (DO NOT use in production - this is a well-known test key)
+    const TEST_PRIVATE_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const TEST_FUNDER: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+    #[test]
+    fn test_client_stores_signature_type_eoa() {
+        let client = PolymarketAsyncClient::new(
+            "https://clob.polymarket.com",
+            137,
+            TEST_PRIVATE_KEY,
+            TEST_FUNDER,
+            0, // EOA
+        ).expect("should create client");
+
+        assert_eq!(client.signature_type, 0);
+    }
+
+    #[test]
+    fn test_client_stores_signature_type_poly_proxy() {
+        let client = PolymarketAsyncClient::new(
+            "https://clob.polymarket.com",
+            137,
+            TEST_PRIVATE_KEY,
+            TEST_FUNDER,
+            1, // Poly proxy
+        ).expect("should create client");
+
+        assert_eq!(client.signature_type, 1);
+    }
+
+    #[test]
+    fn test_client_stores_signature_type_gnosis_safe() {
+        let client = PolymarketAsyncClient::new(
+            "https://clob.polymarket.com",
+            137,
+            TEST_PRIVATE_KEY,
+            TEST_FUNDER,
+            2, // Gnosis safe
+        ).expect("should create client");
+
+        assert_eq!(client.signature_type, 2);
+    }
+
+    #[test]
+    fn test_parse_order_response_valid() {
+        let json = r#"{
+            "id": "0x123",
+            "status": "MATCHED",
+            "market": "0xabc",
+            "outcome": "Yes",
+            "price": "0.65",
+            "side": "BUY",
+            "size_matched": "10",
+            "original_size": "10",
+            "maker_address": "0xdef",
+            "asset_id": "12345"
+        }"#;
+
+        let result: Result<PolymarketOrderResponse, _> = serde_json::from_str(json);
+        assert!(result.is_ok());
+        let order = result.unwrap();
+        assert_eq!(order.id, "0x123");
+        assert_eq!(order.status, "MATCHED");
+        assert_eq!(order.size_matched, "10");
+    }
+
+    #[test]
+    fn test_parse_order_response_null_fails() {
+        let json = "null";
+        let result: Result<PolymarketOrderResponse, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("null"), "Error should mention null: {}", err);
+    }
+
+    #[test]
+    fn test_parse_order_response_empty_fails() {
+        let json = "";
+        let result: Result<PolymarketOrderResponse, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_null_response_detection() {
+        // Test the exact null check logic used in get_order_async
+        let null_responses = ["null", " null ", "null\n", "\nnull\n"];
+        for response in null_responses {
+            assert!(
+                response.trim() == "null" || response.trim().is_empty(),
+                "Should detect '{}' as null response",
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn test_valid_response_not_detected_as_null() {
+        let valid_responses = [
+            r#"{"id":"123"}"#,
+            r#"{"id":"123","status":"MATCHED"}"#,
+        ];
+        for response in valid_responses {
+            assert!(
+                response.trim() != "null" && !response.trim().is_empty(),
+                "Should NOT detect '{}' as null response",
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn test_post_response_fill_extraction_buy() {
+        // Real POST response from Polymarket for a BUY order
+        let json = r#"{
+            "errorMsg": "",
+            "orderID": "0x8b416d01048aea99086ea6c1e4510cad2d0bb881a0def312b9b81b7ac732ad8e",
+            "takingAmount": "5",
+            "makingAmount": "2.35",
+            "status": "matched",
+            "transactionsHashes": ["0xfa6dc3d89588e8024a8c729a3380f7a4ec1be0ba6788894fd8c9a2fb5329b706"],
+            "success": true
+        }"#;
+
+        let resp_json: serde_json::Value = serde_json::from_str(json).unwrap();
+
+        // For BUY: takingAmount = shares received, makingAmount = USDC spent
+        let shares: f64 = resp_json["takingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let cost: f64 = resp_json["makingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+
+        assert_eq!(shares, 5.0, "Should extract 5 shares from takingAmount");
+        assert_eq!(cost, 2.35, "Should extract $2.35 cost from makingAmount");
+    }
+
+    #[test]
+    fn test_post_response_fill_extraction_sell() {
+        // POST response for a SELL order (hypothetical - amounts are reversed)
+        let json = r#"{
+            "errorMsg": "",
+            "orderID": "0xabc123",
+            "takingAmount": "3.50",
+            "makingAmount": "5",
+            "status": "matched",
+            "transactionsHashes": [],
+            "success": true
+        }"#;
+
+        let resp_json: serde_json::Value = serde_json::from_str(json).unwrap();
+
+        // For SELL: makingAmount = shares sold, takingAmount = USDC received
+        let shares: f64 = resp_json["makingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let cost: f64 = resp_json["takingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+
+        assert_eq!(shares, 5.0, "Should extract 5 shares from makingAmount");
+        assert_eq!(cost, 3.50, "Should extract $3.50 from takingAmount");
+    }
+
+    #[test]
+    fn test_post_response_fill_extraction_no_fill() {
+        // POST response when order doesn't fill (FAK with no match)
+        let json = r#"{
+            "errorMsg": "",
+            "orderID": "0xdef456",
+            "status": "LIVE",
+            "success": true
+        }"#;
+
+        let resp_json: serde_json::Value = serde_json::from_str(json).unwrap();
+
+        // Missing takingAmount/makingAmount should default to 0.0
+        let shares: f64 = resp_json["takingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let cost: f64 = resp_json["makingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+
+        assert_eq!(shares, 0.0, "Missing takingAmount should default to 0");
+        assert_eq!(cost, 0.0, "Missing makingAmount should default to 0");
+    }
+
+    #[test]
+    fn test_post_response_fill_extraction_partial_fill() {
+        // POST response for partial fill
+        let json = r#"{
+            "errorMsg": "",
+            "orderID": "0x789ghi",
+            "takingAmount": "3",
+            "makingAmount": "1.47",
+            "status": "matched",
+            "success": true
+        }"#;
+
+        let resp_json: serde_json::Value = serde_json::from_str(json).unwrap();
+        let order_status = resp_json["status"].as_str().unwrap_or("unknown");
+
+        let shares: f64 = resp_json["takingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let cost: f64 = resp_json["makingAmount"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+
+        assert_eq!(order_status, "matched");
+        assert_eq!(shares, 3.0, "Should extract partial fill of 3 shares");
+        assert_eq!(cost, 1.47, "Should extract cost of $1.47");
     }
 }

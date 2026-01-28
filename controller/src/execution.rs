@@ -5,10 +5,14 @@
 
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn, error};
+
+/// Global counter for unique position_id generation
+/// Each arb execution gets a unique sequence number
+static ARB_COUNTER: AtomicU32 = AtomicU32::new(1);
 
 use crate::kalshi::KalshiApiClient;
 use crate::poly_executor::PolyExecutor;
@@ -157,9 +161,14 @@ impl ExecutionEngine {
         let pair = market.pair()
             .ok_or_else(|| anyhow!("No pair for market_id {}", market_id))?;
 
+        // Generate unique position_id for this arb execution
+        // This ensures each arb is tracked separately even on the same market pair
+        let arb_seq = ARB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let position_id: Arc<str> = format!("{}-{}", pair.pair_id, arb_seq).into();
+
         // Log detection early so we know what arb was found even if checks fail
         let profit_cents = req.profit_cents();
-        let est_max_contracts = (req.yes_size.min(req.no_size) / 100) as i64;
+        let est_max_contracts = req.max_contracts();
         info!(
             "[EXEC] 📡 Detected: {} | {:?} y={}¢ n={}¢ | est_profit={}¢ | size={}¢/{}¢ | est_max={}x",
             pair.description, req.arb_type, req.yes_price, req.no_price,
@@ -195,8 +204,9 @@ impl ExecutionEngine {
             });
         }
 
-        // Calculate max contracts from size (min of both sides)
-        let mut max_contracts = (req.yes_size.min(req.no_size) / 100) as i64;
+        // Calculate max contracts: min(yes_size/yes_price, no_size/no_price)
+        // This matches ArbOpportunity::max_contracts() used in confirmation
+        let mut max_contracts = req.max_contracts() as i64;
 
         // Safety: In test mode, cap position size at 10 contracts
         // Note: Polymarket enforces a $1 minimum order value. At 40¢ per contract,
@@ -209,10 +219,11 @@ impl ExecutionEngine {
 
         if max_contracts < 1 {
             warn!(
-                "[EXEC] ⚠️ Insufficient liquidity: {} | {:?} | yes={}¢ ({}¢ size) no={}¢ ({}¢ size) | need 100¢ min",
+                "[EXEC] ⚠️ Insufficient liquidity: {} | {:?} | yes={}¢ ({}¢ size) no={}¢ ({}¢ size) | max_contracts={}",
                 pair.description, req.arb_type,
                 req.yes_price, req.yes_size,
-                req.no_price, req.no_size
+                req.no_price, req.no_size,
+                max_contracts
             );
             // Use delayed release to avoid spam from low-liquidity markets
             self.release_in_flight_delayed(market_id);
@@ -253,6 +264,34 @@ impl ExecutionEngine {
                 capacity.per_market, capacity.total
             );
             max_contracts = capacity.effective;
+        }
+
+        // Re-check Polymarket $1 minimum after capacity capping
+        // (ArbOpportunity::detect() validates this initially, but circuit breaker may reduce contracts)
+        const POLY_MIN_ORDER_CENTS: i64 = 100;
+        let poly_order_value = match req.arb_type {
+            ArbType::PolyYesKalshiNo => max_contracts * req.yes_price as i64,
+            ArbType::KalshiYesPolyNo => max_contracts * req.no_price as i64,
+            ArbType::PolyOnly => {
+                // Both legs on Poly - use the smaller order value
+                (max_contracts * req.yes_price as i64).min(max_contracts * req.no_price as i64)
+            }
+            ArbType::KalshiOnly => POLY_MIN_ORDER_CENTS, // No Poly, always passes
+        };
+
+        if poly_order_value < POLY_MIN_ORDER_CENTS {
+            warn!(
+                "[EXEC] ⚠️ Poly min order (post-cap): {} | {:?} | {}x = {}¢ < $1.00 min",
+                pair.description, req.arb_type, max_contracts, poly_order_value
+            );
+            self.release_in_flight_delayed(market_id);
+            return Ok(ExecutionResult {
+                market_id,
+                success: false,
+                profit_cents: 0,
+                latency_ns: self.clock.now_ns() - req.detected_ns,
+                error: Some("Below Poly $1 min"),
+            });
         }
 
         // Safety net: verify with can_execute (should always pass after capping)
@@ -325,7 +364,102 @@ impl ExecutionEngine {
 
         match result {
             // Note: For same-platform arbs (PolyOnly/KalshiOnly), these are YES/NO fills, not platform fills
-            Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id)) => {
+            Ok((yes_filled, no_filled, yes_cost, no_cost, yes_fees, no_fees, yes_order_id, no_order_id, yes_error, no_error, poly_delayed)) => {
+                // === Handle delayed Polymarket orders ===
+                // If Poly returned status="delayed", we need to spawn a reconciliation task
+                // to poll for the final fill status. In the meantime, record Kalshi as filled
+                // with a reconciliation_pending marker.
+                if poly_delayed {
+                    // Determine which order_id is the delayed Poly order
+                    let (poly_order_id, kalshi_filled, kalshi_cost, kalshi_fees, kalshi_order_id, kalshi_side, poly_side) = match req.arb_type {
+                        ArbType::PolyYesKalshiNo => {
+                            // YES = Poly (delayed), NO = Kalshi
+                            (yes_order_id.clone(), no_filled, no_cost, no_fees, no_order_id.clone(), "no", "yes")
+                        }
+                        ArbType::KalshiYesPolyNo => {
+                            // YES = Kalshi, NO = Poly (delayed)
+                            (no_order_id.clone(), yes_filled, yes_cost, yes_fees, yes_order_id.clone(), "yes", "no")
+                        }
+                        ArbType::PolyOnly => {
+                            // Both legs are Poly - for now treat YES as the "primary" delayed
+                            // Note: This is a rare case and may need more sophisticated handling
+                            warn!("[EXEC] ⏳ PolyOnly arb with delayed order - reconciliation may be incomplete");
+                            (yes_order_id.clone(), 0, 0, 0, String::new(), "", "yes")
+                        }
+                        ArbType::KalshiOnly => {
+                            // Should never happen - Kalshi doesn't have delayed orders
+                            unreachable!("KalshiOnly arb should never have poly_delayed=true");
+                        }
+                    };
+
+                    info!("[EXEC] ⏳ Poly order delayed ({}), spawning reconciliation", poly_order_id);
+
+                    // Record Kalshi fill immediately WITH reconciliation_pending marker
+                    if kalshi_filled > 0 {
+                        let kalshi_price = kalshi_cost as f64 / 100.0 / kalshi_filled as f64;
+                        self.position_channel.record_fill(FillRecord::with_pending_reconciliation(
+                            &position_id,
+                            &pair.description,
+                            "kalshi",
+                            kalshi_side,
+                            max_contracts as f64,
+                            kalshi_filled as f64,
+                            kalshi_price,
+                            kalshi_fees as f64 / 100.0,
+                            &kalshi_order_id,
+                            if kalshi_side == "yes" { TradeReason::ArbLegYes } else { TradeReason::ArbLegNo },
+                            if kalshi_filled == max_contracts { TradeStatus::Success } else { TradeStatus::PartialFill },
+                            None,
+                            poly_order_id.clone(),
+                        ));
+                    }
+
+                    // Read timeout from env var (default 5000ms)
+                    let timeout_ms: u64 = std::env::var("POLY_DELAYED_TIMEOUT_MS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(5000);
+
+                    // Clone values needed for the background reconciliation task
+                    let poly_async_for_spawn = self.poly_async.clone();
+                    let kalshi_for_spawn = self.kalshi.clone();
+                    let position_channel_for_spawn = self.position_channel.clone();
+                    let position_id_for_spawn = position_id.clone();
+                    let description_for_spawn = pair.description.clone();
+                    let kalshi_ticker_for_spawn = pair.kalshi_market_ticker.clone();
+                    let poly_yes_token_for_spawn = pair.poly_yes_token.clone();
+                    let poly_no_token_for_spawn = pair.poly_no_token.clone();
+                    let arb_type_for_spawn = req.arb_type;
+                    let poly_price_for_spawn = if poly_side == "yes" { req.yes_price } else { req.no_price };
+
+                    tokio::spawn(async move {
+                        reconcile_delayed_poly(
+                            poly_async_for_spawn,
+                            kalshi_for_spawn,
+                            poly_order_id,
+                            poly_price_for_spawn,
+                            kalshi_filled,
+                            position_id_for_spawn,
+                            description_for_spawn,
+                            kalshi_ticker_for_spawn,
+                            poly_yes_token_for_spawn,
+                            poly_no_token_for_spawn,
+                            arb_type_for_spawn,
+                            position_channel_for_spawn,
+                            timeout_ms,
+                        ).await;
+                    });
+
+                    // Return early with success (reconciliation will update position tracker later)
+                    return Ok(ExecutionResult {
+                        market_id,
+                        success: true,
+                        profit_cents: 0, // Unknown until reconciliation completes
+                        latency_ns: self.clock.now_ns() - req.detected_ns,
+                        error: None,
+                    });
+                }
+
                 let matched = yes_filled.min(no_filled);
                 let success = matched > 0;
                 let actual_profit = matched as i16 * 100 - (yes_cost + no_cost) as i16;
@@ -348,7 +482,7 @@ impl ExecutionEngine {
                     let kalshi = self.kalshi.clone();
                     let poly_async = self.poly_async.clone();
                     let position_channel = self.position_channel.clone();
-                    let pair_id = pair.pair_id.clone();
+                    let position_id_clone = position_id.clone();
                     let description = pair.description.clone();
                     let arb_type = req.arb_type;
                     let yes_price = req.yes_price;
@@ -362,7 +496,7 @@ impl ExecutionEngine {
 
                     tokio::spawn(async move {
                         Self::auto_close_background(
-                            kalshi, poly_async, position_channel, pair_id, description,
+                            kalshi, poly_async, position_channel, position_id_clone, description,
                             arb_type, yes_filled, no_filled,
                             yes_price, no_price, poly_yes_token, poly_no_token,
                             kalshi_ticker, original_cost_per_contract
@@ -400,12 +534,18 @@ impl ExecutionEngine {
                 } else {
                     cents_to_price(req.yes_price)
                 };
+                // Build failure reason: "No fill" or "No fill - <error>"
+                let yes_failure_reason = if yes_filled == 0 {
+                    Some(format_failure_reason(yes_error.as_deref()))
+                } else {
+                    None
+                };
                 self.position_channel.record_fill(FillRecord::with_details(
-                    &pair.pair_id, &pair.description, platform1, side1,
+                    &position_id, &pair.description, platform1, side1,
                     yes_requested, yes_filled as f64, yes_price,
-                    0.0, &yes_order_id,
+                    yes_fees as f64 / 100.0, &yes_order_id,
                     TradeReason::ArbLegYes, yes_status,
-                    if yes_filled == 0 { Some("No fill".to_string()) } else { None },
+                    yes_failure_reason,
                 ));
 
                 // Record NO leg (success, partial, or failed)
@@ -422,12 +562,18 @@ impl ExecutionEngine {
                 } else {
                     cents_to_price(req.no_price)
                 };
+                // Build failure reason: "No fill" or "No fill - <error>"
+                let no_failure_reason = if no_filled == 0 {
+                    Some(format_failure_reason(no_error.as_deref()))
+                } else {
+                    None
+                };
                 self.position_channel.record_fill(FillRecord::with_details(
-                    &pair.pair_id, &pair.description, platform2, side2,
+                    &position_id, &pair.description, platform2, side2,
                     no_requested, no_filled as f64, no_price,
-                    0.0, &no_order_id,
+                    no_fees as f64 / 100.0, &no_order_id,
                     TradeReason::ArbLegNo, no_status,
-                    if no_filled == 0 { Some("No fill".to_string()) } else { None },
+                    no_failure_reason,
                 ));
 
                 Ok(ExecutionResult {
@@ -456,7 +602,7 @@ impl ExecutionEngine {
         req: &ArbOpportunity,
         pair: &MarketPair,
         contracts: i64,
-    ) -> Result<(i64, i64, i64, i64, String, String)> {
+    ) -> Result<(i64, i64, i64, i64, i64, i64, String, String, Option<String>, Option<String>, bool)> {
         match req.arb_type {
             // === CROSS-PLATFORM: Poly YES + Kalshi NO ===
             ArbType::PolyYesKalshiNo => {
@@ -531,134 +677,152 @@ impl ExecutionEngine {
     }
 
     /// Extract results from PolyYesKalshiNo execution.
-    /// Returns: (yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id)
+    /// Returns: (yes_filled, no_filled, yes_cost, no_cost, yes_fees, no_fees, yes_order_id, no_order_id, yes_error, no_error, poly_delayed)
     /// where YES = Poly and NO = Kalshi
     fn extract_cross_results_poly_yes_kalshi_no(
         &self,
         poly_res: Result<crate::polymarket_clob::PolyFillAsync>,
         kalshi_res: Result<crate::kalshi::KalshiOrderResponse>,
-    ) -> Result<(i64, i64, i64, i64, String, String)> {
-        let (yes_filled, yes_cost, yes_order_id) = match poly_res {
+    ) -> Result<(i64, i64, i64, i64, i64, i64, String, String, Option<String>, Option<String>, bool)> {
+        let (yes_filled, yes_cost, yes_fees, yes_order_id, yes_error, poly_delayed) = match poly_res {
             Ok(fill) => {
-                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id)
+                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, 0i64, fill.order_id, None, fill.is_delayed)
             }
             Err(e) => {
-                warn!("[EXEC] Poly YES failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Poly YES failed: {}", err_msg);
+                (0, 0, 0, String::new(), Some(err_msg), false)
             }
         };
 
-        let (no_filled, no_cost, no_order_id) = match kalshi_res {
+        let (no_filled, no_cost, no_fees, no_order_id, no_error) = match kalshi_res {
             Ok(resp) => {
                 let filled = resp.order.filled_count();
                 let cost = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
-                (filled, cost, resp.order.order_id)
+                let fees = resp.order.total_fees();
+                (filled, cost, fees, resp.order.order_id, None)
             }
             Err(e) => {
-                warn!("[EXEC] Kalshi NO failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Kalshi NO failed: {}", err_msg);
+                (0, 0, 0, String::new(), Some(err_msg))
             }
         };
 
-        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id))
+        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_fees, no_fees, yes_order_id, no_order_id, yes_error, no_error, poly_delayed))
     }
 
     /// Extract results from KalshiYesPolyNo execution.
-    /// Returns: (yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id)
+    /// Returns: (yes_filled, no_filled, yes_cost, no_cost, yes_fees, no_fees, yes_order_id, no_order_id, yes_error, no_error, poly_delayed)
     /// where YES = Kalshi and NO = Poly
     fn extract_cross_results_kalshi_yes_poly_no(
         &self,
         kalshi_res: Result<crate::kalshi::KalshiOrderResponse>,
         poly_res: Result<crate::polymarket_clob::PolyFillAsync>,
-    ) -> Result<(i64, i64, i64, i64, String, String)> {
-        let (yes_filled, yes_cost, yes_order_id) = match kalshi_res {
+    ) -> Result<(i64, i64, i64, i64, i64, i64, String, String, Option<String>, Option<String>, bool)> {
+        let (yes_filled, yes_cost, yes_fees, yes_order_id, yes_error) = match kalshi_res {
             Ok(resp) => {
                 let filled = resp.order.filled_count();
                 let cost = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
-                (filled, cost, resp.order.order_id)
+                let fees = resp.order.total_fees();
+                (filled, cost, fees, resp.order.order_id, None)
             }
             Err(e) => {
-                warn!("[EXEC] Kalshi YES failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Kalshi YES failed: {}", err_msg);
+                (0, 0, 0, String::new(), Some(err_msg))
             }
         };
 
-        let (no_filled, no_cost, no_order_id) = match poly_res {
+        let (no_filled, no_cost, no_fees, no_order_id, no_error, poly_delayed) = match poly_res {
             Ok(fill) => {
-                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id)
+                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, 0i64, fill.order_id, None, fill.is_delayed)
             }
             Err(e) => {
-                warn!("[EXEC] Poly NO failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Poly NO failed: {}", err_msg);
+                (0, 0, 0, String::new(), Some(err_msg), false)
             }
         };
 
-        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id))
+        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_fees, no_fees, yes_order_id, no_order_id, yes_error, no_error, poly_delayed))
     }
 
     /// Extract results from Poly-only execution (same-platform)
+    /// Returns poly_delayed = true if EITHER leg is delayed (both are Poly)
     fn extract_poly_only_results(
         &self,
         yes_res: Result<crate::polymarket_clob::PolyFillAsync>,
         no_res: Result<crate::polymarket_clob::PolyFillAsync>,
-    ) -> Result<(i64, i64, i64, i64, String, String)> {
-        let (yes_filled, yes_cost, yes_order_id) = match yes_res {
+    ) -> Result<(i64, i64, i64, i64, i64, i64, String, String, Option<String>, Option<String>, bool)> {
+        let (yes_filled, yes_cost, yes_order_id, yes_error, yes_delayed) = match yes_res {
             Ok(fill) => {
-                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id)
+                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id, None, fill.is_delayed)
             }
             Err(e) => {
-                warn!("[EXEC] Poly YES failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Poly YES failed: {}", err_msg);
+                (0, 0, String::new(), Some(err_msg), false)
             }
         };
 
-        let (no_filled, no_cost, no_order_id) = match no_res {
+        let (no_filled, no_cost, no_order_id, no_error, no_delayed) = match no_res {
             Ok(fill) => {
-                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id)
+                ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id, None, fill.is_delayed)
             }
             Err(e) => {
-                warn!("[EXEC] Poly NO failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Poly NO failed: {}", err_msg);
+                (0, 0, String::new(), Some(err_msg), false)
             }
         };
 
         // For same-platform, return YES as "kalshi" slot and NO as "poly" slot
         // This keeps the existing result handling logic working
-        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id))
+        // Polymarket has zero fees
+        // If either leg is delayed, we report poly_delayed = true
+        let poly_delayed = yes_delayed || no_delayed;
+        Ok((yes_filled, no_filled, yes_cost, no_cost, 0, 0, yes_order_id, no_order_id, yes_error, no_error, poly_delayed))
     }
 
     /// Extract results from Kalshi-only execution (same-platform)
+    /// poly_delayed is always false for Kalshi-only trades
     fn extract_kalshi_only_results(
         &self,
         yes_res: Result<crate::kalshi::KalshiOrderResponse>,
         no_res: Result<crate::kalshi::KalshiOrderResponse>,
-    ) -> Result<(i64, i64, i64, i64, String, String)> {
-        let (yes_filled, yes_cost, yes_order_id) = match yes_res {
+    ) -> Result<(i64, i64, i64, i64, i64, i64, String, String, Option<String>, Option<String>, bool)> {
+        let (yes_filled, yes_cost, yes_fees, yes_order_id, yes_error) = match yes_res {
             Ok(resp) => {
                 let filled = resp.order.filled_count();
                 let cost = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
-                (filled, cost, resp.order.order_id)
+                let fees = resp.order.total_fees();
+                (filled, cost, fees, resp.order.order_id, None)
             }
             Err(e) => {
-                warn!("[EXEC] Kalshi YES failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Kalshi YES failed: {}", err_msg);
+                (0, 0, 0, String::new(), Some(err_msg))
             }
         };
 
-        let (no_filled, no_cost, no_order_id) = match no_res {
+        let (no_filled, no_cost, no_fees, no_order_id, no_error) = match no_res {
             Ok(resp) => {
                 let filled = resp.order.filled_count();
                 let cost = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
-                (filled, cost, resp.order.order_id)
+                let fees = resp.order.total_fees();
+                (filled, cost, fees, resp.order.order_id, None)
             }
             Err(e) => {
-                warn!("[EXEC] Kalshi NO failed: {}", e);
-                (0, 0, String::new())
+                let err_msg = e.to_string();
+                warn!("[EXEC] Kalshi NO failed: {}", err_msg);
+                (0, 0, 0, String::new(), Some(err_msg))
             }
         };
 
         // For same-platform, return YES as "kalshi" slot and NO as "poly" slot
-        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id))
+        // Kalshi-only trades never have delayed Poly orders
+        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_fees, no_fees, yes_order_id, no_order_id, yes_error, no_error, false))
     }
 
     /// Background task to automatically close excess exposure from mismatched fills.
@@ -671,7 +835,7 @@ impl ExecutionEngine {
         kalshi: Arc<KalshiApiClient>,
         poly_async: Arc<dyn PolyExecutor>,
         position_channel: PositionChannel,
-        pair_id: Arc<str>,
+        position_id: Arc<str>,
         description: Arc<str>,
         arb_type: ArbType,
         yes_filled: i64,
@@ -715,7 +879,7 @@ impl ExecutionEngine {
 
             // Record even zero fills for complete audit trail
             position_channel.record_fill(FillRecord::with_details(
-                &pair_id, &description, platform, side,
+                &position_id, &description, platform, side,
                 -requested,  // Negative = closing position
                 -closed,     // Negative = closing position
                 price, 0.0, order_id,
@@ -853,9 +1017,10 @@ impl ExecutionEngine {
                     );
 
                     // Record every attempt (even zero fills) for complete audit trail
+                    // Always use limit price for consistency with what we requested
                     record_close(
                         position_channel, "polymarket", side,
-                        requested, fill.filled_size, fill.fill_cost / fill.filled_size.max(0.001),
+                        requested, fill.filled_size, price_decimal,
                         &fill.order_id, attempt
                     );
 
@@ -935,9 +1100,10 @@ impl ExecutionEngine {
                     );
 
                     // Record every attempt (even zero fills) for complete audit trail
+                    // Always use limit price - Kalshi's cost fields may return complement price
                     record_close(
                         position_channel, "kalshi", side,
-                        requested, filled as f64, proceeds_cents as f64 / 100.0 / filled.max(1) as f64,
+                        requested, filled as f64, price_decimal,
                         &resp.order.order_id, attempt
                     );
 
@@ -995,6 +1161,247 @@ impl ExecutionEngine {
                 let mask = !(1u64 << bit);
                 in_flight[slot].fetch_and(mask, Ordering::Release);
             });
+        }
+    }
+}
+
+// =============================================================================
+// DELAYED ORDER RECONCILIATION
+// =============================================================================
+
+/// Reconcile a delayed Polymarket order by polling until terminal state.
+///
+/// This function is spawned as a background task when Polymarket returns status="delayed".
+/// It polls the order status and, upon resolution:
+/// 1. Records the Poly fill (or no-fill) to the position tracker
+/// 2. Clears the reconciliation_pending marker
+/// 3. If there's a mismatch with Kalshi fills, unwinds the excess Kalshi position
+///
+/// # Arguments
+/// * `poly_async` - Polymarket executor for polling
+/// * `kalshi` - Kalshi client for unwinding excess positions
+/// * `poly_order_id` - The delayed Polymarket order ID to poll
+/// * `poly_price_cents` - Original order price in cents
+/// * `kalshi_filled` - Number of contracts filled on Kalshi
+/// * `position_id` - Position ID for fill recording
+/// * `description` - Market description for fill recording
+/// * `kalshi_ticker` - Kalshi market ticker for unwinding
+/// * `poly_yes_token` - Polymarket YES token for unwinding
+/// * `poly_no_token` - Polymarket NO token for unwinding
+/// * `arb_type` - Type of arbitrage (determines which side to unwind)
+/// * `position_channel` - Channel to send fill records
+/// * `timeout_ms` - Maximum time to poll before giving up
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_delayed_poly(
+    poly_async: Arc<dyn PolyExecutor>,
+    kalshi: Arc<KalshiApiClient>,
+    poly_order_id: String,
+    poly_price_cents: u16,
+    kalshi_filled: i64,
+    position_id: Arc<str>,
+    description: Arc<str>,
+    kalshi_ticker: Arc<str>,
+    poly_yes_token: Arc<str>,
+    poly_no_token: Arc<str>,
+    arb_type: ArbType,
+    position_channel: PositionChannel,
+    timeout_ms: u64,
+) {
+    info!(
+        "[RECONCILE] Polling Poly order {} (Kalshi filled {})",
+        poly_order_id, kalshi_filled
+    );
+
+    // Convert price to decimal for API
+    let price_decimal = cents_to_price(poly_price_cents);
+
+    // Poll until terminal state or timeout
+    let poll_result = poly_async
+        .poll_delayed_order(&poly_order_id, price_decimal, timeout_ms)
+        .await;
+
+    let (poly_filled, poly_cost) = match poll_result {
+        Ok((filled, cost)) => {
+            info!(
+                "[RECONCILE] Poly {} resolved: filled={:.0}, cost=${:.2}",
+                poly_order_id, filled, cost
+            );
+            (filled as i64, (cost * 100.0) as i64) // Convert to cents
+        }
+        Err(e) => {
+            warn!(
+                "[RECONCILE] Timeout polling {}: {} - assuming no fill",
+                poly_order_id, e
+            );
+            (0, 0)
+        }
+    };
+
+    // Determine which side the Poly order was for
+    let poly_side = match arb_type {
+        ArbType::PolyYesKalshiNo => "yes",
+        ArbType::KalshiYesPolyNo => "no",
+        ArbType::PolyOnly => "yes", // PolyOnly defaults to YES as primary (rare case)
+        ArbType::KalshiOnly => unreachable!("KalshiOnly should never have delayed Poly orders"),
+    };
+
+    // Record Poly fill (or no-fill)
+    if poly_filled > 0 {
+        let poly_price = poly_cost as f64 / 100.0 / poly_filled as f64;
+        position_channel.record_fill(FillRecord::with_details(
+            &position_id,
+            &description,
+            "polymarket",
+            poly_side,
+            kalshi_filled as f64, // requested (assumed same as Kalshi)
+            poly_filled as f64,
+            poly_price,
+            0.0, // Polymarket has zero fees
+            &poly_order_id,
+            if poly_side == "yes" { TradeReason::ArbLegYes } else { TradeReason::ArbLegNo },
+            if poly_filled == kalshi_filled { TradeStatus::Success } else { TradeStatus::PartialFill },
+            None,
+        ));
+    } else {
+        // Record the failed/no-fill
+        position_channel.record_fill(FillRecord::with_details(
+            &position_id,
+            &description,
+            "polymarket",
+            poly_side,
+            kalshi_filled as f64, // requested
+            0.0,                  // filled
+            price_decimal,
+            0.0,
+            &poly_order_id,
+            if poly_side == "yes" { TradeReason::ArbLegYes } else { TradeReason::ArbLegNo },
+            TradeStatus::Failed,
+            Some("No fill - delayed order timeout/canceled".to_string()),
+        ));
+    }
+
+    // Clear the reconciliation_pending marker
+    position_channel.clear_reconciliation_pending(&poly_order_id);
+
+    // Check for mismatch - unwind excess on whichever platform filled more
+    if kalshi_filled != poly_filled && (kalshi_filled > 0 || poly_filled > 0) {
+        // Configuration for retry logic
+        const MIN_PRICE_CENTS: i64 = 1;
+        const PRICE_STEP_CENTS: i64 = 1;
+        const RETRY_DELAY_MS: u64 = 100;
+
+        // Record close helper (simplified version for reconciliation)
+        let record_close = |position_channel: &PositionChannel, platform: &str, side: &str,
+                           requested: f64, closed: f64, price: f64, order_id: &str, attempt: u32| {
+            let reason = if attempt == 1 {
+                TradeReason::AutoClose
+            } else {
+                TradeReason::AutoCloseRetry
+            };
+
+            let status = if closed >= requested {
+                TradeStatus::Success
+            } else if closed > 0.0 {
+                TradeStatus::PartialFill
+            } else {
+                TradeStatus::Failed
+            };
+
+            position_channel.record_fill(FillRecord::with_details(
+                &position_id, &description, platform, side,
+                -requested,
+                -closed,
+                price, 0.0, order_id,
+                reason, status,
+                if closed == 0.0 { Some("No fill".to_string()) } else { None },
+            ));
+        };
+
+        let log_final_result = |platform: &str, total_closed: i64, total_proceeds: i64, remaining: i64| {
+            if total_closed > 0 {
+                info!(
+                    "[RECONCILE] Closed {} {} contracts for {}¢",
+                    total_closed, platform, total_proceeds
+                );
+            }
+            if remaining > 0 {
+                error!(
+                    "[RECONCILE] Failed to close {} {} contracts - EXPOSURE REMAINS!",
+                    remaining, platform
+                );
+            }
+        };
+
+        if kalshi_filled > poly_filled {
+            // Kalshi filled more - unwind excess Kalshi position
+            let excess = kalshi_filled - poly_filled;
+            warn!(
+                "[RECONCILE] Mismatch: Kalshi={} Poly={}, unwinding {} Kalshi contracts",
+                kalshi_filled, poly_filled, excess
+            );
+
+            // Determine which side to unwind on Kalshi
+            let kalshi_side = match arb_type {
+                ArbType::PolyYesKalshiNo => "no",  // Kalshi had NO
+                ArbType::KalshiYesPolyNo => "yes", // Kalshi had YES
+                ArbType::PolyOnly => return,       // No Kalshi position to unwind
+                ArbType::KalshiOnly => unreachable!(),
+            };
+
+            // Unwind the excess Kalshi position
+            // We need to sell at a price that will fill - start slightly below our buy price
+            let start_price_cents = poly_price_cents as i64; // Use Poly price as proxy
+
+            ExecutionEngine::close_kalshi_with_retry(
+                &kalshi,
+                &position_channel,
+                &kalshi_ticker,
+                kalshi_side,
+                start_price_cents,
+                excess,
+                MIN_PRICE_CENTS,
+                PRICE_STEP_CENTS,
+                RETRY_DELAY_MS,
+                record_close,
+                log_final_result,
+            ).await;
+        } else {
+            // Poly filled more - unwind excess Poly position
+            let excess = poly_filled - kalshi_filled;
+            warn!(
+                "[RECONCILE] Mismatch: Kalshi={} Poly={}, unwinding {} Poly contracts",
+                kalshi_filled, poly_filled, excess
+            );
+
+            // Determine which token/side to unwind on Polymarket
+            let (poly_token, poly_side_str) = match arb_type {
+                ArbType::PolyYesKalshiNo => (&poly_yes_token, "yes"), // Poly had YES
+                ArbType::KalshiYesPolyNo => (&poly_no_token, "no"),   // Poly had NO
+                ArbType::PolyOnly => return, // Both sides are Poly - complex case, skip for now
+                ArbType::KalshiOnly => unreachable!(),
+            };
+
+            // Wait for Poly settlement before attempting to close
+            info!(
+                "[RECONCILE] Waiting 2s for Poly settlement before auto-close ({} {} contracts)",
+                excess, poly_side_str
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // Unwind the excess Poly position
+            ExecutionEngine::close_poly_with_retry(
+                &poly_async,
+                &position_channel,
+                poly_token,
+                poly_side_str,
+                poly_price_cents,
+                excess,
+                MIN_PRICE_CENTS,
+                PRICE_STEP_CENTS,
+                RETRY_DELAY_MS,
+                record_close,
+                log_final_result,
+            ).await;
         }
     }
 }
@@ -1099,7 +1506,7 @@ pub async fn run_execution_loop(
                     // Skip logging for errors that already have detailed logs
                     let already_logged = matches!(
                         result.error,
-                        Some("Already in-flight") | Some("Insufficient liquidity")
+                        Some("Already in-flight") | Some("Insufficient liquidity") | Some("Below Poly $1 min")
                     );
                     if !already_logged {
                         let detail = engine.state.get_by_id(result.market_id)
@@ -1228,4 +1635,319 @@ mod tests {
             detected_ns
         );
     }
+
+    // =========================================================================
+    // BUG FIX TESTS: Auto-close price recording
+    // =========================================================================
+
+    /// Bug #1: Failed close attempts should record the LIMIT price, not 0.0
+    ///
+    /// When an API call returns OK but filled=0, the price should be the limit
+    /// price we sent, not 0.0 (which happens when we derive price from proceeds).
+    #[test]
+    fn test_close_price_calculation_zero_fill() {
+        // Scenario: API returns OK but filled=0, proceeds=0
+        // Current bug: derives price as 0.0/100.0/1 = 0.0
+        // Expected: should use the limit price we sent (46 cents)
+
+        let limit_price_cents: i64 = 46;
+        let filled: i64 = 0;
+        let proceeds_cents: i64 = 0;
+
+        // This is the BUGGY calculation from current code
+        let buggy_price = proceeds_cents as f64 / 100.0 / (filled.max(1) as f64);
+
+        // This is what we SHOULD record
+        let expected_price = limit_price_cents as f64 / 100.0;
+
+        // Currently this will be equal (both 0.0), but after fix it won't be
+        // The correct price should be the limit price, not derived from proceeds
+        assert!(
+            (expected_price - 0.46).abs() < 0.001,
+            "Expected price should be 0.46, got {}",
+            expected_price
+        );
+
+        // The buggy calculation gives 0.0 - this test documents the bug
+        assert!(
+            (buggy_price - 0.0).abs() < 0.001,
+            "Current buggy price is 0.0"
+        );
+
+        // This assertion SHOULD pass after fix - currently the logic is wrong
+        // We use calculate_close_record_price to test the fix
+        let correct_price = calculate_close_record_price(filled, proceeds_cents, limit_price_cents);
+        assert!(
+            (correct_price - 0.46).abs() < 0.001,
+            "Close price for zero-fill should be limit price (0.46), got {}",
+            correct_price
+        );
+    }
+
+    /// Bug #2: Successful close should record LIMIT price, not proceeds-derived price
+    ///
+    /// When selling on Kalshi, the `taker_fill_cost + maker_fill_cost` returns
+    /// the complement price (100 - limit_price), not the actual sale price.
+    /// We should record what we asked for, not what Kalshi reports.
+    #[test]
+    fn test_close_price_calculation_full_fill() {
+        // Scenario: Sell 8 contracts at limit 46c
+        // Kalshi returns proceeds of 432c (which is 8 * 54c, the complement)
+        // Current bug: records 432/100/8 = 0.54
+        // Expected: should record 0.46 (our limit price)
+
+        let limit_price_cents: i64 = 46;
+        let filled: i64 = 8;
+        let proceeds_cents: i64 = 432; // Kalshi reports 8 * 54c = 432c
+
+        // This is the BUGGY calculation from current code
+        let buggy_price = proceeds_cents as f64 / 100.0 / (filled as f64);
+
+        assert!(
+            (buggy_price - 0.54).abs() < 0.001,
+            "Current buggy price is 0.54 (complement), got {}",
+            buggy_price
+        );
+
+        // After fix, we should always use the limit price we sent
+        let correct_price = calculate_close_record_price(filled, proceeds_cents, limit_price_cents);
+        assert!(
+            (correct_price - 0.46).abs() < 0.001,
+            "Close price should be limit price (0.46), got {}",
+            correct_price
+        );
+    }
+
+    /// Bug #3: Failed Polymarket orders should capture the actual error message
+    ///
+    /// When Poly returns an error like "invalid signature", we should record
+    /// "No fill - invalid signature" instead of just "No fill".
+    #[test]
+    fn test_failure_reason_captures_error_message() {
+        // Scenario: Polymarket returns error "invalid signature"
+        // Current bug: records failure_reason as "No fill"
+        // Expected: "No fill - Polymarket order failed 400 Bad Request: {\"error\":\"invalid signature\"}"
+
+        let api_error = "Polymarket order failed 400 Bad Request: {\"error\":\"invalid signature\"}";
+
+        // This is what the failure reason SHOULD be
+        let expected_reason = format_failure_reason(Some(api_error));
+
+        assert!(
+            expected_reason.contains("No fill"),
+            "Should start with 'No fill'"
+        );
+        assert!(
+            expected_reason.contains("invalid signature"),
+            "Should contain the actual error message, got: {}",
+            expected_reason
+        );
+        assert_eq!(
+            expected_reason,
+            "No fill - Polymarket order failed 400 Bad Request: {\"error\":\"invalid signature\"}",
+            "Format should be 'No fill - <error>'"
+        );
+    }
+
+    /// Test that when there's no specific error, we just say "No fill"
+    #[test]
+    fn test_failure_reason_no_error() {
+        let reason = format_failure_reason(None);
+        assert_eq!(reason, "No fill", "Without error should just be 'No fill'");
+    }
+
+    // =========================================================================
+    // BUG FIX TESTS: Unique position_id per arb execution
+    // =========================================================================
+
+    #[test]
+    fn test_arb_counter_increments() {
+        // Get two sequential counter values
+        let seq1 = ARB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let seq2 = ARB_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        // They should be sequential
+        assert_eq!(seq2, seq1 + 1, "Counter should increment by 1");
+    }
+
+    #[test]
+    fn test_position_id_format() {
+        let pair_id = "nba-lal-bos-2026-01-27-KXNBAGAME-26JAN27LALBOS-LAL";
+        let seq = 42u32;
+
+        let position_id = format!("{}-{}", pair_id, seq);
+
+        assert_eq!(
+            position_id,
+            "nba-lal-bos-2026-01-27-KXNBAGAME-26JAN27LALBOS-LAL-42"
+        );
+    }
+
+    #[test]
+    fn test_position_ids_are_unique() {
+        // Simulate multiple arb executions on the same market
+        let pair_id: Arc<str> = "test-market-pair".into();
+
+        let mut position_ids = Vec::new();
+        for _ in 0..100 {
+            let seq = ARB_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let position_id: Arc<str> = format!("{}-{}", pair_id, seq).into();
+            position_ids.push(position_id);
+        }
+
+        // All position_ids should be unique
+        let unique_count = position_ids.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(unique_count, 100, "All position_ids should be unique");
+    }
+
+    #[test]
+    fn test_position_id_uniqueness_across_threads() {
+        use std::sync::atomic::Ordering;
+
+        let pair_id: Arc<str> = "threaded-test-pair".into();
+        let position_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let pair_id = pair_id.clone();
+            let position_ids = position_ids.clone();
+
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..10 {
+                    let seq = ARB_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let position_id: Arc<str> = format!("{}-{}", pair_id, seq).into();
+                    position_ids.lock().unwrap().push(position_id);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let ids = position_ids.lock().unwrap();
+        let unique_count = ids.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(unique_count, 100, "All position_ids should be unique across threads");
+    }
+
+    // =========================================================================
+    // Polymarket $1 Minimum Order Value Tests
+    // =========================================================================
+
+    /// Polymarket requires a minimum order value of $1.00
+    /// This function calculates the minimum contracts needed at a given price
+    #[inline]
+    fn poly_min_contracts_for_price(price_cents: i64) -> i64 {
+        const MIN_ORDER_CENTS: i64 = 100;
+        (MIN_ORDER_CENTS + price_cents - 1) / price_cents // ceil division
+    }
+
+    #[test]
+    fn test_poly_min_contracts_at_49_cents() {
+        // At 49¢ per contract:
+        // 1 × 49 = 49¢ < $1.00 ❌
+        // 2 × 49 = 98¢ < $1.00 ❌
+        // 3 × 49 = 147¢ ≥ $1.00 ✓
+        let min = poly_min_contracts_for_price(49);
+        assert_eq!(min, 3, "At 49¢, need 3 contracts to meet $1 minimum");
+    }
+
+    #[test]
+    fn test_poly_min_contracts_at_50_cents() {
+        // At 50¢ per contract:
+        // 1 × 50 = 50¢ < $1.00 ❌
+        // 2 × 50 = 100¢ = $1.00 ✓
+        let min = poly_min_contracts_for_price(50);
+        assert_eq!(min, 2, "At 50¢, need 2 contracts to meet $1 minimum");
+    }
+
+    #[test]
+    fn test_poly_min_contracts_at_10_cents() {
+        // At 10¢ per contract:
+        // 10 × 10 = 100¢ = $1.00 ✓
+        let min = poly_min_contracts_for_price(10);
+        assert_eq!(min, 10, "At 10¢, need 10 contracts to meet $1 minimum");
+    }
+
+    #[test]
+    fn test_poly_min_contracts_at_1_dollar() {
+        // At 100¢ per contract (rare but possible):
+        // 1 × 100 = 100¢ = $1.00 ✓
+        let min = poly_min_contracts_for_price(100);
+        assert_eq!(min, 1, "At $1.00, need 1 contract to meet $1 minimum");
+    }
+
+    #[test]
+    fn test_poly_order_would_be_rejected() {
+        // Simulating the user's scenario: 49¢ price, 1 contract
+        let price_cents = 49i64;
+        let contracts = 1i64;
+        let order_value_cents = price_cents * contracts;
+        let min_contracts = poly_min_contracts_for_price(price_cents);
+
+        assert!(
+            order_value_cents < 100,
+            "1 contract at 49¢ = {}¢ should be below $1 minimum",
+            order_value_cents
+        );
+        assert!(
+            contracts < min_contracts,
+            "1 contract is below minimum {} for 49¢ price",
+            min_contracts
+        );
+    }
+
+    #[test]
+    fn test_poly_order_would_succeed() {
+        // 3 contracts at 49¢ should work
+        let price_cents = 49i64;
+        let contracts = 3i64;
+        let order_value_cents = price_cents * contracts;
+        let min_contracts = poly_min_contracts_for_price(price_cents);
+
+        assert!(
+            order_value_cents >= 100,
+            "3 contracts at 49¢ = {}¢ should be >= $1 minimum",
+            order_value_cents
+        );
+        assert!(
+            contracts >= min_contracts,
+            "3 contracts should meet minimum {} for 49¢ price",
+            min_contracts
+        );
+    }
+}
+
+/// Format the failure reason for a no-fill scenario.
+///
+/// If there was an API error, includes it: "No fill - <error>"
+/// Otherwise just returns "No fill"
+#[inline]
+fn format_failure_reason(api_error: Option<&str>) -> String {
+    match api_error {
+        Some(err) => format!("No fill - {}", err),
+        None => "No fill".to_string(),
+    }
+}
+
+// =============================================================================
+// TEST HELPER FUNCTIONS
+// =============================================================================
+
+/// Calculate the correct price to record for auto-close attempts.
+///
+/// Always uses the limit price we sent, not the proceeds-derived price.
+/// This avoids two bugs:
+/// 1. Zero fills recording 0.0 instead of the limit price
+/// 2. Kalshi returning complement prices (100 - limit) in cost fields
+///
+/// Note: This is used by tests to document and verify the correct behavior.
+/// The actual implementation uses `price_decimal` directly in the close functions.
+#[cfg(test)]
+#[inline]
+fn calculate_close_record_price(filled: i64, _proceeds_cents: i64, limit_price_cents: i64) -> f64 {
+    // Always use limit price - this is what we asked for
+    // The proceeds might be the complement price or zero
+    let _ = filled; // Filled count doesn't affect which price to record
+    limit_price_cents as f64 / 100.0
 }

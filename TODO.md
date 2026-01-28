@@ -4,9 +4,9 @@ Last updated: 2026-01-20
 
 ## Active work
 
-- [ ] **Capture Polymarket buy and sell events**
-  - [ ] Persist fills/trades (buy + sell) in capture/replay format
-  - [ ] Include order id, market/token, side (buy/sell), price, size, timestamp, status transitions
+- [x] **Capture Polymarket buy and sell events**
+  - [x] Persist fills/trades (buy + sell) in capture/replay format
+  - [x] Include order id, market/token, side (buy/sell), price, size, timestamp, status transitions
 
 - [ ] **Web app: positions + drift detection**
   - [ ] Pull live positions/balances from **Polymarket + Kalshi APIs**
@@ -22,9 +22,17 @@ Last updated: 2026-01-20
   - [x] Simulate one leg filling and the compensating sell failing
   - [x] Verify we record exposure, trip appropriate safeguards, and keep system running
 
-- [] **Figure out the right processes to rebalance accounts within the legal bounds**
+- [ ] **Check cash balances on startup**
+  - [ ] Query Kalshi and Polymarket cash balances on controller start
+  - [ ] Use as upper bound for money to be spent
 
-- [] **Push Notifications to our phones for arbs**
+- [ ] **Continuously monitor cash balances**
+  - [ ] Pull cash balance periodically over app lifecycle
+  - [ ] Update spending limits dynamically
+
+- [ ] **Figure out the right processes to rebalance accounts within the legal bounds**
+
+- [ ] **Push Notifications to our phones for arbs**
 
 ## Notes / decisions
 

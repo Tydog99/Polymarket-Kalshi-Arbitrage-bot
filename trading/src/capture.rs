@@ -550,6 +550,32 @@ pub fn build_client_with_capture(
     builder.build()
 }
 
+/// Build a Kalshi API client with optional capture middleware
+///
+/// Creates a client configured for Kalshi's REST API with the specified timeout.
+/// If CAPTURE_DIR is set, HTTP traffic will be captured.
+pub fn build_kalshi_client(timeout: std::time::Duration) -> reqwest_middleware::ClientWithMiddleware {
+    build_client_with_capture(
+        reqwest::Client::builder()
+            .timeout(timeout)
+    )
+}
+
+/// Build a Polymarket CLOB client with optional capture middleware
+///
+/// Creates a client configured for Polymarket's CLOB API with connection pooling,
+/// keepalive, and the specified timeout. If CAPTURE_DIR is set, HTTP traffic will be captured.
+pub fn build_poly_client(timeout: std::time::Duration) -> reqwest_middleware::ClientWithMiddleware {
+    build_client_with_capture(
+        reqwest::Client::builder()
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .tcp_nodelay(true)
+            .timeout(timeout)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

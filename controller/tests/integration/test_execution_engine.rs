@@ -39,7 +39,7 @@ use arb_bot::execution::{ExecutionEngine, NanoClock};
 use arb_bot::kalshi::{KalshiApiClient, KalshiConfig};
 use arb_bot::poly_executor::mock::MockPolyClient;
 use arb_bot::poly_executor::PolyExecutor;
-use arb_bot::position_tracker::{create_position_channel, FillRecord};
+use arb_bot::position_tracker::{create_position_channel, FillRecord, PositionMessage};
 use arb_bot::types::{ArbType, ArbOpportunity, GlobalState, MarketPair, MarketType};
 
 use super::replay_harness::load_fixture;
@@ -110,7 +110,7 @@ fn create_disabled_circuit_breaker() -> CircuitBreaker {
 fn create_test_engine(
     kalshi_server: &MockServer,
     mock_poly: Arc<dyn PolyExecutor>,
-) -> (ExecutionEngine, mpsc::UnboundedReceiver<FillRecord>) {
+) -> (ExecutionEngine, mpsc::UnboundedReceiver<PositionMessage>) {
     let kalshi = Arc::new(create_test_kalshi_client(kalshi_server));
     let state = Arc::new(GlobalState::default());
     let circuit_breaker = Arc::new(create_disabled_circuit_breaker());
@@ -149,12 +149,14 @@ fn create_test_request(arb_type: ArbType) -> ArbOpportunity {
 }
 
 /// Drain all fills from the channel (non-blocking).
-async fn drain_fills(rx: &mut mpsc::UnboundedReceiver<FillRecord>) -> Vec<FillRecord> {
+async fn drain_fills(rx: &mut mpsc::UnboundedReceiver<PositionMessage>) -> Vec<FillRecord> {
     let mut fills = Vec::new();
     // Give a brief moment for fills to arrive
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    while let Ok(fill) = rx.try_recv() {
-        fills.push(fill);
+    while let Ok(msg) = rx.try_recv() {
+        if let PositionMessage::Fill(fill) = msg {
+            fills.push(fill);
+        }
     }
     fills
 }

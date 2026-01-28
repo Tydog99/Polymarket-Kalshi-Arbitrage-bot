@@ -612,6 +612,9 @@ async fn main() -> Result<()> {
         std::env::set_var("DEBUG_WS_ADDR", &addr);
         std::env::set_var("DEBUG_WS", "1");
     }
+    if let Some(platforms) = cli_arg_value(&args, "--controller-platforms") {
+        std::env::set_var("CONTROLLER_PLATFORMS", &platforms);
+    }
 
     // Build league list for discovery from CLI/env.
     // - `--leagues nba,nfl` overrides env.
@@ -765,14 +768,20 @@ async fn main() -> Result<()> {
         .context("POLY_PRIVATE_KEY not set")?;
     let poly_funder = std::env::var("POLY_FUNDER")
         .context("POLY_FUNDER not set (your wallet address)")?;
+    // Signature type: 0=EOA, 1=poly proxy, 2=gnosis safe
+    let poly_signature_type: i32 = std::env::var("POLY_SIGNATURE_TYPE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     // Create async Polymarket client and derive API credentials
-    info!("[POLYMARKET] Creating async client and deriving API credentials...");
+    info!("[POLYMARKET] Creating async client and deriving API credentials (signature_type={})...", poly_signature_type);
     let poly_async_client = PolymarketAsyncClient::new(
         POLY_CLOB_HOST,
         POLYGON_CHAIN_ID,
         &poly_private_key,
         &poly_funder,
+        poly_signature_type,
     )?;
     let api_creds = poly_async_client.derive_api_key(0).await?;
     let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
@@ -865,7 +874,9 @@ async fn main() -> Result<()> {
     // Create shutdown channel for WebSocket reconnection
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let position_tracker = Arc::new(RwLock::new(PositionTracker::new()));
+    let position_tracker = PositionTracker::load();
+    position_tracker.check_pending_reconciliations();
+    let position_tracker = Arc::new(RwLock::new(position_tracker));
     let (position_channel, position_rx) = create_position_channel();
 
     tokio::spawn(position_writer_loop(position_rx, position_tracker));
@@ -945,12 +956,13 @@ async fn main() -> Result<()> {
 
         let trading_poly: Option<Arc<trading::polymarket::SharedAsyncClient>> =
             if local_platforms.contains(&TradingPlatform::Polymarket) {
-                info!("[HYBRID] Creating Polymarket client for local execution");
-                let client = trading::polymarket::PolymarketAsyncClient::new(
+                info!("[HYBRID] Creating Polymarket client for local execution (signature_type={})", poly_signature_type);
+                let client = trading::polymarket::PolymarketAsyncClient::new_with_signature_type(
                     POLY_CLOB_HOST,
                     POLYGON_CHAIN_ID,
                     &poly_private_key,
                     &poly_funder,
+                    poly_signature_type,
                 )?;
                 let api_creds = client.derive_api_key(0).await?;
                 let prepared = trading::polymarket::PreparedCreds::from_api_creds(&api_creds)?;
@@ -1371,6 +1383,7 @@ async fn main() -> Result<()> {
     // This catches opportunities that existed before both platforms were fully loaded
     let sweep_state = state.clone();
     let sweep_exec_tx = exec_tx.clone();
+    let sweep_confirm_tx = confirm_tx.clone();
     let sweep_clock = clock.clone();
     let sweep_tui_state = tui_state.clone();
     let sweep_log_tx = tui_log_tx.clone();
@@ -1390,39 +1403,17 @@ async fn main() -> Result<()> {
         log_line(format!("[SWEEP] Startup sweep scheduled in {}s...", STARTUP_SWEEP_DELAY_SECS), tui_active);
         tokio::time::sleep(tokio::time::Duration::from_secs(STARTUP_SWEEP_DELAY_SECS)).await;
 
-        let market_count = sweep_state.market_count();
-        let mut arbs_found = 0;
-        let mut markets_scanned = 0;
-
-        for market in sweep_state.markets.iter().take(market_count) {
-            let (k_yes, k_no, _, _) = market.kalshi.load();
-            let (p_yes, p_no, _, _) = market.poly.load();
-
-            // Only check markets with both platforms populated
-            if k_yes == 0 || k_no == 0 || p_yes == 0 || p_no == 0 {
-                continue;
-            }
-            markets_scanned += 1;
-
-            // Check for arbs using ArbOpportunity::detect()
-            if let Some(req) = ArbOpportunity::detect(
-                market.market_id,
-                market.kalshi.load(),
-                market.poly.load(),
-                sweep_state.arb_config(),
-                sweep_clock.now_ns(),
-            ) {
-                arbs_found += 1;
-                if let Err(e) = sweep_exec_tx.try_send(req) {
-                    let tui_active = sweep_tui_state.read().await.active;
-                    log_line(format!("[SWEEP] Failed to send arb request: {}", e), tui_active);
-                }
-            }
-        }
+        // Run the sweep using the extracted testable function
+        let result = arb::sweep_markets(
+            &sweep_state,
+            sweep_clock.now_ns(),
+            &sweep_exec_tx,
+            &sweep_confirm_tx,
+        );
 
         let tui_active = sweep_tui_state.read().await.active;
-        log_line(format!("[SWEEP] Startup sweep complete: scanned {} markets, found {} arbs",
-              markets_scanned, arbs_found), tui_active);
+        log_line(format!("[SWEEP] Startup sweep complete: scanned {} markets, found {} arbs (exec: {}, confirm: {})",
+              result.markets_scanned, result.arbs_found, result.routed_to_exec, result.routed_to_confirm), tui_active);
     });
 
     // System health monitoring and arbitrage diagnostics

@@ -41,7 +41,8 @@ nonzero_ext = "0.3"
 pkcs1 = { version = "0.7", features = ["pem"] }
 rand = "0.8"
 regex = "1.11"
-reqwest = { version = "0.11", features = ["json", "blocking"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+reqwest-middleware = "0.4"
 rsa = { version = "0.9", features = ["sha2"] }
 rustc-hash = "2.0"
 serde = { version = "1.0", features = ["derive", "rc"] }

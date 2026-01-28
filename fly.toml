@@ -1,0 +1,43 @@
+# fly.toml app configuration file generated for arb-controller on 2026-01-25T08:50:38-08:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'arb-controller'
+primary_region = 'ams'
+
+[build]
+
+[[mounts]]
+  source = 'arb_data'
+  destination = '/data'
+
+[env]
+  RUST_LOG = "info"
+  FORCE_DISCOVERY = "0"
+  PRICE_LOGGING = "0"
+  POLY_SIGNATURE_TYPE = "2"
+
+  # Circuit breaker settings
+  CB_ENABLED = "true"
+  CB_MAX_POSITION_PER_MARKET = "10"
+  CB_MAX_TOTAL_POSITION = "100"
+  CB_MAX_DAILY_LOSS = "100.0"
+  CB_MAX_CONSECUTIVE_ERRORS = "5"
+  CB_COOLDOWN_SECS = "300"
+
+# Background daemon - restart always to keep running 24/7
+[[restart]]
+  policy = "always"
+  processes = ["app"]
+
+# No http_service - this is a background daemon without HTTP
+# The restart policy handles keeping it running
+
+[processes]
+  app = "/usr/local/bin/fly-entrypoint.sh"
+
+[[vm]]
+  memory = '512mb'
+  cpus = 1
+  memory_mb = 512

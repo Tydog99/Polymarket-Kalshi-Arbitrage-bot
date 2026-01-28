@@ -22,14 +22,37 @@ pub fn workspace_root() -> PathBuf {
         .unwrap_or_else(controller_dir)
 }
 
+/// Resolve a relative path, checking cwd first (for containers), then fallback.
+///
+/// - `must_exist`: if true, only return cwd path if file exists there
+/// - `fallback`: compile-time fallback directory
+fn resolve_with_cwd_priority<P: AsRef<Path>>(rel: P, must_exist: bool, fallback: PathBuf) -> PathBuf {
+    let rel = rel.as_ref();
+
+    // Check current working directory first (container deployment)
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_path = cwd.join(rel);
+        if !must_exist || cwd_path.exists() {
+            return cwd_path;
+        }
+    }
+
+    // Fall back to compile-time directory (development)
+    fallback.join(rel)
+}
+
 /// Resolve a path that should live in the controller crate directory.
+///
+/// Checks cwd first (if file exists), then controller crate directory.
 pub fn resolve_controller_asset<P: AsRef<Path>>(rel: P) -> PathBuf {
-    controller_dir().join(rel)
+    resolve_with_cwd_priority(rel, true, controller_dir())
 }
 
 /// Resolve a path that should live in the workspace root (secrets/config).
+///
+/// Checks cwd first (even if file doesn't exist - for writing), then workspace root.
 pub fn resolve_workspace_file<P: AsRef<Path>>(rel: P) -> PathBuf {
-    workspace_root().join(rel)
+    resolve_with_cwd_priority(rel, false, workspace_root())
 }
 
 /// Load `.env` once, searching common locations:

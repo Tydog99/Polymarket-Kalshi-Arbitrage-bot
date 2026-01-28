@@ -128,6 +128,76 @@ impl Default for ArbConfig {
     }
 }
 
+// ============================================================================
+// Startup Sweep
+// ============================================================================
+
+use crate::config;
+use crate::types::{ArbOpportunity, GlobalState, MarketPair};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+
+/// Result of a market sweep operation.
+#[derive(Debug, Default)]
+pub struct SweepResult {
+    pub markets_scanned: usize,
+    pub arbs_found: usize,
+    pub routed_to_confirm: usize,
+    pub routed_to_exec: usize,
+}
+
+/// Sweep all markets for arbitrage opportunities and route to appropriate channels.
+///
+/// This is the core logic extracted from the startup sweep for testability.
+/// Routes arbs based on `config::requires_confirmation()` for each league.
+pub fn sweep_markets(
+    state: &GlobalState,
+    clock_ns: u64,
+    exec_tx: &mpsc::Sender<ArbOpportunity>,
+    confirm_tx: &mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
+) -> SweepResult {
+    let mut result = SweepResult::default();
+    let market_count = state.market_count();
+
+    for market in state.markets.iter().take(market_count) {
+        let (k_yes, k_no, _, _) = market.kalshi.load();
+        let (p_yes, p_no, _, _) = market.poly.load();
+
+        // Only check markets with both platforms populated
+        if k_yes == 0 || k_no == 0 || p_yes == 0 || p_no == 0 {
+            continue;
+        }
+        result.markets_scanned += 1;
+
+        // Check for arbs using ArbOpportunity::detect()
+        if let Some(req) = ArbOpportunity::detect(
+            market.market_id,
+            market.kalshi.load(),
+            market.poly.load(),
+            state.arb_config(),
+            clock_ns,
+        ) {
+            result.arbs_found += 1;
+
+            // Route based on confirmation requirement
+            if let Some(pair) = market.pair() {
+                if config::requires_confirmation(&pair.league) {
+                    if confirm_tx.try_send((req, pair)).is_ok() {
+                        result.routed_to_confirm += 1;
+                    }
+                } else if exec_tx.try_send(req).is_ok() {
+                    result.routed_to_exec += 1;
+                }
+            } else if exec_tx.try_send(req).is_ok() {
+                // No pair metadata - fall back to direct execution
+                result.routed_to_exec += 1;
+            }
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

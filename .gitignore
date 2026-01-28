@@ -15,3 +15,4 @@ positions.json
 
 # Confirmation logs
 .confirmations/
+*.code-workspace

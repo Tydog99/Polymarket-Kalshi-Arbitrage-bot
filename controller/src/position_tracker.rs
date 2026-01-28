@@ -73,6 +73,9 @@ pub struct TradeRecord {
     pub failure_reason: Option<String>,
     /// Exchange order ID (if available)
     pub order_id: Option<String>,
+    /// If Some(poly_order_id), this fill is pending reconciliation with a delayed Polymarket order
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation_pending: Option<String>,
 }
 
 const POSITION_FILE: &str = "positions.json";
@@ -91,12 +94,18 @@ pub struct PositionLeg {
 #[allow(dead_code)]
 impl PositionLeg {
     pub fn add(&mut self, contracts: f64, price: f64) {
-        let new_cost = contracts * price;
-        self.cost_basis += new_cost;
-        self.contracts += contracts;
-        if self.contracts > 0.0 {
-            self.avg_price = self.cost_basis / self.contracts;
+        // Only accumulate cost_basis on buys (positive contracts)
+        // cost_basis represents total cost paid, never reduced on sells
+        if contracts > 0.0 {
+            let new_cost = contracts * price;
+            self.cost_basis += new_cost;
+            // Update avg_price based on new weighted average
+            let new_contracts = self.contracts + contracts;
+            if new_contracts > 0.0 {
+                self.avg_price = self.cost_basis / new_contracts;
+            }
         }
+        self.contracts += contracts;
     }
     
     /// Unrealized P&L based on current market price
@@ -183,6 +192,36 @@ impl ArbPosition {
         failure_reason: Option<String>,
         order_id: Option<String>,
     ) -> u32 {
+        self.record_trade_with_reconciliation(
+            reason,
+            platform,
+            side,
+            requested_contracts,
+            filled_contracts,
+            price,
+            status,
+            failure_reason,
+            order_id,
+            None, // No reconciliation pending
+        )
+    }
+
+    /// Record a trade in the history with optional reconciliation pending marker.
+    /// Returns the sequence number assigned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_trade_with_reconciliation(
+        &mut self,
+        reason: TradeReason,
+        platform: &str,
+        side: &str,
+        requested_contracts: f64,
+        filled_contracts: f64,
+        price: f64,
+        status: TradeStatus,
+        failure_reason: Option<String>,
+        order_id: Option<String>,
+        reconciliation_pending: Option<String>,
+    ) -> u32 {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
 
@@ -198,6 +237,7 @@ impl ArbPosition {
             status,
             failure_reason,
             order_id,
+            reconciliation_pending,
         };
 
         self.trades.push(trade);
@@ -249,9 +289,52 @@ impl ArbPosition {
             // NO won: Kalshi NO + Poly NO pay out
             self.kalshi_no.contracts + self.poly_no.contracts
         };
-        
+
         self.realized_pnl = Some(payout - self.total_cost());
         self.status = "resolved".to_string();
+    }
+
+    /// Check if this position should be marked as failed.
+    /// A position is failed when both arb legs have been attempted but both failed
+    /// (zero contracts filled on either side).
+    pub fn should_be_marked_failed(&self) -> bool {
+        // Must have zero contracts
+        if self.total_contracts().abs() > 0.0 {
+            return false;
+        }
+
+        // Must still be "open" (not already resolved/failed)
+        if self.status != "open" {
+            return false;
+        }
+
+        // Check if we have both arb leg attempts
+        let has_yes_leg = self.trades.iter().any(|t| t.reason == TradeReason::ArbLegYes);
+        let has_no_leg = self.trades.iter().any(|t| t.reason == TradeReason::ArbLegNo);
+
+        if !has_yes_leg || !has_no_leg {
+            // Still waiting for both legs to be recorded
+            return false;
+        }
+
+        // Check if there are any pending reconciliations (don't mark failed if we're waiting for Poly)
+        let has_pending_reconciliation = self.trades.iter().any(|t| t.reconciliation_pending.is_some());
+        if has_pending_reconciliation {
+            return false;
+        }
+
+        // All arb leg trades must have failed (no successful or partial fills)
+        let all_arb_legs_failed = self.trades.iter()
+            .filter(|t| matches!(t.reason, TradeReason::ArbLegYes | TradeReason::ArbLegNo))
+            .all(|t| matches!(t.status, TradeStatus::Failed | TradeStatus::Blocked));
+
+        all_arb_legs_failed
+    }
+
+    /// Mark position as failed (both legs failed, no position taken)
+    pub fn mark_failed(&mut self) {
+        self.status = "failed".to_string();
+        self.realized_pnl = Some(0.0); // No P&L since no position was taken
     }
 }
 
@@ -286,24 +369,12 @@ pub struct PositionSummary {
 pub struct PositionTracker {
     /// All positions keyed by market_id
     positions: HashMap<String, ArbPosition>,
-
-    /// Daily realized P&L
-    pub daily_realized_pnl: f64,
-
-    /// Daily trading date (for reset)
-    pub trading_date: String,
-
-    /// Cumulative all-time P&L
-    pub all_time_pnl: f64,
 }
 
 /// Data structure for serialization
 #[derive(Serialize)]
 struct SaveData {
     positions: HashMap<String, ArbPosition>,
-    daily_realized_pnl: f64,
-    trading_date: String,
-    all_time_pnl: f64,
 }
 
 impl Default for PositionTracker {
@@ -317,9 +388,6 @@ impl PositionTracker {
     pub fn new() -> Self {
         Self {
             positions: HashMap::new(),
-            daily_realized_pnl: 0.0,
-            trading_date: today_string(),
-            all_time_pnl: 0.0,
         }
     }
     
@@ -332,15 +400,8 @@ impl PositionTracker {
         match std::fs::read_to_string(path.as_ref()) {
             Ok(contents) => {
                 match serde_json::from_str::<Self>(&contents) {
-                    Ok(mut tracker) => {
-                        // Check if we need to reset daily P&L
-                        let today = today_string();
-                        if tracker.trading_date != today {
-                            info!("[POSITIONS] New trading day, resetting daily P&L");
-                            tracker.daily_realized_pnl = 0.0;
-                            tracker.trading_date = today;
-                        }
-                        info!("[POSITIONS] Loaded {} positions from {:?}", 
+                    Ok(tracker) => {
+                        info!("[POSITIONS] Loaded {} positions from {:?}",
                               tracker.positions.len(), path.as_ref());
                         tracker
                     }
@@ -373,9 +434,6 @@ impl PositionTracker {
         // Clone data for serialization
         let data = SaveData {
             positions: self.positions.clone(),
-            daily_realized_pnl: self.daily_realized_pnl,
-            trading_date: self.trading_date.clone(),
-            all_time_pnl: self.all_time_pnl,
         };
         // Try to spawn on runtime; if no runtime, save synchronously
         let path = crate::paths::resolve_workspace_file(POSITION_FILE);
@@ -419,8 +477,8 @@ impl PositionTracker {
 
         position.total_fees += fill.fees;
 
-        // Record in trade history
-        position.record_trade(
+        // Record in trade history (with reconciliation_pending if set)
+        position.record_trade_with_reconciliation(
             fill.reason.clone(),
             &fill.platform,
             &fill.side,
@@ -430,12 +488,21 @@ impl PositionTracker {
             fill.status.clone(),
             fill.failure_reason.clone(),
             if fill.order_id.is_empty() { None } else { Some(fill.order_id.clone()) },
+            fill.reconciliation_pending.clone(),
         );
 
-        info!("[POSITIONS] Recorded fill: {} {} {} @{:.1}¢ x{:.0} (fees: ${:.4}) [reason={:?}, status={:?}]",
+        let pending_str = if fill.reconciliation_pending.is_some() { " [RECONCILIATION_PENDING]" } else { "" };
+        info!("[POSITIONS] Recorded fill: {} {} {} @{:.1}¢ x{:.0} (fees: ${:.4}) [reason={:?}, status={:?}]{}",
               fill.platform, fill.side, fill.market_id,
               fill.price * 100.0, fill.contracts, fill.fees,
-              fill.reason, fill.status);
+              fill.reason, fill.status, pending_str);
+
+        // Check if the position should be marked as failed (both legs attempted, both failed)
+        if position.should_be_marked_failed() {
+            position.mark_failed();
+            info!("[POSITIONS] Position {} marked as failed (both legs failed, no contracts filled)",
+                  fill.market_id);
+        }
     }
     
     /// Get or create position for a market
@@ -455,13 +522,10 @@ impl PositionTracker {
         if let Some(position) = self.positions.get_mut(market_id) {
             position.resolve(yes_won);
             let pnl = position.realized_pnl.unwrap_or(0.0);
-            
-            self.daily_realized_pnl += pnl;
-            self.all_time_pnl += pnl;
-            
+
             info!("[POSITIONS] Resolved {}: {} won, P&L: ${:.2}",
                   market_id, if yes_won { "YES" } else { "NO" }, pnl);
-            
+
             self.save_async();
             Some(pnl)
         } else {
@@ -499,18 +563,59 @@ impl PositionTracker {
             .filter(|p| p.status == "open")
             .collect()
     }
-    
-    /// Daily P&L (realized only)
-    pub fn daily_pnl(&self) -> f64 {
-        self.daily_realized_pnl
+
+    /// Clear the reconciliation_pending marker for all trades with the given poly_order_id.
+    /// Called after reconciliation completes (either successfully or after giving up).
+    pub fn clear_reconciliation_pending(&mut self, poly_order_id: &str) {
+        let mut cleared_count = 0;
+        for position in self.positions.values_mut() {
+            for trade in position.trades.iter_mut() {
+                if trade.reconciliation_pending.as_deref() == Some(poly_order_id) {
+                    trade.reconciliation_pending = None;
+                    cleared_count += 1;
+                }
+            }
+        }
+        if cleared_count > 0 {
+            info!("[POSITIONS] Cleared reconciliation_pending for {} trades (poly_order_id={})",
+                  cleared_count, poly_order_id);
+            self.save_async();
+        }
     }
-    
-    /// Reset daily counters (call at midnight)
-    pub fn reset_daily(&mut self) {
-        self.daily_realized_pnl = 0.0;
-        self.trading_date = today_string();
-        self.save_async();
+
+    /// Check for any pending reconciliations from a previous session and log a warning banner.
+    /// Should be called on startup to alert about incomplete reconciliations.
+    pub fn check_pending_reconciliations(&self) {
+        let mut pending_reconciliations: Vec<(&str, &str, f64)> = Vec::new();
+
+        for position in self.positions.values() {
+            for trade in &position.trades {
+                // Check if this trade has a pending reconciliation marker
+                if let Some(ref poly_order_id) = trade.reconciliation_pending {
+                    pending_reconciliations.push((
+                        &position.market_id,
+                        poly_order_id.as_str(),
+                        trade.filled_contracts,
+                    ));
+                }
+            }
+        }
+
+        if !pending_reconciliations.is_empty() {
+            tracing::error!("╔══════════════════════════════════════════════════════════════╗");
+            tracing::error!("║  ⚠️  PENDING RECONCILIATIONS DETECTED FROM PREVIOUS SESSION  ║");
+            tracing::error!("╠══════════════════════════════════════════════════════════════╣");
+            for (market_id, poly_order_id, filled) in &pending_reconciliations {
+                tracing::error!("║  Poly Order: {}", poly_order_id);
+                tracing::error!("║  Market: {} | Kalshi filled: {}", market_id, filled);
+            }
+            tracing::error!("╠══════════════════════════════════════════════════════════════╣");
+            tracing::error!("║  ACTION REQUIRED: Manually verify Polymarket order status    ║");
+            tracing::error!("║  and reconcile positions before continuing trading.          ║");
+            tracing::error!("╚══════════════════════════════════════════════════════════════╝");
+        }
     }
+
 }
 
 /// Record of a single fill (used for position updates and trade history)
@@ -534,6 +639,8 @@ pub struct FillRecord {
     pub status: TradeStatus,
     /// If failed/blocked, the reason why
     pub failure_reason: Option<String>,
+    /// If Some(poly_order_id), this fill is pending reconciliation with a delayed Polymarket order
+    pub reconciliation_pending: Option<String>,
 }
 
 impl FillRecord {
@@ -574,6 +681,7 @@ impl FillRecord {
             requested_contracts: contracts, // For legacy API, assume requested = filled
             status: if contracts.abs() > 0.0 { TradeStatus::Success } else { TradeStatus::Failed },
             failure_reason: None,
+            reconciliation_pending: None,
         }
     }
 
@@ -607,6 +715,42 @@ impl FillRecord {
             requested_contracts,
             status,
             failure_reason,
+            reconciliation_pending: None,
+        }
+    }
+
+    /// Create a FillRecord with a pending reconciliation marker
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_pending_reconciliation(
+        market_id: &str,
+        description: &str,
+        platform: &str,
+        side: &str,
+        requested_contracts: f64,
+        filled_contracts: f64,
+        price: f64,
+        fees: f64,
+        order_id: &str,
+        reason: TradeReason,
+        status: TradeStatus,
+        failure_reason: Option<String>,
+        poly_order_id: String,
+    ) -> Self {
+        Self {
+            market_id: market_id.to_string(),
+            description: description.to_string(),
+            platform: platform.to_string(),
+            side: side.to_string(),
+            contracts: filled_contracts,
+            price,
+            fees,
+            order_id: order_id.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            reason,
+            requested_contracts,
+            status,
+            failure_reason,
+            reconciliation_pending: Some(poly_order_id),
         }
     }
 }
@@ -619,56 +763,93 @@ pub fn create_position_tracker() -> SharedPositionTracker {
     Arc::new(RwLock::new(PositionTracker::load()))
 }
 
-fn today_string() -> String {
-    chrono::Utc::now().format("%Y-%m-%d").to_string()
+/// Messages sent through the position channel
+#[derive(Debug, Clone)]
+pub enum PositionMessage {
+    /// Record a fill
+    Fill(FillRecord),
+    /// Clear the reconciliation_pending marker for fills with this poly_order_id
+    ClearReconciliationPending(String),
 }
 
 #[derive(Clone)]
 pub struct PositionChannel {
-    tx: mpsc::UnboundedSender<FillRecord>,
+    tx: mpsc::UnboundedSender<PositionMessage>,
 }
 
 impl PositionChannel {
-    pub fn new(tx: mpsc::UnboundedSender<FillRecord>) -> Self {
+    pub fn new(tx: mpsc::UnboundedSender<PositionMessage>) -> Self {
         Self { tx }
     }
 
     #[inline]
     pub fn record_fill(&self, fill: FillRecord) {
-        if let Err(e) = self.tx.send(fill) {
+        if let Err(e) = self.tx.send(PositionMessage::Fill(fill)) {
             // This is critical - losing fills means incorrect P&L and audit trail
             tracing::error!(
-                "[POSITION] Failed to record fill - DATA LOSS! Fill: {:?}, Error: {}",
+                "[POSITION] Failed to record fill - DATA LOSS! Message: {:?}, Error: {}",
+                e.0, e
+            );
+        }
+    }
+
+    /// Clear the reconciliation_pending marker for fills associated with this poly_order_id.
+    /// Called after reconciliation completes (either successfully or after giving up).
+    #[inline]
+    pub fn clear_reconciliation_pending(&self, poly_order_id: &str) {
+        if let Err(e) = self.tx.send(PositionMessage::ClearReconciliationPending(poly_order_id.to_string())) {
+            tracing::error!(
+                "[POSITION] Failed to clear reconciliation pending - Message: {:?}, Error: {}",
                 e.0, e
             );
         }
     }
 }
 
-pub fn create_position_channel() -> (PositionChannel, mpsc::UnboundedReceiver<FillRecord>) {
+pub fn create_position_channel() -> (PositionChannel, mpsc::UnboundedReceiver<PositionMessage>) {
     let (tx, rx) = mpsc::unbounded_channel();
     (PositionChannel::new(tx), rx)
 }
 
 pub async fn position_writer_loop(
-    mut rx: mpsc::UnboundedReceiver<FillRecord>,
+    mut rx: mpsc::UnboundedReceiver<PositionMessage>,
     tracker: Arc<RwLock<PositionTracker>>,
 ) {
-    let mut batch = Vec::with_capacity(16);
+    let mut batch: Vec<FillRecord> = Vec::with_capacity(16);
     let mut interval = tokio::time::interval(Duration::from_millis(100));
 
     loop {
         tokio::select! {
             biased;
 
-            Some(fill) = rx.recv() => {
-                batch.push(fill);
-                if batch.len() >= 16 {
-                    let mut guard = tracker.write().await;
-                    for fill in batch.drain(..) {
-                        guard.record_fill_internal(&fill);
+            Some(msg) = rx.recv() => {
+                match msg {
+                    PositionMessage::Fill(fill) => {
+                        batch.push(fill);
+                        if batch.len() >= 16 {
+                            let mut guard = tracker.write().await;
+                            for fill in batch.drain(..) {
+                                guard.record_fill_internal(&fill);
+                            }
+                            guard.save_async();
+                        }
                     }
-                    guard.save_async();
+                    PositionMessage::ClearReconciliationPending(poly_order_id) => {
+                        // Acquire lock once for both operations
+                        let mut guard = tracker.write().await;
+                        // Flush any pending fills first
+                        let had_fills = !batch.is_empty();
+                        for fill in batch.drain(..) {
+                            guard.record_fill_internal(&fill);
+                        }
+                        // Clear the reconciliation marker
+                        guard.clear_reconciliation_pending(&poly_order_id);
+                        // Ensure we save if we flushed fills (clear_reconciliation_pending
+                        // only saves if markers were cleared, but flushed fills need saving too)
+                        if had_fills {
+                            guard.save_async();
+                        }
+                    }
                 }
             }
             _ = interval.tick() => {
@@ -1043,5 +1224,365 @@ mod tests {
         // +10 - 7 - 3 = 0
         let net = pos.poly_yes.contracts;
         assert!(net.abs() < 0.001, "Net position should be 0, got {}", net);
+    }
+
+    // =========================================================================
+    // RECONCILIATION PENDING TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_reconciliation_pending_field_on_fill_record() {
+        let mut tracker = PositionTracker::new();
+
+        // Record a fill with pending reconciliation
+        let fill = FillRecord::with_pending_reconciliation(
+            "TEST-MARKET",
+            "Test Market",
+            "kalshi",
+            "no",
+            10.0,
+            10.0,
+            0.50,
+            0.0,
+            "kalshi-order-123",
+            TradeReason::ArbLegNo,
+            TradeStatus::Success,
+            None,
+            "poly-order-456".to_string(),
+        );
+        tracker.record_fill_internal(&fill);
+
+        let pos = tracker.get("TEST-MARKET").expect("Position should exist");
+        assert_eq!(pos.trades.len(), 1);
+
+        let trade = &pos.trades[0];
+        assert_eq!(trade.reconciliation_pending, Some("poly-order-456".to_string()));
+    }
+
+    #[test]
+    fn test_clear_reconciliation_pending() {
+        let mut tracker = PositionTracker::new();
+
+        // Record two fills with the same pending reconciliation
+        let fill1 = FillRecord::with_pending_reconciliation(
+            "TEST-MARKET-1",
+            "Test Market 1",
+            "kalshi",
+            "no",
+            10.0,
+            10.0,
+            0.50,
+            0.0,
+            "kalshi-order-1",
+            TradeReason::ArbLegNo,
+            TradeStatus::Success,
+            None,
+            "poly-order-ABC".to_string(),
+        );
+        tracker.record_fill_internal(&fill1);
+
+        // Record another fill without pending reconciliation
+        let fill2 = FillRecord::with_details(
+            "TEST-MARKET-2",
+            "Test Market 2",
+            "kalshi",
+            "yes",
+            5.0,
+            5.0,
+            0.30,
+            0.0,
+            "kalshi-order-2",
+            TradeReason::ArbLegYes,
+            TradeStatus::Success,
+            None,
+        );
+        tracker.record_fill_internal(&fill2);
+
+        // Verify pending is set
+        let pos1 = tracker.get("TEST-MARKET-1").unwrap();
+        assert_eq!(pos1.trades[0].reconciliation_pending, Some("poly-order-ABC".to_string()));
+
+        let pos2 = tracker.get("TEST-MARKET-2").unwrap();
+        assert!(pos2.trades[0].reconciliation_pending.is_none());
+
+        // Clear the pending reconciliation
+        tracker.clear_reconciliation_pending("poly-order-ABC");
+
+        // Verify it's cleared
+        let pos1 = tracker.get("TEST-MARKET-1").unwrap();
+        assert!(pos1.trades[0].reconciliation_pending.is_none());
+
+        // Verify other trades are unaffected
+        let pos2 = tracker.get("TEST-MARKET-2").unwrap();
+        assert!(pos2.trades[0].reconciliation_pending.is_none());
+    }
+
+    #[test]
+    fn test_check_pending_reconciliations_empty() {
+        let tracker = PositionTracker::new();
+        // Should not panic or log errors for empty tracker
+        tracker.check_pending_reconciliations();
+    }
+
+    #[test]
+    fn test_check_pending_reconciliations_with_pending() {
+        let mut tracker = PositionTracker::new();
+
+        // Record a fill with pending reconciliation
+        let fill = FillRecord::with_pending_reconciliation(
+            "TEST-MARKET",
+            "Test Market",
+            "kalshi",
+            "no",
+            10.0,
+            10.0,
+            0.50,
+            0.0,
+            "kalshi-order-123",
+            TradeReason::ArbLegNo,
+            TradeStatus::Success,
+            None,
+            "poly-order-789".to_string(),
+        );
+        tracker.record_fill_internal(&fill);
+
+        // This should log an error banner (we can't easily verify logging in tests,
+        // but we verify it doesn't panic)
+        tracker.check_pending_reconciliations();
+    }
+
+    #[test]
+    fn test_reconciliation_pending_serialization() {
+        let mut tracker = PositionTracker::new();
+
+        // Record a fill with pending reconciliation
+        let fill = FillRecord::with_pending_reconciliation(
+            "TEST-MARKET",
+            "Test Market",
+            "kalshi",
+            "no",
+            10.0,
+            10.0,
+            0.50,
+            0.0,
+            "kalshi-order-123",
+            TradeReason::ArbLegNo,
+            TradeStatus::Success,
+            None,
+            "poly-order-XYZ".to_string(),
+        );
+        tracker.record_fill_internal(&fill);
+
+        // Serialize to JSON
+        let json = serde_json::to_string_pretty(&tracker).expect("Should serialize");
+
+        // Verify the reconciliation_pending field is present
+        assert!(json.contains("reconciliation_pending"));
+        assert!(json.contains("poly-order-XYZ"));
+
+        // Deserialize back
+        let loaded: PositionTracker = serde_json::from_str(&json).expect("Should deserialize");
+        let pos = loaded.get("TEST-MARKET").expect("Position should exist");
+        assert_eq!(pos.trades[0].reconciliation_pending, Some("poly-order-XYZ".to_string()));
+    }
+
+    #[test]
+    fn test_reconciliation_pending_none_not_serialized() {
+        let mut tracker = PositionTracker::new();
+
+        // Record a fill without pending reconciliation
+        let fill = FillRecord::with_details(
+            "TEST-MARKET",
+            "Test Market",
+            "kalshi",
+            "no",
+            10.0,
+            10.0,
+            0.50,
+            0.0,
+            "kalshi-order-123",
+            TradeReason::ArbLegNo,
+            TradeStatus::Success,
+            None,
+        );
+        tracker.record_fill_internal(&fill);
+
+        // Serialize to JSON
+        let json = serde_json::to_string_pretty(&tracker).expect("Should serialize");
+
+        // The reconciliation_pending field should NOT be present when None
+        // (due to skip_serializing_if = "Option::is_none")
+        assert!(!json.contains("reconciliation_pending"));
+    }
+
+    // =========================================================================
+    // FAILED POSITION TESTS (both legs fail)
+    // =========================================================================
+
+    #[test]
+    fn test_position_marked_failed_when_both_legs_fail() {
+        let mut tracker = PositionTracker::new();
+
+        // Record YES leg failure
+        let yes_fill = FillRecord::with_details(
+            "TEST-MARKET",
+            "Test Market",
+            "kalshi",
+            "yes",
+            10.0,  // requested
+            0.0,   // filled (failed)
+            0.80,
+            0.0,
+            "",
+            TradeReason::ArbLegYes,
+            TradeStatus::Failed,
+            Some("No fill".to_string()),
+        );
+        tracker.record_fill_internal(&yes_fill);
+
+        // After first leg, position should still be "open" (waiting for second leg)
+        let pos = tracker.get("TEST-MARKET").expect("Position should exist");
+        assert_eq!(pos.status, "open", "Position should still be open after first leg");
+
+        // Record NO leg failure
+        let no_fill = FillRecord::with_details(
+            "TEST-MARKET",
+            "Test Market",
+            "polymarket",
+            "no",
+            10.0,  // requested
+            0.0,   // filled (failed)
+            0.14,
+            0.0,
+            "",
+            TradeReason::ArbLegNo,
+            TradeStatus::Failed,
+            Some("No fill".to_string()),
+        );
+        tracker.record_fill_internal(&no_fill);
+
+        // After both legs fail, position should be marked as "failed"
+        let pos = tracker.get("TEST-MARKET").expect("Position should exist");
+        assert_eq!(pos.status, "failed", "Position should be marked as failed when both legs fail");
+        assert_eq!(pos.realized_pnl, Some(0.0), "P&L should be 0 for failed position");
+        assert_eq!(pos.total_contracts(), 0.0, "Should have no contracts");
+    }
+
+    #[test]
+    fn test_position_stays_open_when_one_leg_fills() {
+        let mut tracker = PositionTracker::new();
+
+        // Record YES leg success
+        let yes_fill = FillRecord::with_details(
+            "TEST-MARKET",
+            "Test Market",
+            "kalshi",
+            "yes",
+            10.0,
+            10.0,  // filled successfully
+            0.80,
+            0.0,
+            "order-123",
+            TradeReason::ArbLegYes,
+            TradeStatus::Success,
+            None,
+        );
+        tracker.record_fill_internal(&yes_fill);
+
+        // Record NO leg failure
+        let no_fill = FillRecord::with_details(
+            "TEST-MARKET",
+            "Test Market",
+            "polymarket",
+            "no",
+            10.0,
+            0.0,   // failed
+            0.14,
+            0.0,
+            "",
+            TradeReason::ArbLegNo,
+            TradeStatus::Failed,
+            Some("No fill".to_string()),
+        );
+        tracker.record_fill_internal(&no_fill);
+
+        // Position should stay "open" because one leg filled (needs auto-close)
+        let pos = tracker.get("TEST-MARKET").expect("Position should exist");
+        assert_eq!(pos.status, "open", "Position should stay open when one leg fills");
+        assert!(pos.total_contracts() > 0.0, "Should have contracts from successful leg");
+    }
+
+    #[test]
+    fn test_position_not_marked_failed_with_pending_reconciliation() {
+        let mut tracker = PositionTracker::new();
+
+        // Record YES leg with pending reconciliation (Kalshi filled, waiting for Poly delayed order)
+        let yes_fill = FillRecord::with_pending_reconciliation(
+            "TEST-MARKET",
+            "Test Market",
+            "kalshi",
+            "yes",
+            10.0,
+            10.0,  // Kalshi filled
+            0.80,
+            0.0,
+            "kalshi-order-123",
+            TradeReason::ArbLegYes,
+            TradeStatus::Success,
+            None,
+            "poly-delayed-456".to_string(),
+        );
+        tracker.record_fill_internal(&yes_fill);
+
+        // Record NO leg as "failed" (Poly returned delayed, recorded as 0 fill temporarily)
+        let no_fill = FillRecord::with_details(
+            "TEST-MARKET",
+            "Test Market",
+            "polymarket",
+            "no",
+            10.0,
+            0.0,   // Pending reconciliation
+            0.14,
+            0.0,
+            "poly-delayed-456",
+            TradeReason::ArbLegNo,
+            TradeStatus::Failed,
+            Some("Delayed".to_string()),
+        );
+        tracker.record_fill_internal(&no_fill);
+
+        // Position should NOT be marked failed because there's a pending reconciliation
+        let pos = tracker.get("TEST-MARKET").expect("Position should exist");
+        assert_eq!(pos.status, "open", "Position should stay open with pending reconciliation");
+    }
+
+    #[test]
+    fn test_should_be_marked_failed_logic() {
+        let mut pos = ArbPosition::new("TEST-MARKET", "Test");
+
+        // Empty position should not be marked failed (no legs recorded)
+        assert!(!pos.should_be_marked_failed(), "Empty position should not be failed");
+
+        // Add only YES leg failure
+        pos.record_trade(
+            TradeReason::ArbLegYes,
+            "kalshi", "yes",
+            10.0, 0.0, 0.80,
+            TradeStatus::Failed,
+            Some("No fill".to_string()),
+            None,
+        );
+        assert!(!pos.should_be_marked_failed(), "Position with only one leg should not be failed");
+
+        // Add NO leg failure
+        pos.record_trade(
+            TradeReason::ArbLegNo,
+            "polymarket", "no",
+            10.0, 0.0, 0.14,
+            TradeStatus::Failed,
+            Some("No fill".to_string()),
+            None,
+        );
+        assert!(pos.should_be_marked_failed(), "Position with both legs failed should be marked failed");
     }
 }

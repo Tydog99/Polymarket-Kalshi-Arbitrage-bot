@@ -148,7 +148,7 @@ impl HybridExecutor {
             return Ok(());
         }
 
-        let mut max_contracts = (req.yes_size.min(req.no_size) / 100) as i64;
+        let mut max_contracts = req.max_contracts() as i64;
         if max_contracts < 1 {
             self.release_in_flight_delayed(market_id);
             return Ok(());
