@@ -17,6 +17,7 @@ fi
 cat > /etc/profile.d/arb-env.sh << 'EOF'
 export KALSHI_PRIVATE_KEY_PATH="/data/kalshi.pem"
 export KALSHI_PRIVATE_KEY=$(echo "$KALSHI_KEY_B64" | base64 -d)
+alias execute-controler="CAPTURE_DIR=./.captures CAPTURE_FILTER=all CONTROLLER_PLATFORMS=kalshi,polymarket DRY_RUN=0 controller --controller-platforms=kalshi,polymarket"
 EOF
 
 # Start Tailscale daemon
