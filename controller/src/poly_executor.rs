@@ -39,6 +39,22 @@ pub trait PolyExecutor: Send + Sync {
     /// # Returns
     /// `PolyFillAsync` with order_id, filled_size, and fill_cost
     async fn sell_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync>;
+
+    /// Poll a delayed order until it reaches a terminal state or times out.
+    ///
+    /// # Arguments
+    /// * `order_id` - The Polymarket order ID to poll
+    /// * `price` - Original order price (used to compute fill cost)
+    /// * `timeout_ms` - Maximum time to poll before giving up
+    ///
+    /// # Returns
+    /// `(size_matched, fill_cost)` - For canceled/expired orders, returns (0.0, 0.0)
+    async fn poll_delayed_order(
+        &self,
+        order_id: &str,
+        price: f64,
+        timeout_ms: u64,
+    ) -> Result<(f64, f64)>;
 }
 
 // =============================================================================
@@ -68,6 +84,17 @@ pub mod mock {
         Error(String),
     }
 
+    /// Response for delayed order polling.
+    #[derive(Clone, Debug)]
+    pub enum MockDelayedResponse {
+        /// Order filled with given size
+        Filled { size: f64 },
+        /// Order canceled/expired (no fill)
+        NoFill,
+        /// Timeout (still pending)
+        Timeout,
+    }
+
     /// Record of a call to the mock client.
     #[derive(Clone, Debug)]
     pub struct MockCall {
@@ -84,6 +111,7 @@ pub mod mock {
     /// Also tracks all calls for verification in tests.
     pub struct MockPolyClient {
         responses: RwLock<HashMap<String, MockResponse>>,
+        delayed_responses: RwLock<HashMap<String, MockDelayedResponse>>,
         calls: RwLock<Vec<MockCall>>,
     }
 
@@ -92,6 +120,7 @@ pub mod mock {
         pub fn new() -> Self {
             Self {
                 responses: RwLock::new(HashMap::new()),
+                delayed_responses: RwLock::new(HashMap::new()),
                 calls: RwLock::new(Vec::new()),
             }
         }
@@ -144,6 +173,18 @@ pub mod mock {
             let responses = self.responses.read().unwrap();
             responses.get(token_id).cloned()
         }
+
+        /// Configure a delayed order response (for poll_delayed_order).
+        pub fn set_delayed_response(&self, order_id: &str, response: MockDelayedResponse) {
+            let mut delayed = self.delayed_responses.write().unwrap();
+            delayed.insert(order_id.to_string(), response);
+        }
+
+        /// Get the configured delayed response for an order.
+        fn get_delayed_response(&self, order_id: &str) -> Option<MockDelayedResponse> {
+            let delayed = self.delayed_responses.read().unwrap();
+            delayed.get(order_id).cloned()
+        }
     }
 
     impl Default for MockPolyClient {
@@ -191,6 +232,29 @@ pub mod mock {
                 }),
                 Some(MockResponse::Error(msg)) => Err(anyhow!("Mock error: {}", msg)),
                 None => Err(anyhow!("No mock response configured for token: {}", token_id)),
+            }
+        }
+
+        async fn poll_delayed_order(
+            &self,
+            order_id: &str,
+            price: f64,
+            _timeout_ms: u64,
+        ) -> Result<(f64, f64)> {
+            match self.get_delayed_response(order_id) {
+                Some(MockDelayedResponse::Filled { size }) => {
+                    Ok((size, size * price))
+                }
+                Some(MockDelayedResponse::NoFill) => {
+                    Ok((0.0, 0.0))
+                }
+                Some(MockDelayedResponse::Timeout) => {
+                    Err(anyhow!("Order {} still pending after timeout", order_id))
+                }
+                None => {
+                    // Default to NoFill if not configured
+                    Ok((0.0, 0.0))
+                }
             }
         }
     }

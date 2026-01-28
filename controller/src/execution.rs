@@ -420,30 +420,30 @@ impl ExecutionEngine {
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(5000);
 
-                    // TODO: Task 5 will implement reconcile_delayed_poly()
-                    // For now, spawn a stub that logs the TODO
-                    let _poly_order_id_for_spawn = poly_order_id.clone();
-                    let _poly_side_for_spawn = poly_side.to_string();
-                    let _position_id_for_spawn = position_id.clone();
-                    let _timeout_ms_for_spawn = timeout_ms;
-                    let _position_channel_for_spawn = self.position_channel.clone();
-                    let _poly_async_for_spawn = self.poly_async.clone();
-                    let _kalshi_filled_for_spawn = kalshi_filled;
-                    let _poly_price_for_spawn = if poly_side == "yes" { req.yes_price } else { req.no_price };
+                    // Clone values needed for the background reconciliation task
+                    let poly_async_for_spawn = self.poly_async.clone();
+                    let kalshi_for_spawn = self.kalshi.clone();
+                    let position_channel_for_spawn = self.position_channel.clone();
+                    let position_id_for_spawn = position_id.clone();
+                    let description_for_spawn = pair.description.clone();
+                    let kalshi_ticker_for_spawn = pair.kalshi_market_ticker.clone();
+                    let arb_type_for_spawn = req.arb_type;
+                    let poly_price_for_spawn = if poly_side == "yes" { req.yes_price } else { req.no_price };
 
                     tokio::spawn(async move {
-                        // TODO: Implement reconcile_delayed_poly() in Task 5
-                        // reconcile_delayed_poly(
-                        //     _poly_async_for_spawn,
-                        //     _position_channel_for_spawn,
-                        //     _poly_order_id_for_spawn,
-                        //     _poly_side_for_spawn,
-                        //     _position_id_for_spawn,
-                        //     _kalshi_filled_for_spawn,
-                        //     _poly_price_for_spawn,
-                        //     _timeout_ms_for_spawn,
-                        // ).await;
-                        warn!("[EXEC] TODO: reconcile_delayed_poly() not yet implemented (Task 5)");
+                        reconcile_delayed_poly(
+                            poly_async_for_spawn,
+                            kalshi_for_spawn,
+                            poly_order_id,
+                            poly_price_for_spawn,
+                            kalshi_filled,
+                            position_id_for_spawn,
+                            description_for_spawn,
+                            kalshi_ticker_for_spawn,
+                            arb_type_for_spawn,
+                            position_channel_for_spawn,
+                            timeout_ms,
+                        ).await;
                     });
 
                     // Return early with success (reconciliation will update position tracker later)
@@ -1158,6 +1158,204 @@ impl ExecutionEngine {
                 in_flight[slot].fetch_and(mask, Ordering::Release);
             });
         }
+    }
+}
+
+// =============================================================================
+// DELAYED ORDER RECONCILIATION
+// =============================================================================
+
+/// Reconcile a delayed Polymarket order by polling until terminal state.
+///
+/// This function is spawned as a background task when Polymarket returns status="delayed".
+/// It polls the order status and, upon resolution:
+/// 1. Records the Poly fill (or no-fill) to the position tracker
+/// 2. Clears the reconciliation_pending marker
+/// 3. If there's a mismatch with Kalshi fills, unwinds the excess Kalshi position
+///
+/// # Arguments
+/// * `poly_async` - Polymarket executor for polling
+/// * `kalshi` - Kalshi client for unwinding excess positions
+/// * `poly_order_id` - The delayed Polymarket order ID to poll
+/// * `poly_price_cents` - Original order price in cents
+/// * `kalshi_filled` - Number of contracts filled on Kalshi
+/// * `position_id` - Position ID for fill recording
+/// * `description` - Market description for fill recording
+/// * `kalshi_ticker` - Kalshi market ticker for unwinding
+/// * `arb_type` - Type of arbitrage (determines which side to unwind)
+/// * `position_channel` - Channel to send fill records
+/// * `timeout_ms` - Maximum time to poll before giving up
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_delayed_poly(
+    poly_async: Arc<dyn PolyExecutor>,
+    kalshi: Arc<KalshiApiClient>,
+    poly_order_id: String,
+    poly_price_cents: u16,
+    kalshi_filled: i64,
+    position_id: Arc<str>,
+    description: Arc<str>,
+    kalshi_ticker: Arc<str>,
+    arb_type: ArbType,
+    position_channel: PositionChannel,
+    timeout_ms: u64,
+) {
+    info!(
+        "[RECONCILE] Polling Poly order {} (Kalshi filled {})",
+        poly_order_id, kalshi_filled
+    );
+
+    // Convert price to decimal for API
+    let price_decimal = cents_to_price(poly_price_cents);
+
+    // Poll until terminal state or timeout
+    let poll_result = poly_async
+        .poll_delayed_order(&poly_order_id, price_decimal, timeout_ms)
+        .await;
+
+    let (poly_filled, poly_cost) = match poll_result {
+        Ok((filled, cost)) => {
+            info!(
+                "[RECONCILE] Poly {} resolved: filled={:.0}, cost=${:.2}",
+                poly_order_id, filled, cost
+            );
+            (filled as i64, (cost * 100.0) as i64) // Convert to cents
+        }
+        Err(e) => {
+            warn!(
+                "[RECONCILE] Timeout polling {}: {} - assuming no fill",
+                poly_order_id, e
+            );
+            (0, 0)
+        }
+    };
+
+    // Determine which side the Poly order was for
+    let poly_side = match arb_type {
+        ArbType::PolyYesKalshiNo => "yes",
+        ArbType::KalshiYesPolyNo => "no",
+        ArbType::PolyOnly => "yes", // PolyOnly defaults to YES as primary (rare case)
+        ArbType::KalshiOnly => unreachable!("KalshiOnly should never have delayed Poly orders"),
+    };
+
+    // Record Poly fill (or no-fill)
+    if poly_filled > 0 {
+        let poly_price = poly_cost as f64 / 100.0 / poly_filled as f64;
+        position_channel.record_fill(FillRecord::with_details(
+            &position_id,
+            &description,
+            "polymarket",
+            poly_side,
+            kalshi_filled as f64, // requested (assumed same as Kalshi)
+            poly_filled as f64,
+            poly_price,
+            0.0, // Polymarket has zero fees
+            &poly_order_id,
+            if poly_side == "yes" { TradeReason::ArbLegYes } else { TradeReason::ArbLegNo },
+            if poly_filled == kalshi_filled { TradeStatus::Success } else { TradeStatus::PartialFill },
+            None,
+        ));
+    } else {
+        // Record the failed/no-fill
+        position_channel.record_fill(FillRecord::with_details(
+            &position_id,
+            &description,
+            "polymarket",
+            poly_side,
+            kalshi_filled as f64, // requested
+            0.0,                  // filled
+            price_decimal,
+            0.0,
+            &poly_order_id,
+            if poly_side == "yes" { TradeReason::ArbLegYes } else { TradeReason::ArbLegNo },
+            TradeStatus::Failed,
+            Some("No fill - delayed order timeout/canceled".to_string()),
+        ));
+    }
+
+    // Clear the reconciliation_pending marker
+    position_channel.clear_reconciliation_pending(&poly_order_id);
+
+    // Check for mismatch - if Kalshi filled more than Poly, we need to unwind
+    if kalshi_filled != poly_filled && kalshi_filled > 0 {
+        let excess = kalshi_filled - poly_filled;
+        warn!(
+            "[RECONCILE] Mismatch: Kalshi={} Poly={}, unwinding {} Kalshi contracts",
+            kalshi_filled, poly_filled, excess
+        );
+
+        // Determine which side to unwind on Kalshi
+        let kalshi_side = match arb_type {
+            ArbType::PolyYesKalshiNo => "no",  // Kalshi had NO
+            ArbType::KalshiYesPolyNo => "yes", // Kalshi had YES
+            ArbType::PolyOnly => return,       // No Kalshi position to unwind
+            ArbType::KalshiOnly => unreachable!(),
+        };
+
+        // Unwind the excess Kalshi position
+        // We need to sell at a price that will fill - start slightly below our buy price
+        let start_price_cents = poly_price_cents as i64; // Use Poly price as proxy
+
+        // Configuration for retry logic
+        const MIN_PRICE_CENTS: i64 = 1;
+        const PRICE_STEP_CENTS: i64 = 1;
+        const RETRY_DELAY_MS: u64 = 100;
+
+        // Record close helper (simplified version for reconciliation)
+        let record_close = |position_channel: &PositionChannel, platform: &str, side: &str,
+                           requested: f64, closed: f64, price: f64, order_id: &str, attempt: u32| {
+            let reason = if attempt == 1 {
+                TradeReason::AutoClose
+            } else {
+                TradeReason::AutoCloseRetry
+            };
+
+            let status = if closed >= requested {
+                TradeStatus::Success
+            } else if closed > 0.0 {
+                TradeStatus::PartialFill
+            } else {
+                TradeStatus::Failed
+            };
+
+            position_channel.record_fill(FillRecord::with_details(
+                &position_id, &description, platform, side,
+                -requested,
+                -closed,
+                price, 0.0, order_id,
+                reason, status,
+                if closed == 0.0 { Some("No fill".to_string()) } else { None },
+            ));
+        };
+
+        let log_final_result = |platform: &str, total_closed: i64, total_proceeds: i64, remaining: i64| {
+            if total_closed > 0 {
+                info!(
+                    "[RECONCILE] Closed {} {} contracts for {}¢",
+                    total_closed, platform, total_proceeds
+                );
+            }
+            if remaining > 0 {
+                error!(
+                    "[RECONCILE] Failed to close {} {} contracts - EXPOSURE REMAINS!",
+                    remaining, platform
+                );
+            }
+        };
+
+        // Call the existing close_kalshi_with_retry
+        ExecutionEngine::close_kalshi_with_retry(
+            &kalshi,
+            &position_channel,
+            &kalshi_ticker,
+            kalshi_side,
+            start_price_cents,
+            excess,
+            MIN_PRICE_CENTS,
+            PRICE_STEP_CENTS,
+            RETRY_DELAY_MS,
+            record_close,
+            log_final_result,
+        ).await;
     }
 }
 

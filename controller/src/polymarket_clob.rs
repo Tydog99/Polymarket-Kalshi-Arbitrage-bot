@@ -924,6 +924,15 @@ impl PolyExecutor for SharedAsyncClient {
     async fn sell_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         SharedAsyncClient::sell_fak(self, token_id, price, size).await
     }
+
+    async fn poll_delayed_order(
+        &self,
+        order_id: &str,
+        price: f64,
+        timeout_ms: u64,
+    ) -> Result<(f64, f64)> {
+        SharedAsyncClient::poll_delayed_order(self, order_id, price, timeout_ms).await
+    }
 }
 
 // ============================================================================
