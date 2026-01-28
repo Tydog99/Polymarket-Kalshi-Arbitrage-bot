@@ -82,6 +82,9 @@ pub mod mock {
         PartialFill { filled: f64, price: f64 },
         /// Order failed with error
         Error(String),
+        /// Delayed order - returns is_delayed=true with specified order_id
+        /// The actual fill will come from poll_delayed_order based on configured MockDelayedResponse
+        Delayed { order_id: String },
     }
 
     /// Response for delayed order polling.
@@ -168,6 +171,14 @@ pub mod mock {
             responses.insert(token.to_string(), MockResponse::Error(error.to_string()));
         }
 
+        /// Configure a delayed order response for a token.
+        /// The order_id will be returned immediately with is_delayed=true.
+        /// Use set_delayed_response to configure what poll_delayed_order returns for this order_id.
+        pub fn set_delayed_order(&self, token: &str, order_id: &str) {
+            let mut responses = self.responses.write().unwrap();
+            responses.insert(token.to_string(), MockResponse::Delayed { order_id: order_id.to_string() });
+        }
+
         /// Get the configured response for a token.
         fn get_response(&self, token_id: &str) -> Option<MockResponse> {
             let responses = self.responses.read().unwrap();
@@ -211,6 +222,12 @@ pub mod mock {
                     is_delayed: false,
                 }),
                 Some(MockResponse::Error(msg)) => Err(anyhow!("Mock error: {}", msg)),
+                Some(MockResponse::Delayed { order_id }) => Ok(PolyFillAsync {
+                    order_id,
+                    filled_size: 0.0,
+                    fill_cost: 0.0,
+                    is_delayed: true,
+                }),
                 None => Err(anyhow!("No mock response configured for token: {}", token_id)),
             }
         }
@@ -231,6 +248,12 @@ pub mod mock {
                     is_delayed: false,
                 }),
                 Some(MockResponse::Error(msg)) => Err(anyhow!("Mock error: {}", msg)),
+                Some(MockResponse::Delayed { order_id }) => Ok(PolyFillAsync {
+                    order_id,
+                    filled_size: 0.0,
+                    fill_cost: 0.0,
+                    is_delayed: true,
+                }),
                 None => Err(anyhow!("No mock response configured for token: {}", token_id)),
             }
         }
