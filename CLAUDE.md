@@ -123,6 +123,37 @@ When one leg of an arbitrage fills but the other fails (creating unhedged exposu
 - `PRICE_STEP_CENTS = 1` - Decrement 1¢ per retry
 - `RETRY_DELAY_MS = 100` - Brief delay between attempts
 
+### Delayed Polymarket Order Reconciliation
+
+When Polymarket returns `status=delayed` (order accepted but not yet matched), the bot spawns a background task to poll until terminal state instead of triggering premature auto-close.
+
+**Flow:**
+
+1. Poly returns `delayed` → record Kalshi fill with `reconciliation_pending` marker
+2. Background task polls Poly order status with exponential backoff
+3. On terminal state (filled/cancelled): record Poly fill, clear pending marker
+4. On fill mismatch: unwind excess on either platform using auto-close logic
+
+```
+[EXEC] Poly order delayed, spawning reconciliation task (order_id: abc123)
+[EXEC] Reconciliation polling attempt #1 (delay: 100ms)
+[EXEC] Reconciliation polling attempt #2 (delay: 200ms)
+[EXEC] Reconciliation complete: 5 contracts filled @ 48c
+```
+
+**Configuration:** `POLY_DELAYED_TIMEOUT_MS` (default: 5000) - maximum time to poll before timing out
+
+**Startup Warning:** If the bot restarts with pending reconciliations in `positions.json`, it logs an ERROR banner requiring manual verification:
+
+```
+[ERROR] ════════════════════════════════════════════════════════════════
+[ERROR] PENDING RECONCILIATIONS DETECTED - Manual verification required!
+[ERROR] Market: KXNBAGAME-26JAN24MIAUTA has unresolved delayed orders
+[ERROR] ════════════════════════════════════════════════════════════════
+```
+
+**Known Limitation:** PolyOnly arbs (both legs on Polymarket) with delayed orders have incomplete reconciliation handling. The system logs a warning but cannot fully reconcile since both sides may be in delayed state. This is a rare edge case.
+
 ### Lock-Free Orderbook Design
 
 `AtomicOrderbook` uses a packed u64 format for cache-line efficiency:
@@ -143,6 +174,8 @@ When one leg of an arbitrage fills but the other fails (creating unhedged exposu
 - `POLY_SIGNATURE_TYPE` (default: 0) - Signature type for Polymarket orders: 0=EOA direct signing, 1=Poly proxy, 2=Gnosis Safe
 
 **Execution:** `DRY_RUN` (default: 1), `RUST_LOG` (default: info)
+
+**Polymarket reconciliation:** `POLY_DELAYED_TIMEOUT_MS` (default: 5000) - timeout for polling delayed order status
 
 **Hybrid execution:** `CONTROLLER_PLATFORMS` - comma-separated list of platforms the controller executes locally
 - `kalshi` - Execute Kalshi orders locally
