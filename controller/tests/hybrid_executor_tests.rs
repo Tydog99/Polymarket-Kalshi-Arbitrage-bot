@@ -546,13 +546,14 @@ async fn test_hybrid_executor_drops_insufficient_size_arb() {
         None,
     );
 
-    // Size too small for even 1 contract (need >= 100 cents)
+    // Size too small for even 1 contract
+    // max_contracts = min(yes_size/yes_price, no_size/no_price) = min(39/40, 49/50) = min(0, 0) = 0
     let req = ArbOpportunity {
         market_id: 0,
         yes_price: 40,
         no_price: 50,
-        yes_size: 50,  // Less than 100 cents = 0 contracts
-        no_size: 50,
+        yes_size: 39,  // 39/40 = 0 contracts
+        no_size: 49,   // 49/50 = 0 contracts
         arb_type: ArbType::PolyYesKalshiNo,
         detected_ns: 0,
         is_test: false,
