@@ -1,11 +1,22 @@
 let ws = null;
-let lastSnapshot = null;
 let lastRender = 0;
 
 const statusEl = document.getElementById("status");
 const summaryEl = document.getElementById("summary");
 const rowsEl = document.getElementById("rows");
 const filterEl = document.getElementById("filter");
+
+const marketsById = new Map();
+let meta = {
+  now_ms: 0,
+  threshold_cents: 0,
+  market_count: 0,
+  with_both_prices: 0,
+  kalshi_total_updates: 0,
+  polymarket_total_updates: 0,
+  kalshi_delta: 0,
+  polymarket_delta: 0,
+};
 
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -30,7 +41,28 @@ function connect() {
 
   ws.onmessage = (ev) => {
     try {
-      lastSnapshot = JSON.parse(ev.data);
+      const msg = JSON.parse(ev.data);
+      if (msg && msg.type === "snapshot") {
+        meta = { ...meta, ...msg };
+        marketsById.clear();
+        for (const m of msg.markets || []) {
+          if (m && m.market_id != null) marketsById.set(m.market_id, m);
+        }
+      } else if (msg && msg.type === "market_update" && msg.market) {
+        meta.now_ms = msg.now_ms || meta.now_ms;
+        meta.threshold_cents = msg.threshold_cents || meta.threshold_cents;
+        const m = msg.market;
+        if (m.market_id != null) marketsById.set(m.market_id, m);
+      } else {
+        // Back-compat: treat untyped messages as a snapshot
+        if (msg && msg.markets) {
+          meta = { ...meta, ...msg };
+          marketsById.clear();
+          for (const m of msg.markets || []) {
+            if (m && m.market_id != null) marketsById.set(m.market_id, m);
+          }
+        }
+      }
       maybeRender();
     } catch (e) {
       // ignore malformed frames
@@ -52,16 +84,19 @@ function fmtAge(nowMs, lastMs) {
 }
 
 function render() {
-  if (!lastSnapshot) return;
-  const s = lastSnapshot;
+  const s = meta;
   const filter = (filterEl.value || "").toLowerCase().trim();
 
-  summaryEl.textContent =
-    `${s.market_count} markets | both=${s.with_both_prices} | ` +
-    `Δk=${s.kalshi_delta} Δp=${s.polymarket_delta} | ` +
-    `k=${s.kalshi_total_updates} p=${s.polymarket_total_updates}`;
+  const marketsArr = Array.from(marketsById.values());
+  const marketCount = marketsArr.length;
+  const withBoth = marketsArr.reduce((acc, m) => acc + ((m.k_yes > 0 && m.k_no > 0 && m.p_yes > 0 && m.p_no > 0) ? 1 : 0), 0);
 
-  const markets = (s.markets || [])
+  summaryEl.textContent =
+    `${marketCount} markets | both=${withBoth} | ` +
+    `Δk=${s.kalshi_delta || 0} Δp=${s.polymarket_delta || 0} | ` +
+    `k=${s.kalshi_total_updates || 0} p=${s.polymarket_total_updates || 0}`;
+
+  const markets = marketsArr
     .filter((m) => {
       if (!filter) return true;
       return (m.description || "").toLowerCase().includes(filter) ||
@@ -90,10 +125,11 @@ function render() {
     const size = `${m.yes_size || 0}/${m.no_size || 0}`;
     const upd = `${m.k_updates || 0}/${m.p_updates || 0}`;
 
-    const age = `${fmtAge(s.now_ms, m.k_last_ms)} / ${fmtAge(s.now_ms, m.p_last_ms)}`;
+    const nowMs = s.now_ms || Date.now();
+    const age = `${fmtAge(nowMs, m.k_last_ms)} / ${fmtAge(nowMs, m.p_last_ms)}`;
     const ageMax = Math.max(
-      m.k_last_ms ? (s.now_ms - m.k_last_ms) : 0,
-      m.p_last_ms ? (s.now_ms - m.p_last_ms) : 0
+      m.k_last_ms ? (nowMs - m.k_last_ms) : 0,
+      m.p_last_ms ? (nowMs - m.p_last_ms) : 0
     );
     const ageClass = ageMax > 30000 ? "warn mono" : "mono";
 

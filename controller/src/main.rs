@@ -825,6 +825,22 @@ async fn main() -> Result<()> {
         None => None,
     };
 
+    // If DEBUG_WS is enabled, emit a periodic full snapshot for resync + summary.
+    // This is independent of the heartbeat loop; per-market updates are emitted from WS handlers.
+    if let Some(dbg) = debug_broadcaster.clone() {
+        let snapshot_state = state.clone();
+        tokio::spawn(async move {
+            let mut prev_k: u64 = 0;
+            let mut prev_p: u64 = 0;
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+            loop {
+                interval.tick().await;
+                let json = debug_socket::build_snapshot_json(&snapshot_state, &mut prev_k, &mut prev_p);
+                dbg.send_json(json);
+            }
+        });
+    }
+
     // Initialize execution infrastructure
     let (exec_tx, exec_rx) = create_execution_channel();
     let circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig::from_env()));
@@ -1283,6 +1299,7 @@ async fn main() -> Result<()> {
     let kalshi_clock = clock.clone();
     let kalshi_tui_state = tui_state.clone();
     let kalshi_log_tx = tui_log_tx.clone();
+    let kalshi_debug = debug_broadcaster.clone();
     let kalshi_handle = tokio::spawn(async move {
         loop {
             let shutdown_rx = kalshi_shutdown_rx.clone();
@@ -1296,6 +1313,7 @@ async fn main() -> Result<()> {
                 kalshi_clock.clone(),
                 kalshi_tui_state.clone(),
                 kalshi_log_tx.clone(),
+                kalshi_debug.clone(),
             )
             .await
             {
@@ -1320,6 +1338,7 @@ async fn main() -> Result<()> {
     let poly_clock = clock.clone();
     let poly_tui_state = tui_state.clone();
     let poly_log_tx = tui_log_tx.clone();
+    let poly_debug = debug_broadcaster.clone();
     let poly_handle = tokio::spawn(async move {
         loop {
             let shutdown_rx = poly_shutdown_rx.clone();
@@ -1332,6 +1351,7 @@ async fn main() -> Result<()> {
                 poly_clock.clone(),
                 poly_tui_state.clone(),
                 poly_log_tx.clone(),
+                poly_debug.clone(),
             )
             .await
             {
@@ -1410,7 +1430,6 @@ async fn main() -> Result<()> {
     let heartbeat_threshold = threshold_cents;
     let heartbeat_tui_state = tui_state.clone();
     let heartbeat_log_tx = tui_log_tx.clone();
-    let heartbeat_debug = debug_broadcaster.clone();
     let heartbeat_handle = tokio::spawn(async move {
         use crate::arb::kalshi_fee;
         use std::collections::HashMap;
@@ -1572,83 +1591,6 @@ async fn main() -> Result<()> {
             let poly_delta = total_poly_updates.saturating_sub(prev_poly_updates);
             prev_kalshi_updates = total_kalshi_updates;
             prev_poly_updates = total_poly_updates;
-
-            // Emit a structured snapshot for external debug consumers (web UI).
-            if verbose {
-                if let Some(ref dbg) = heartbeat_debug {
-                    #[derive(serde::Serialize)]
-                    struct MarketDetailWs<'a> {
-                        description: &'a str,
-                        league: &'a str,
-                        market_type: &'a str,
-                        k_yes: u16,
-                        k_no: u16,
-                        p_yes: u16,
-                        p_no: u16,
-                        gap_cents: Option<i16>,
-                        yes_size: u16,
-                        no_size: u16,
-                        k_updates: u32,
-                        p_updates: u32,
-                        k_last_ms: u64,
-                        p_last_ms: u64,
-                    }
-
-                    #[derive(serde::Serialize)]
-                    struct DebugSnapshot<'a> {
-                        now_ms: u64,
-                        market_count: usize,
-                        threshold_cents: u16,
-                        with_both_prices: usize,
-                        kalshi_total_updates: u64,
-                        polymarket_total_updates: u64,
-                        kalshi_delta: u64,
-                        polymarket_delta: u64,
-                        markets: Vec<MarketDetailWs<'a>>,
-                    }
-
-                    let markets = market_details
-                        .iter()
-                        .map(|m| MarketDetailWs {
-                            description: &m.description,
-                            league: &m.league,
-                            market_type: match m.market_type {
-                                MarketType::Moneyline => "moneyline",
-                                MarketType::Spread => "spread",
-                                MarketType::Total => "total",
-                                MarketType::Btts => "btts",
-                            },
-                            k_yes: m.k_yes,
-                            k_no: m.k_no,
-                            p_yes: m.p_yes,
-                            p_no: m.p_no,
-                            gap_cents: if m.gap == i16::MAX { None } else { Some(m.gap) },
-                            yes_size: m.yes_size,
-                            no_size: m.no_size,
-                            k_updates: m.k_updates,
-                            p_updates: m.p_updates,
-                            k_last_ms: m.k_last_ms,
-                            p_last_ms: m.p_last_ms,
-                        })
-                        .collect::<Vec<_>>();
-
-                    let snapshot = DebugSnapshot {
-                        now_ms,
-                        market_count,
-                        threshold_cents: heartbeat_threshold,
-                        with_both_prices: with_both,
-                        kalshi_total_updates: total_kalshi_updates,
-                        polymarket_total_updates: total_poly_updates,
-                        kalshi_delta,
-                        polymarket_delta: poly_delta,
-                        markets,
-                    };
-
-                    if let Ok(json) = serde_json::to_string(&snapshot) {
-                        dbg.send_json(json);
-                    }
-                }
-            }
 
             if verbose {
                 // Verbose mode: hierarchical tree view

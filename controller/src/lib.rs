@@ -11,6 +11,7 @@ pub mod confirm_log;
 pub mod confirm_queue;
 pub mod confirm_tui;
 pub mod discovery;
+pub mod debug_socket;
 pub mod execution;
 pub mod kalshi;
 pub mod paths;
