@@ -406,7 +406,7 @@ pub struct PolymarketOrderResponse {
 pub struct PolymarketAsyncClient {
     host: String,
     chain_id: u64,
-    http: reqwest::Client,  // Async client with connection pooling
+    http: reqwest_middleware::ClientWithMiddleware,  // Async client with connection pooling + capture
     wallet: Arc<LocalWallet>,
     funder: String,
     wallet_address_str: String,
@@ -422,14 +422,8 @@ impl PolymarketAsyncClient {
         let address_header = HeaderValue::from_str(&wallet_address_str)
             .map_err(|e| anyhow!("Invalid wallet address for header: {}", e))?;
 
-        // Build async client with connection pooling and keepalive
-        let http = reqwest::Client::builder()
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .tcp_keepalive(std::time::Duration::from_secs(30))
-            .tcp_nodelay(true)
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?;
+        // Build async client with connection pooling, keepalive, and HTTP capture
+        let http = trading::capture::build_poly_client(std::time::Duration::from_secs(10));
 
         Ok(Self {
             host: host.trim_end_matches('/').to_string(),
