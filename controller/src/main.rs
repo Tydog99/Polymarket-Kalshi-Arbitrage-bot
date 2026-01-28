@@ -29,6 +29,7 @@ mod config;
 mod confirm_log;
 mod confirm_queue;
 mod confirm_tui;
+mod debug_socket;
 mod discovery;
 mod execution;
 mod kalshi;
@@ -60,6 +61,7 @@ use config::{ARB_THRESHOLD, enabled_leagues, get_league_configs, parse_controlle
 use confirm_log::{ConfirmationLogger, ConfirmationRecord, ConfirmationStatus};
 use confirm_queue::{ConfirmAction, ConfirmationQueue};
 use confirm_tui::TuiState;
+use debug_socket::DebugBroadcaster;
 use discovery::DiscoveryClient;
 use execution::{ExecutionEngine, NanoClock, create_execution_channel, run_execution_loop};
 use kalshi::{KalshiConfig, KalshiApiClient};
@@ -579,6 +581,8 @@ async fn main() -> Result<()> {
     //   cargo run -p controller -- --leagues nba
     //   cargo run -p controller -- --leagues nba,nfl --pairing-debug --pairing-debug-limit 50
     //   cargo run -p controller -- --verbose-heartbeat --heartbeat-interval 5
+    //   cargo run -p controller -- --verbose-heartbeat --debug-ws
+    //   cargo run -p controller -- --verbose-heartbeat --debug-ws-addr 127.0.0.1:9105
     let args: Vec<String> = std::env::args().skip(1).collect();
     if cli_has_flag(&args, "--verbose-heartbeat") {
         std::env::set_var("VERBOSE_HEARTBEAT", "1");
@@ -600,6 +604,13 @@ async fn main() -> Result<()> {
     }
     if let Some(skip) = cli_arg_value(&args, "--confirm-mode-skip") {
         std::env::set_var("CONFIRM_MODE_SKIP", &skip);
+    }
+    if cli_has_flag(&args, "--debug-ws") {
+        std::env::set_var("DEBUG_WS", "1");
+    }
+    if let Some(addr) = cli_arg_value(&args, "--debug-ws-addr") {
+        std::env::set_var("DEBUG_WS_ADDR", &addr);
+        std::env::set_var("DEBUG_WS", "1");
     }
 
     // Build league list for discovery from CLI/env.
@@ -791,6 +802,44 @@ async fn main() -> Result<()> {
         info!("📡 Global state initialized: tracking {} markets", s.market_count());
         s
     });
+
+    // Optional: stream verbose heartbeat snapshots to a local WebSocket.
+    // Intended for a separate web UI process (see debug_web crate).
+    let debug_broadcaster: Option<DebugBroadcaster> = match config::debug_ws_addr() {
+        Some(addr) => match addr.parse::<std::net::SocketAddr>() {
+            Ok(sock) => match debug_socket::spawn_debug_ws_server(sock).await {
+                Ok(b) => {
+                    info!("[DEBUG_WS] Streaming verbose snapshots on ws://{}", addr);
+                    Some(b)
+                }
+                Err(e) => {
+                    warn!("[DEBUG_WS] Failed to bind ws://{}: {}", addr, e);
+                    None
+                }
+            },
+            Err(e) => {
+                warn!("[DEBUG_WS] Invalid DEBUG_WS_ADDR='{}': {}", addr, e);
+                None
+            }
+        },
+        None => None,
+    };
+
+    // If DEBUG_WS is enabled, emit a periodic full snapshot for resync + summary.
+    // This is independent of the heartbeat loop; per-market updates are emitted from WS handlers.
+    if let Some(dbg) = debug_broadcaster.clone() {
+        let snapshot_state = state.clone();
+        tokio::spawn(async move {
+            let mut prev_k: u64 = 0;
+            let mut prev_p: u64 = 0;
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+            loop {
+                interval.tick().await;
+                let json = debug_socket::build_snapshot_json(&snapshot_state, &mut prev_k, &mut prev_p);
+                dbg.send_json(json);
+            }
+        });
+    }
 
     // Initialize execution infrastructure
     let (exec_tx, exec_rx) = create_execution_channel();
@@ -1250,6 +1299,7 @@ async fn main() -> Result<()> {
     let kalshi_clock = clock.clone();
     let kalshi_tui_state = tui_state.clone();
     let kalshi_log_tx = tui_log_tx.clone();
+    let kalshi_debug = debug_broadcaster.clone();
     let kalshi_handle = tokio::spawn(async move {
         loop {
             let shutdown_rx = kalshi_shutdown_rx.clone();
@@ -1263,6 +1313,7 @@ async fn main() -> Result<()> {
                 kalshi_clock.clone(),
                 kalshi_tui_state.clone(),
                 kalshi_log_tx.clone(),
+                kalshi_debug.clone(),
             )
             .await
             {
@@ -1287,6 +1338,7 @@ async fn main() -> Result<()> {
     let poly_clock = clock.clone();
     let poly_tui_state = tui_state.clone();
     let poly_log_tx = tui_log_tx.clone();
+    let poly_debug = debug_broadcaster.clone();
     let poly_handle = tokio::spawn(async move {
         loop {
             let shutdown_rx = poly_shutdown_rx.clone();
@@ -1299,6 +1351,7 @@ async fn main() -> Result<()> {
                 poly_clock.clone(),
                 poly_tui_state.clone(),
                 poly_log_tx.clone(),
+                poly_debug.clone(),
             )
             .await
             {
@@ -1322,15 +1375,6 @@ async fn main() -> Result<()> {
     let sweep_tui_state = tui_state.clone();
     let sweep_log_tx = tui_log_tx.clone();
     tokio::spawn(async move {
-        // Helper closure to route log output based on TUI state
-        let log_line = |line: String, tui_active: bool| {
-            if tui_active {
-                let _ = sweep_log_tx.try_send(line);
-            } else {
-                info!("{}", line);
-            }
-        };
-
         // Helper closure to route log output based on TUI state
         let log_line = |line: String, tui_active: bool| {
             if tui_active {

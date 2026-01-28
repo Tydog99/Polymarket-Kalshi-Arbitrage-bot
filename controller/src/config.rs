@@ -205,6 +205,24 @@ pub fn heartbeat_interval_secs() -> u64 {
     })
 }
 
+/// Optional debug WebSocket server address for streaming verbose heartbeat snapshots as JSON.
+///
+/// Enable with either:
+/// - `DEBUG_WS=1` (binds default `127.0.0.1:9105`)
+/// - `DEBUG_WS_ADDR=127.0.0.1:9105` (enables + sets address)
+pub fn debug_ws_addr() -> Option<String> {
+    let enabled = std::env::var("DEBUG_WS")
+        .map(|v| v == "1" || v.to_lowercase() == "true" || v.to_lowercase() == "yes")
+        .unwrap_or(false);
+
+    let addr = std::env::var("DEBUG_WS_ADDR").ok().filter(|s| !s.is_empty());
+    match (enabled, addr) {
+        (_, Some(a)) => Some(a),
+        (true, None) => Some("127.0.0.1:9105".to_string()),
+        (false, None) => None,
+    }
+}
+
 /// League configuration for market discovery
 #[derive(Debug, Clone)]
 pub struct LeagueConfig {

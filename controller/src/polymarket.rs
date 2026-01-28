@@ -19,6 +19,7 @@ use crate::types::{
     GlobalState, ArbOpportunity, MarketPair, PriceCents, SizeCents,
     parse_price, fxhash_str,
 };
+use crate::debug_socket::{DebugBroadcaster, build_market_update_json};
 
 // === WebSocket Message Types ===
 
@@ -300,6 +301,7 @@ pub async fn run_ws(
     clock: Arc<NanoClock>,
     tui_state: Arc<tokio::sync::RwLock<crate::confirm_tui::TuiState>>,
     log_tx: mpsc::Sender<String>,
+    debug: Option<DebugBroadcaster>,
 ) -> Result<()> {
     // Helper to route logs based on TUI state
     let log_info = |msg: &str, tui_active: bool| {
@@ -348,6 +350,7 @@ pub async fn run_ws(
             clock,
             tui_state,
             log_tx,
+            debug,
         ).await;
     }
 
@@ -382,6 +385,7 @@ pub async fn run_ws(
         let clock = Arc::clone(&clock);
         let tui_state = Arc::clone(&tui_state);
         let log_tx = log_tx.clone();
+        let debug = debug.clone();
 
         let handle = tokio::spawn(async move {
             run_single_ws(
@@ -395,6 +399,7 @@ pub async fn run_ws(
                 clock,
                 tui_state,
                 log_tx,
+                debug,
             ).await
         });
 
@@ -428,6 +433,7 @@ async fn run_single_ws(
     clock: Arc<NanoClock>,
     tui_state: Arc<tokio::sync::RwLock<crate::confirm_tui::TuiState>>,
     log_tx: mpsc::Sender<String>,
+    debug: Option<DebugBroadcaster>,
 ) -> Result<()> {
     let log_prefix = if conn_id == 0 && tokens.len() <= POLY_MAX_TOKENS_PER_WS {
         "[POLY]".to_string()
@@ -520,7 +526,7 @@ async fn run_single_ws(
                                         book.asks.len(),
                                         book.bids.len()
                                     );
-                                    process_book(&state, book, &exec_tx, &confirm_tx, threshold_cents, &clock).await;
+                                    process_book(&state, book, &exec_tx, &confirm_tx, threshold_cents, &clock, debug.as_ref()).await;
                                 }
                             }
                             // Even if empty, this was a valid book array, don't try other parsers
@@ -531,7 +537,7 @@ async fn run_single_ws(
                         else if let Ok(event) = serde_json::from_str::<PriceChangeEvent>(&text) {
                             if let Some(changes) = &event.price_changes {
                                 for change in changes {
-                                    process_price_change(&state, change, &exec_tx, &confirm_tx, threshold_cents, &clock).await;
+                                    process_price_change(&state, change, &exec_tx, &confirm_tx, threshold_cents, &clock, debug.as_ref()).await;
                                 }
                             }
                         }
@@ -589,6 +595,7 @@ async fn process_book(
     confirm_tx: &mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
     _threshold_cents: PriceCents,
     clock: &NanoClock,
+    debug: Option<&DebugBroadcaster>,
 ) {
     let token_hash = fxhash_str(&book.asset_id);
 
@@ -634,6 +641,11 @@ async fn process_book(
         market.poly.update_yes(best_ask, ask_size);
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
+        if let Some(dbg) = debug {
+            if let Some(json) = build_market_update_json(state, market_id) {
+                dbg.send_json(json);
+            }
+        }
 
         // Check arbs using ArbOpportunity::detect()
         if let Some(req) = ArbOpportunity::detect(
@@ -669,6 +681,11 @@ async fn process_book(
         market.poly.update_no(best_ask, ask_size);
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
+        if let Some(dbg) = debug {
+            if let Some(json) = build_market_update_json(state, market_id) {
+                dbg.send_json(json);
+            }
+        }
 
         // Check arbs using ArbOpportunity::detect()
         if let Some(req) = ArbOpportunity::detect(
@@ -701,6 +718,7 @@ async fn process_price_change(
     confirm_tx: &mpsc::Sender<(ArbOpportunity, Arc<MarketPair>)>,
     _threshold_cents: PriceCents,
     clock: &NanoClock,
+    debug: Option<&DebugBroadcaster>,
 ) {
     // Only process SELL (ask) side updates
     // Polymarket uses "SELL" for asks and "BUY" for bids
@@ -736,6 +754,11 @@ async fn process_price_change(
         market.poly.update_yes(price, current_yes_size);
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
+        if let Some(dbg) = debug {
+            if let Some(json) = build_market_update_json(state, market_id) {
+                dbg.send_json(json);
+            }
+        }
 
         // Debug: log price change
         tracing::debug!(
@@ -775,6 +798,11 @@ async fn process_price_change(
         market.poly.update_no(price, current_no_size);
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
+        if let Some(dbg) = debug {
+            if let Some(json) = build_market_update_json(state, market_id) {
+                dbg.send_json(json);
+            }
+        }
 
         // Debug: log price change
         tracing::debug!(

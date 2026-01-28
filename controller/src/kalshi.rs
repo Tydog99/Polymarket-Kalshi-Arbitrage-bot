@@ -28,6 +28,7 @@ use crate::types::{
     GlobalState, ArbOpportunity, PriceCents, SizeCents, fxhash_str,
     MarketPair,
 };
+use crate::debug_socket::{DebugBroadcaster, build_market_update_json};
 
 // === Order Types ===
 
@@ -465,6 +466,7 @@ pub async fn run_ws(
     clock: Arc<NanoClock>,
     tui_state: Arc<tokio::sync::RwLock<crate::confirm_tui::TuiState>>,
     log_tx: mpsc::Sender<String>,
+    debug: Option<DebugBroadcaster>,
 ) -> Result<()> {
     // Helper to route logs based on TUI state
     let log_info = |msg: &str, tui_active: bool| {
@@ -576,6 +578,11 @@ pub async fn run_ws(
                                                 .as_millis() as u64;
                                             process_kalshi_snapshot(market, body);
                                             market.mark_kalshi_update_unix_ms(now_ms);
+                                            if let Some(ref dbg) = debug {
+                                                if let Some(json) = build_market_update_json(&state, market_id) {
+                                                    dbg.send_json(json);
+                                                }
+                                            }
 
                                             // Check for arbs using ArbOpportunity::detect()
                                             if let Some(req) = ArbOpportunity::detect(
@@ -597,6 +604,11 @@ pub async fn run_ws(
                                                 .as_millis() as u64;
                                             process_kalshi_delta(market, body);
                                             market.mark_kalshi_update_unix_ms(now_ms);
+                                            if let Some(ref dbg) = debug {
+                                                if let Some(json) = build_market_update_json(&state, market_id) {
+                                                    dbg.send_json(json);
+                                                }
+                                            }
 
                                             // Check for arbs using ArbOpportunity::detect()
                                             if let Some(req) = ArbOpportunity::detect(

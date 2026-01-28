@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Arb Monitor • Positions</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script src="/static/app.js" defer></script>
+    <script src="/static/positions.js" defer></script>
+  </head>
+  <body>
+    <div class="nav">
+      <div class="nav-inner">
+        <div class="brand">
+          <div>Arb Monitor</div>
+          <small class="mono">positions.json</small>
+        </div>
+        <div class="menu">
+          <a data-nav href="/">Live Markets</a>
+          <a data-nav href="/positions">Positions</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="container">
+      <div class="header">
+        <div>
+          <h1>Positions</h1>
+          <p class="sub">
+            Live view of <span class="mono">positions.json</span>. Updates stream
+            in automatically when the file changes.
+          </p>
+        </div>
+        <div class="pill" title="Connection state">
+          <span id="connDot" class="dot"></span>
+          <span id="connText">Connecting…</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <table class="table" aria-label="Positions table">
+          <thead>
+            <tr>
+              <th>Market</th>
+              <th>Opened</th>
+              <th>Status</th>
+              <th class="right">Kalshi YES</th>
+              <th class="right">Kalshi NO</th>
+              <th class="right">Poly YES</th>
+              <th class="right">Poly NO</th>
+              <th class="right">Fees</th>
+              <th class="right">Capital</th>
+              <th class="right">Expected P&amp;L</th>
+              <th class="right">ROI%</th>
+            </tr>
+          </thead>
+          <tbody id="positionsBody">
+            <tr>
+              <td colspan="11" class="empty">Loading…</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </body>
+</html>
+
