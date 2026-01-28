@@ -785,16 +785,20 @@ pub async fn position_writer_loop(
                         }
                     }
                     PositionMessage::ClearReconciliationPending(poly_order_id) => {
-                        // Flush any pending fills first
-                        if !batch.is_empty() {
-                            let mut guard = tracker.write().await;
-                            for fill in batch.drain(..) {
-                                guard.record_fill_internal(&fill);
-                            }
-                        }
-                        // Now clear the reconciliation marker
+                        // Acquire lock once for both operations
                         let mut guard = tracker.write().await;
+                        // Flush any pending fills first
+                        let had_fills = !batch.is_empty();
+                        for fill in batch.drain(..) {
+                            guard.record_fill_internal(&fill);
+                        }
+                        // Clear the reconciliation marker
                         guard.clear_reconciliation_pending(&poly_order_id);
+                        // Ensure we save if we flushed fills (clear_reconciliation_pending
+                        // only saves if markers were cleared, but flushed fills need saving too)
+                        if had_fills {
+                            guard.save_async();
+                        }
                     }
                 }
             }
