@@ -825,7 +825,9 @@ async fn main() -> Result<()> {
     // Create shutdown channel for WebSocket reconnection
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let position_tracker = Arc::new(RwLock::new(PositionTracker::new()));
+    let position_tracker = PositionTracker::load();
+    position_tracker.check_pending_reconciliations();
+    let position_tracker = Arc::new(RwLock::new(position_tracker));
     let (position_channel, position_rx) = create_position_channel();
 
     tokio::spawn(position_writer_loop(position_rx, position_tracker));
