@@ -1,6 +1,12 @@
 # AtomicOrderbook: Lock-Free Price Cache
 
-## Overview
+> **⚠️ DEPRECATED**: This design has been replaced by `OrderbookDepth` with `InstrumentedRwLock`.
+> See `controller/docs/ORDERBOOK_DEPTH.md` for the current implementation.
+>
+> The `AtomicOrderbook` code is retained for reference but is no longer used in production.
+> The new design stores 3 price levels per side (vs 1) for EV-maximizing arbitrage detection.
+
+## Overview (Historical)
 
 `AtomicOrderbook` (`types.rs`) provides lock-free, thread-safe orderbook state for a single trading platform. It packs four 16-bit values into a single `AtomicU64` for cache-line efficiency.
 
