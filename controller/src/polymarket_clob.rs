@@ -646,26 +646,40 @@ impl SharedAsyncClient {
             .map_err(|e| anyhow!("Failed to parse order response: {} (body: {})", e, resp_body))?;
         let order_id = resp_json["orderID"].as_str().unwrap_or("unknown").to_string();
         let order_status = resp_json["status"].as_str().unwrap_or("unknown");
+        let is_delayed = order_status == "delayed";
 
         // Extract fill info directly from POST response (no need to call get_order)
         // For BUY: takingAmount = shares received, makingAmount = USDC spent
         // For SELL: takingAmount = USDC received, makingAmount = shares sold
+        // Note: When status="delayed", amounts are empty strings - this is expected
         let (filled_size, fill_cost) = if side.eq_ignore_ascii_case("BUY") {
             let shares: f64 = match resp_json["takingAmount"].as_str() {
-                Some(s) => s.parse().unwrap_or_else(|e| {
+                Some(s) if !s.is_empty() => s.parse().unwrap_or_else(|e| {
                     tracing::warn!("[POLY] Failed to parse takingAmount '{}': {}", s, e);
                     0.0
                 }),
+                Some(_) if is_delayed => 0.0, // Empty string expected for delayed orders
+                Some(s) => {
+                    tracing::warn!("[POLY] Empty takingAmount in non-delayed response: {}", resp_json);
+                    s.parse().unwrap_or(0.0)
+                }
+                None if is_delayed => 0.0, // Missing expected for delayed orders
                 None => {
                     tracing::warn!("[POLY] takingAmount not present in response: {}", resp_json);
                     0.0
                 }
             };
             let cost: f64 = match resp_json["makingAmount"].as_str() {
-                Some(s) => s.parse().unwrap_or_else(|e| {
+                Some(s) if !s.is_empty() => s.parse().unwrap_or_else(|e| {
                     tracing::warn!("[POLY] Failed to parse makingAmount '{}': {}", s, e);
                     0.0
                 }),
+                Some(_) if is_delayed => 0.0, // Empty string expected for delayed orders
+                Some(s) => {
+                    tracing::warn!("[POLY] Empty makingAmount in non-delayed response: {}", resp_json);
+                    s.parse().unwrap_or(0.0)
+                }
+                None if is_delayed => 0.0, // Missing expected for delayed orders
                 None => {
                     tracing::warn!("[POLY] makingAmount not present in response: {}", resp_json);
                     0.0
@@ -675,20 +689,32 @@ impl SharedAsyncClient {
         } else {
             // SELL: makingAmount is shares sold, takingAmount is USDC received
             let shares: f64 = match resp_json["makingAmount"].as_str() {
-                Some(s) => s.parse().unwrap_or_else(|e| {
+                Some(s) if !s.is_empty() => s.parse().unwrap_or_else(|e| {
                     tracing::warn!("[POLY] Failed to parse makingAmount '{}': {}", s, e);
                     0.0
                 }),
+                Some(_) if is_delayed => 0.0, // Empty string expected for delayed orders
+                Some(s) => {
+                    tracing::warn!("[POLY] Empty makingAmount in non-delayed response: {}", resp_json);
+                    s.parse().unwrap_or(0.0)
+                }
+                None if is_delayed => 0.0, // Missing expected for delayed orders
                 None => {
                     tracing::warn!("[POLY] makingAmount not present in response: {}", resp_json);
                     0.0
                 }
             };
             let cost: f64 = match resp_json["takingAmount"].as_str() {
-                Some(s) => s.parse().unwrap_or_else(|e| {
+                Some(s) if !s.is_empty() => s.parse().unwrap_or_else(|e| {
                     tracing::warn!("[POLY] Failed to parse takingAmount '{}': {}", s, e);
                     0.0
                 }),
+                Some(_) if is_delayed => 0.0, // Empty string expected for delayed orders
+                Some(s) => {
+                    tracing::warn!("[POLY] Empty takingAmount in non-delayed response: {}", resp_json);
+                    s.parse().unwrap_or(0.0)
+                }
+                None if is_delayed => 0.0, // Missing expected for delayed orders
                 None => {
                     tracing::warn!("[POLY] takingAmount not present in response: {}", resp_json);
                     0.0
@@ -698,14 +724,16 @@ impl SharedAsyncClient {
         };
 
         tracing::info!(
-            "[POLY] FAK {} {}: status={}, filled={:.2}/{:.2}, cost=${:.2}",
-            side, order_id, order_status, filled_size, size, fill_cost
+            "[POLY] FAK {} {}: status={}, filled={:.2}/{:.2}, cost=${:.2}{}",
+            side, order_id, order_status, filled_size, size, fill_cost,
+            if is_delayed { " (DELAYED)" } else { "" }
         );
 
         Ok(PolyFillAsync {
             order_id,
             filled_size,
             fill_cost,
+            is_delayed,
         })
     }
 
@@ -785,6 +813,8 @@ pub struct PolyFillAsync {
     pub order_id: String,
     pub filled_size: f64,
     pub fill_cost: f64,
+    /// True when Polymarket returns status="delayed" - fill may come later
+    pub is_delayed: bool,
 }
 
 // =============================================================================
