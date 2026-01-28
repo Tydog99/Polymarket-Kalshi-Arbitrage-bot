@@ -3,7 +3,7 @@
 //! This module provides high-performance order execution for the Polymarket CLOB,
 //! including pre-computed authentication credentials and optimized request handling.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -596,12 +596,106 @@ impl SharedAsyncClient {
         self.execute_order(token_id, price, size, "BUY").await
     }
 
-    /// Execute FAK sell order - 
+    /// Execute FAK sell order -
     pub async fn sell_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         debug_assert!(!token_id.is_empty(), "token_id must not be empty");
         debug_assert!(price > 0.0 && price < 1.0, "price must be 0 < p < 1");
         debug_assert!(size >= 1.0, "size must be >= 1");
         self.execute_order(token_id, price, size, "SELL").await
+    }
+
+    /// Poll a delayed order until it reaches a terminal state or times out.
+    ///
+    /// Returns (size_matched, fill_cost) where fill_cost = size_matched * price.
+    /// For canceled/expired orders, returns (0.0, 0.0).
+    pub async fn poll_delayed_order(
+        &self,
+        order_id: &str,
+        price: f64,
+        timeout_ms: u64,
+    ) -> Result<(f64, f64)> {
+        const BACKOFF_MS: [u64; 6] = [100, 200, 500, 1000, 1500, 2000];
+
+        let start = Instant::now();
+        let timeout = Duration::from_millis(timeout_ms);
+        let mut attempt = 0;
+
+        loop {
+            // Check timeout before polling
+            if start.elapsed() >= timeout {
+                return Err(anyhow!(
+                    "Order {} still pending after {}ms",
+                    order_id,
+                    timeout_ms
+                ));
+            }
+
+            // Poll the order
+            match self.inner.get_order_async(order_id, &self.creds).await {
+                Ok(order) => {
+                    let status = order.status.to_lowercase();
+
+                    match status.as_str() {
+                        "matched" | "filled" => {
+                            // Terminal success - parse size_matched and compute fill cost
+                            let size_matched: f64 = order.size_matched.parse().unwrap_or(0.0);
+                            let fill_cost = size_matched * price;
+                            tracing::info!(
+                                "[POLY] Order {} reached terminal state '{}': matched={:.2}, cost=${:.2}",
+                                order_id, status, size_matched, fill_cost
+                            );
+                            return Ok((size_matched, fill_cost));
+                        }
+                        "canceled" | "expired" => {
+                            // Terminal failure - no fill
+                            tracing::info!(
+                                "[POLY] Order {} reached terminal state '{}': no fill",
+                                order_id, status
+                            );
+                            return Ok((0.0, 0.0));
+                        }
+                        "delayed" | "live" => {
+                            // Non-terminal - continue polling
+                            tracing::debug!(
+                                "[POLY] Order {} still in '{}' state, attempt {}",
+                                order_id, status, attempt + 1
+                            );
+                        }
+                        _ => {
+                            // Unknown status - treat as non-terminal and continue
+                            tracing::warn!(
+                                "[POLY] Order {} has unknown status '{}', continuing to poll",
+                                order_id, status
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[POLY] Error polling order {}: {}, continuing",
+                        order_id, e
+                    );
+                }
+            }
+
+            // Calculate backoff delay (use last value if beyond array)
+            let delay_ms = BACKOFF_MS.get(attempt).copied().unwrap_or(BACKOFF_MS[BACKOFF_MS.len() - 1]);
+
+            // Don't sleep if we would exceed timeout
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "Order {} still pending after {}ms",
+                    order_id,
+                    timeout_ms
+                ));
+            }
+
+            let sleep_duration = Duration::from_millis(delay_ms).min(remaining);
+            tokio::time::sleep(sleep_duration).await;
+
+            attempt += 1;
+        }
     }
 
     async fn execute_order(&self, token_id: &str, price: f64, size: f64, side: &str) -> Result<PolyFillAsync> {
@@ -646,26 +740,40 @@ impl SharedAsyncClient {
             .map_err(|e| anyhow!("Failed to parse order response: {} (body: {})", e, resp_body))?;
         let order_id = resp_json["orderID"].as_str().unwrap_or("unknown").to_string();
         let order_status = resp_json["status"].as_str().unwrap_or("unknown");
+        let is_delayed = order_status == "delayed";
 
         // Extract fill info directly from POST response (no need to call get_order)
         // For BUY: takingAmount = shares received, makingAmount = USDC spent
         // For SELL: takingAmount = USDC received, makingAmount = shares sold
+        // Note: When status="delayed", amounts are empty strings - this is expected
         let (filled_size, fill_cost) = if side.eq_ignore_ascii_case("BUY") {
             let shares: f64 = match resp_json["takingAmount"].as_str() {
-                Some(s) => s.parse().unwrap_or_else(|e| {
+                Some(s) if !s.is_empty() => s.parse().unwrap_or_else(|e| {
                     tracing::warn!("[POLY] Failed to parse takingAmount '{}': {}", s, e);
                     0.0
                 }),
+                Some(_) if is_delayed => 0.0, // Empty string expected for delayed orders
+                Some(s) => {
+                    tracing::warn!("[POLY] Empty takingAmount in non-delayed response: {}", resp_json);
+                    s.parse().unwrap_or(0.0)
+                }
+                None if is_delayed => 0.0, // Missing expected for delayed orders
                 None => {
                     tracing::warn!("[POLY] takingAmount not present in response: {}", resp_json);
                     0.0
                 }
             };
             let cost: f64 = match resp_json["makingAmount"].as_str() {
-                Some(s) => s.parse().unwrap_or_else(|e| {
+                Some(s) if !s.is_empty() => s.parse().unwrap_or_else(|e| {
                     tracing::warn!("[POLY] Failed to parse makingAmount '{}': {}", s, e);
                     0.0
                 }),
+                Some(_) if is_delayed => 0.0, // Empty string expected for delayed orders
+                Some(s) => {
+                    tracing::warn!("[POLY] Empty makingAmount in non-delayed response: {}", resp_json);
+                    s.parse().unwrap_or(0.0)
+                }
+                None if is_delayed => 0.0, // Missing expected for delayed orders
                 None => {
                     tracing::warn!("[POLY] makingAmount not present in response: {}", resp_json);
                     0.0
@@ -675,20 +783,32 @@ impl SharedAsyncClient {
         } else {
             // SELL: makingAmount is shares sold, takingAmount is USDC received
             let shares: f64 = match resp_json["makingAmount"].as_str() {
-                Some(s) => s.parse().unwrap_or_else(|e| {
+                Some(s) if !s.is_empty() => s.parse().unwrap_or_else(|e| {
                     tracing::warn!("[POLY] Failed to parse makingAmount '{}': {}", s, e);
                     0.0
                 }),
+                Some(_) if is_delayed => 0.0, // Empty string expected for delayed orders
+                Some(s) => {
+                    tracing::warn!("[POLY] Empty makingAmount in non-delayed response: {}", resp_json);
+                    s.parse().unwrap_or(0.0)
+                }
+                None if is_delayed => 0.0, // Missing expected for delayed orders
                 None => {
                     tracing::warn!("[POLY] makingAmount not present in response: {}", resp_json);
                     0.0
                 }
             };
             let cost: f64 = match resp_json["takingAmount"].as_str() {
-                Some(s) => s.parse().unwrap_or_else(|e| {
+                Some(s) if !s.is_empty() => s.parse().unwrap_or_else(|e| {
                     tracing::warn!("[POLY] Failed to parse takingAmount '{}': {}", s, e);
                     0.0
                 }),
+                Some(_) if is_delayed => 0.0, // Empty string expected for delayed orders
+                Some(s) => {
+                    tracing::warn!("[POLY] Empty takingAmount in non-delayed response: {}", resp_json);
+                    s.parse().unwrap_or(0.0)
+                }
+                None if is_delayed => 0.0, // Missing expected for delayed orders
                 None => {
                     tracing::warn!("[POLY] takingAmount not present in response: {}", resp_json);
                     0.0
@@ -698,14 +818,16 @@ impl SharedAsyncClient {
         };
 
         tracing::info!(
-            "[POLY] FAK {} {}: status={}, filled={:.2}/{:.2}, cost=${:.2}",
-            side, order_id, order_status, filled_size, size, fill_cost
+            "[POLY] FAK {} {}: status={}, filled={:.2}/{:.2}, cost=${:.2}{}",
+            side, order_id, order_status, filled_size, size, fill_cost,
+            if is_delayed { " (DELAYED)" } else { "" }
         );
 
         Ok(PolyFillAsync {
             order_id,
             filled_size,
             fill_cost,
+            is_delayed,
         })
     }
 
@@ -785,6 +907,8 @@ pub struct PolyFillAsync {
     pub order_id: String,
     pub filled_size: f64,
     pub fill_cost: f64,
+    /// True when Polymarket returns status="delayed" - fill may come later
+    pub is_delayed: bool,
 }
 
 // =============================================================================
@@ -799,6 +923,15 @@ impl PolyExecutor for SharedAsyncClient {
 
     async fn sell_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         SharedAsyncClient::sell_fak(self, token_id, price, size).await
+    }
+
+    async fn poll_delayed_order(
+        &self,
+        order_id: &str,
+        price: f64,
+        timeout_ms: u64,
+    ) -> Result<(f64, f64)> {
+        SharedAsyncClient::poll_delayed_order(self, order_id, price, timeout_ms).await
     }
 }
 

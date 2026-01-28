@@ -161,6 +161,8 @@ pub struct PolyFillAsync {
     pub order_id: String,
     pub filled_size: f64,
     pub fill_cost: f64,
+    /// True when Polymarket returns status="delayed" - fill may come later
+    pub is_delayed: bool,
 }
 
 // ============================================================================
