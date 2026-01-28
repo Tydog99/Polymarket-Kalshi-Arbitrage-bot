@@ -289,9 +289,52 @@ impl ArbPosition {
             // NO won: Kalshi NO + Poly NO pay out
             self.kalshi_no.contracts + self.poly_no.contracts
         };
-        
+
         self.realized_pnl = Some(payout - self.total_cost());
         self.status = "resolved".to_string();
+    }
+
+    /// Check if this position should be marked as failed.
+    /// A position is failed when both arb legs have been attempted but both failed
+    /// (zero contracts filled on either side).
+    pub fn should_be_marked_failed(&self) -> bool {
+        // Must have zero contracts
+        if self.total_contracts().abs() > 0.0 {
+            return false;
+        }
+
+        // Must still be "open" (not already resolved/failed)
+        if self.status != "open" {
+            return false;
+        }
+
+        // Check if we have both arb leg attempts
+        let has_yes_leg = self.trades.iter().any(|t| t.reason == TradeReason::ArbLegYes);
+        let has_no_leg = self.trades.iter().any(|t| t.reason == TradeReason::ArbLegNo);
+
+        if !has_yes_leg || !has_no_leg {
+            // Still waiting for both legs to be recorded
+            return false;
+        }
+
+        // Check if there are any pending reconciliations (don't mark failed if we're waiting for Poly)
+        let has_pending_reconciliation = self.trades.iter().any(|t| t.reconciliation_pending.is_some());
+        if has_pending_reconciliation {
+            return false;
+        }
+
+        // All arb leg trades must have failed (no successful or partial fills)
+        let all_arb_legs_failed = self.trades.iter()
+            .filter(|t| matches!(t.reason, TradeReason::ArbLegYes | TradeReason::ArbLegNo))
+            .all(|t| matches!(t.status, TradeStatus::Failed | TradeStatus::Blocked));
+
+        all_arb_legs_failed
+    }
+
+    /// Mark position as failed (both legs failed, no position taken)
+    pub fn mark_failed(&mut self) {
+        self.status = "failed".to_string();
+        self.realized_pnl = Some(0.0); // No P&L since no position was taken
     }
 }
 
@@ -453,6 +496,13 @@ impl PositionTracker {
               fill.platform, fill.side, fill.market_id,
               fill.price * 100.0, fill.contracts, fill.fees,
               fill.reason, fill.status, pending_str);
+
+        // Check if the position should be marked as failed (both legs attempted, both failed)
+        if position.should_be_marked_failed() {
+            position.mark_failed();
+            info!("[POSITIONS] Position {} marked as failed (both legs failed, no contracts filled)",
+                  fill.market_id);
+        }
     }
     
     /// Get or create position for a market
@@ -1363,5 +1413,176 @@ mod tests {
         // The reconciliation_pending field should NOT be present when None
         // (due to skip_serializing_if = "Option::is_none")
         assert!(!json.contains("reconciliation_pending"));
+    }
+
+    // =========================================================================
+    // FAILED POSITION TESTS (both legs fail)
+    // =========================================================================
+
+    #[test]
+    fn test_position_marked_failed_when_both_legs_fail() {
+        let mut tracker = PositionTracker::new();
+
+        // Record YES leg failure
+        let yes_fill = FillRecord::with_details(
+            "TEST-MARKET",
+            "Test Market",
+            "kalshi",
+            "yes",
+            10.0,  // requested
+            0.0,   // filled (failed)
+            0.80,
+            0.0,
+            "",
+            TradeReason::ArbLegYes,
+            TradeStatus::Failed,
+            Some("No fill".to_string()),
+        );
+        tracker.record_fill_internal(&yes_fill);
+
+        // After first leg, position should still be "open" (waiting for second leg)
+        let pos = tracker.get("TEST-MARKET").expect("Position should exist");
+        assert_eq!(pos.status, "open", "Position should still be open after first leg");
+
+        // Record NO leg failure
+        let no_fill = FillRecord::with_details(
+            "TEST-MARKET",
+            "Test Market",
+            "polymarket",
+            "no",
+            10.0,  // requested
+            0.0,   // filled (failed)
+            0.14,
+            0.0,
+            "",
+            TradeReason::ArbLegNo,
+            TradeStatus::Failed,
+            Some("No fill".to_string()),
+        );
+        tracker.record_fill_internal(&no_fill);
+
+        // After both legs fail, position should be marked as "failed"
+        let pos = tracker.get("TEST-MARKET").expect("Position should exist");
+        assert_eq!(pos.status, "failed", "Position should be marked as failed when both legs fail");
+        assert_eq!(pos.realized_pnl, Some(0.0), "P&L should be 0 for failed position");
+        assert_eq!(pos.total_contracts(), 0.0, "Should have no contracts");
+    }
+
+    #[test]
+    fn test_position_stays_open_when_one_leg_fills() {
+        let mut tracker = PositionTracker::new();
+
+        // Record YES leg success
+        let yes_fill = FillRecord::with_details(
+            "TEST-MARKET",
+            "Test Market",
+            "kalshi",
+            "yes",
+            10.0,
+            10.0,  // filled successfully
+            0.80,
+            0.0,
+            "order-123",
+            TradeReason::ArbLegYes,
+            TradeStatus::Success,
+            None,
+        );
+        tracker.record_fill_internal(&yes_fill);
+
+        // Record NO leg failure
+        let no_fill = FillRecord::with_details(
+            "TEST-MARKET",
+            "Test Market",
+            "polymarket",
+            "no",
+            10.0,
+            0.0,   // failed
+            0.14,
+            0.0,
+            "",
+            TradeReason::ArbLegNo,
+            TradeStatus::Failed,
+            Some("No fill".to_string()),
+        );
+        tracker.record_fill_internal(&no_fill);
+
+        // Position should stay "open" because one leg filled (needs auto-close)
+        let pos = tracker.get("TEST-MARKET").expect("Position should exist");
+        assert_eq!(pos.status, "open", "Position should stay open when one leg fills");
+        assert!(pos.total_contracts() > 0.0, "Should have contracts from successful leg");
+    }
+
+    #[test]
+    fn test_position_not_marked_failed_with_pending_reconciliation() {
+        let mut tracker = PositionTracker::new();
+
+        // Record YES leg with pending reconciliation (Kalshi filled, waiting for Poly delayed order)
+        let yes_fill = FillRecord::with_pending_reconciliation(
+            "TEST-MARKET",
+            "Test Market",
+            "kalshi",
+            "yes",
+            10.0,
+            10.0,  // Kalshi filled
+            0.80,
+            0.0,
+            "kalshi-order-123",
+            TradeReason::ArbLegYes,
+            TradeStatus::Success,
+            None,
+            "poly-delayed-456".to_string(),
+        );
+        tracker.record_fill_internal(&yes_fill);
+
+        // Record NO leg as "failed" (Poly returned delayed, recorded as 0 fill temporarily)
+        let no_fill = FillRecord::with_details(
+            "TEST-MARKET",
+            "Test Market",
+            "polymarket",
+            "no",
+            10.0,
+            0.0,   // Pending reconciliation
+            0.14,
+            0.0,
+            "poly-delayed-456",
+            TradeReason::ArbLegNo,
+            TradeStatus::Failed,
+            Some("Delayed".to_string()),
+        );
+        tracker.record_fill_internal(&no_fill);
+
+        // Position should NOT be marked failed because there's a pending reconciliation
+        let pos = tracker.get("TEST-MARKET").expect("Position should exist");
+        assert_eq!(pos.status, "open", "Position should stay open with pending reconciliation");
+    }
+
+    #[test]
+    fn test_should_be_marked_failed_logic() {
+        let mut pos = ArbPosition::new("TEST-MARKET", "Test");
+
+        // Empty position should not be marked failed (no legs recorded)
+        assert!(!pos.should_be_marked_failed(), "Empty position should not be failed");
+
+        // Add only YES leg failure
+        pos.record_trade(
+            TradeReason::ArbLegYes,
+            "kalshi", "yes",
+            10.0, 0.0, 0.80,
+            TradeStatus::Failed,
+            Some("No fill".to_string()),
+            None,
+        );
+        assert!(!pos.should_be_marked_failed(), "Position with only one leg should not be failed");
+
+        // Add NO leg failure
+        pos.record_trade(
+            TradeReason::ArbLegNo,
+            "polymarket", "no",
+            10.0, 0.0, 0.14,
+            TradeStatus::Failed,
+            Some("No fill".to_string()),
+            None,
+        );
+        assert!(pos.should_be_marked_failed(), "Position with both legs failed should be marked failed");
     }
 }
