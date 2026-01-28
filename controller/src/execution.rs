@@ -427,6 +427,8 @@ impl ExecutionEngine {
                     let position_id_for_spawn = position_id.clone();
                     let description_for_spawn = pair.description.clone();
                     let kalshi_ticker_for_spawn = pair.kalshi_market_ticker.clone();
+                    let poly_yes_token_for_spawn = pair.poly_yes_token.clone();
+                    let poly_no_token_for_spawn = pair.poly_no_token.clone();
                     let arb_type_for_spawn = req.arb_type;
                     let poly_price_for_spawn = if poly_side == "yes" { req.yes_price } else { req.no_price };
 
@@ -440,6 +442,8 @@ impl ExecutionEngine {
                             position_id_for_spawn,
                             description_for_spawn,
                             kalshi_ticker_for_spawn,
+                            poly_yes_token_for_spawn,
+                            poly_no_token_for_spawn,
                             arb_type_for_spawn,
                             position_channel_for_spawn,
                             timeout_ms,
@@ -1182,6 +1186,8 @@ impl ExecutionEngine {
 /// * `position_id` - Position ID for fill recording
 /// * `description` - Market description for fill recording
 /// * `kalshi_ticker` - Kalshi market ticker for unwinding
+/// * `poly_yes_token` - Polymarket YES token for unwinding
+/// * `poly_no_token` - Polymarket NO token for unwinding
 /// * `arb_type` - Type of arbitrage (determines which side to unwind)
 /// * `position_channel` - Channel to send fill records
 /// * `timeout_ms` - Maximum time to poll before giving up
@@ -1195,6 +1201,8 @@ async fn reconcile_delayed_poly(
     position_id: Arc<str>,
     description: Arc<str>,
     kalshi_ticker: Arc<str>,
+    poly_yes_token: Arc<str>,
+    poly_no_token: Arc<str>,
     arb_type: ArbType,
     position_channel: PositionChannel,
     timeout_ms: u64,
@@ -1275,26 +1283,8 @@ async fn reconcile_delayed_poly(
     // Clear the reconciliation_pending marker
     position_channel.clear_reconciliation_pending(&poly_order_id);
 
-    // Check for mismatch - if Kalshi filled more than Poly, we need to unwind
-    if kalshi_filled != poly_filled && kalshi_filled > 0 {
-        let excess = kalshi_filled - poly_filled;
-        warn!(
-            "[RECONCILE] Mismatch: Kalshi={} Poly={}, unwinding {} Kalshi contracts",
-            kalshi_filled, poly_filled, excess
-        );
-
-        // Determine which side to unwind on Kalshi
-        let kalshi_side = match arb_type {
-            ArbType::PolyYesKalshiNo => "no",  // Kalshi had NO
-            ArbType::KalshiYesPolyNo => "yes", // Kalshi had YES
-            ArbType::PolyOnly => return,       // No Kalshi position to unwind
-            ArbType::KalshiOnly => unreachable!(),
-        };
-
-        // Unwind the excess Kalshi position
-        // We need to sell at a price that will fill - start slightly below our buy price
-        let start_price_cents = poly_price_cents as i64; // Use Poly price as proxy
-
+    // Check for mismatch - unwind excess on whichever platform filled more
+    if kalshi_filled != poly_filled && (kalshi_filled > 0 || poly_filled > 0) {
         // Configuration for retry logic
         const MIN_PRICE_CENTS: i64 = 1;
         const PRICE_STEP_CENTS: i64 = 1;
@@ -1342,20 +1332,77 @@ async fn reconcile_delayed_poly(
             }
         };
 
-        // Call the existing close_kalshi_with_retry
-        ExecutionEngine::close_kalshi_with_retry(
-            &kalshi,
-            &position_channel,
-            &kalshi_ticker,
-            kalshi_side,
-            start_price_cents,
-            excess,
-            MIN_PRICE_CENTS,
-            PRICE_STEP_CENTS,
-            RETRY_DELAY_MS,
-            record_close,
-            log_final_result,
-        ).await;
+        if kalshi_filled > poly_filled {
+            // Kalshi filled more - unwind excess Kalshi position
+            let excess = kalshi_filled - poly_filled;
+            warn!(
+                "[RECONCILE] Mismatch: Kalshi={} Poly={}, unwinding {} Kalshi contracts",
+                kalshi_filled, poly_filled, excess
+            );
+
+            // Determine which side to unwind on Kalshi
+            let kalshi_side = match arb_type {
+                ArbType::PolyYesKalshiNo => "no",  // Kalshi had NO
+                ArbType::KalshiYesPolyNo => "yes", // Kalshi had YES
+                ArbType::PolyOnly => return,       // No Kalshi position to unwind
+                ArbType::KalshiOnly => unreachable!(),
+            };
+
+            // Unwind the excess Kalshi position
+            // We need to sell at a price that will fill - start slightly below our buy price
+            let start_price_cents = poly_price_cents as i64; // Use Poly price as proxy
+
+            ExecutionEngine::close_kalshi_with_retry(
+                &kalshi,
+                &position_channel,
+                &kalshi_ticker,
+                kalshi_side,
+                start_price_cents,
+                excess,
+                MIN_PRICE_CENTS,
+                PRICE_STEP_CENTS,
+                RETRY_DELAY_MS,
+                record_close,
+                log_final_result,
+            ).await;
+        } else {
+            // Poly filled more - unwind excess Poly position
+            let excess = poly_filled - kalshi_filled;
+            warn!(
+                "[RECONCILE] Mismatch: Kalshi={} Poly={}, unwinding {} Poly contracts",
+                kalshi_filled, poly_filled, excess
+            );
+
+            // Determine which token/side to unwind on Polymarket
+            let (poly_token, poly_side_str) = match arb_type {
+                ArbType::PolyYesKalshiNo => (&poly_yes_token, "yes"), // Poly had YES
+                ArbType::KalshiYesPolyNo => (&poly_no_token, "no"),   // Poly had NO
+                ArbType::PolyOnly => return, // Both sides are Poly - complex case, skip for now
+                ArbType::KalshiOnly => unreachable!(),
+            };
+
+            // Wait for Poly settlement before attempting to close
+            info!(
+                "[RECONCILE] Waiting 2s for Poly settlement before auto-close ({} {} contracts)",
+                excess, poly_side_str
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // Unwind the excess Poly position
+            ExecutionEngine::close_poly_with_retry(
+                &poly_async,
+                &position_channel,
+                poly_token,
+                poly_side_str,
+                poly_price_cents,
+                excess,
+                MIN_PRICE_CENTS,
+                PRICE_STEP_CENTS,
+                RETRY_DELAY_MS,
+                record_close,
+                log_final_result,
+            ).await;
+        }
     }
 }
 
