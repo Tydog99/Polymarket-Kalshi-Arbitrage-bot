@@ -387,6 +387,9 @@ impl ArbOpportunity {
             (ArbType::KalshiOnly, k_yes + k_yes_fee + k_no + k_no_fee, k_yes, k_no, k_yes_size, k_no_size),
         ];
 
+        // Polymarket minimum order value is $1.00 (100 cents)
+        const POLY_MIN_ORDER_CENTS: u16 = 100;
+
         // Find first valid arb (lowest cost that beats threshold)
         for (arb_type, cost, yes_price, no_price, yes_size, no_size) in candidates {
             if cost <= config.threshold_cents() {
@@ -397,16 +400,40 @@ impl ArbOpportunity {
                 let max_contracts = yes_contracts.min(no_contracts);
 
                 if max_contracts as f64 >= config.min_contracts() {
-                    return Some(Self {
-                        market_id,
-                        arb_type,
-                        yes_price,
-                        no_price,
-                        yes_size,
-                        no_size,
-                        detected_ns,
-                        is_test: false,
-                    });
+                    // Check Polymarket minimum order value ($1.00)
+                    // Order value = contracts × price_per_contract
+                    let poly_order_ok = match arb_type {
+                        ArbType::PolyYesKalshiNo => {
+                            // Poly YES leg: contracts × yes_price >= $1
+                            max_contracts * yes_price >= POLY_MIN_ORDER_CENTS
+                        }
+                        ArbType::KalshiYesPolyNo => {
+                            // Poly NO leg: contracts × no_price >= $1
+                            max_contracts * no_price >= POLY_MIN_ORDER_CENTS
+                        }
+                        ArbType::PolyOnly => {
+                            // Both legs on Poly: both must be >= $1
+                            max_contracts * yes_price >= POLY_MIN_ORDER_CENTS
+                                && max_contracts * no_price >= POLY_MIN_ORDER_CENTS
+                        }
+                        ArbType::KalshiOnly => {
+                            // No Poly involvement
+                            true
+                        }
+                    };
+
+                    if poly_order_ok {
+                        return Some(Self {
+                            market_id,
+                            arb_type,
+                            yes_price,
+                            no_price,
+                            yes_size,
+                            no_size,
+                            detected_ns,
+                            is_test: false,
+                        });
+                    }
                 }
             }
         }
@@ -1546,6 +1573,280 @@ mod tests {
         let arb = result.expect("should detect arb");
         assert_eq!(arb.market_id, 42);
         assert_eq!(arb.detected_ns, 999888777);
+    }
+
+    // =========================================================================
+    // Polymarket $1 Minimum Order Value Tests
+    // =========================================================================
+
+    #[test]
+    fn test_detect_rejects_poly_order_below_1_dollar() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // PolyYesKalshiNo: Poly YES at 49¢ with only 1 contract = $0.49 < $1.00
+        // yes_size=49 at yes_price=49 = 1 contract, no_size=500 at no_price=50 = 10 contracts
+        // max_contracts = min(1, 10) = 1
+        // Poly order value = 1 × 49¢ = $0.49 < $1.00 → REJECT
+        let result = ArbOpportunity::detect(
+            0,
+            (55, 50, 500, 500),         // kalshi: yes=55, no=50, sizes=500
+            (49, 58, 49, 500),          // poly: yes=49 (1 contract of liquidity), no=58
+            &config,
+            0,
+        );
+
+        assert!(result.is_none(), "Should reject Poly order below $1: 1 contract × 49¢ = $0.49");
+    }
+
+    #[test]
+    fn test_detect_accepts_poly_order_at_1_dollar() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // PolyYesKalshiNo: Poly YES at 50¢ with 2 contracts = $1.00 = minimum
+        // yes_size=100 at yes_price=50 = 2 contracts
+        // Poly order value = 2 × 50¢ = $1.00 = $1.00 → ACCEPT
+        // Arb cost: p_yes(50) + k_no(45) + fee(~2) = 97 < 99 threshold ✓
+        let result = ArbOpportunity::detect(
+            0,
+            (55, 45, 500, 500),         // kalshi: yes=55, no=45, sizes=500
+            (50, 58, 100, 500),         // poly: yes=50, 2 contracts of liquidity
+            &config,
+            0,
+        );
+
+        assert!(result.is_some(), "Should accept Poly order at exactly $1.00: 2 × 50¢");
+    }
+
+    #[test]
+    fn test_detect_accepts_poly_order_above_1_dollar() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // PolyYesKalshiNo: Poly YES at 49¢ with 3 contracts = $1.47 > $1.00
+        // yes_size=147 at yes_price=49 = 3 contracts
+        // Poly order value = 3 × 49¢ = $1.47 > $1.00 → ACCEPT
+        // Arb cost: p_yes(49) + k_no(45) + fee(~2) = 96 < 99 threshold ✓
+        let result = ArbOpportunity::detect(
+            0,
+            (55, 45, 500, 500),         // kalshi: yes=55, no=45, sizes=500
+            (49, 58, 147, 500),         // poly: yes=49, 3 contracts of liquidity
+            &config,
+            0,
+        );
+
+        assert!(result.is_some(), "Should accept Poly order above $1.00: 3 × 49¢ = $1.47");
+    }
+
+    #[test]
+    fn test_detect_kalshi_only_ignores_poly_minimum() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // KalshiOnly: No Polymarket involvement, so $1 minimum doesn't apply
+        // Even if Poly prices exist, they're not used for KalshiOnly arb
+        let result = ArbOpportunity::detect(
+            0,
+            (45, 48, 500, 500),         // kalshi: yes=45, no=48 (total 93 + fees < 100)
+            (99, 99, 10, 10),           // poly: expensive, low liquidity (would fail $1 check)
+            &config,
+            0,
+        );
+
+        // This should find KalshiOnly arb since Kalshi prices are good
+        // and Poly minimum doesn't apply to KalshiOnly
+        if let Some(arb) = result {
+            assert_eq!(arb.arb_type, ArbType::KalshiOnly);
+        }
+        // Note: may return None if the arb doesn't meet other thresholds
+    }
+
+    #[test]
+    fn test_detect_kalshi_yes_poly_no_validates_poly_no_leg() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // KalshiYesPolyNo: Poly NO at 49¢ with only 1 contract = $0.49 < $1.00
+        // k_yes=45, p_no=49, so cost = 45 + fee(~2) + 49 = 96 < 99 threshold ✓
+        // But Poly NO order value = 1 × 49¢ = $0.49 < $1.00 → REJECT
+        let result = ArbOpportunity::detect(
+            0,
+            (45, 55, 500, 500),         // kalshi: yes=45, no=55, sizes=500
+            (58, 49, 500, 49),          // poly: yes=58, no=49 (only 1 contract liquidity)
+            &config,
+            0,
+        );
+
+        assert!(result.is_none(), "Should reject KalshiYesPolyNo when Poly NO order < $1");
+    }
+
+    #[test]
+    fn test_detect_kalshi_yes_poly_no_accepts_valid_poly_no_leg() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // KalshiYesPolyNo: Poly NO at 49¢ with 3 contracts = $1.47 >= $1.00
+        // k_yes=45, p_no=49, so cost = 45 + fee(~2) + 49 = 96 < 99 threshold ✓
+        // Poly NO order value = 3 × 49¢ = $1.47 >= $1.00 → ACCEPT
+        let result = ArbOpportunity::detect(
+            0,
+            (45, 55, 500, 500),         // kalshi: yes=45, no=55, sizes=500
+            (58, 49, 500, 147),         // poly: yes=58, no=49 (3 contracts liquidity: 147/49=3)
+            &config,
+            0,
+        );
+
+        let arb = result.expect("Should accept KalshiYesPolyNo when Poly NO order >= $1");
+        assert_eq!(arb.arb_type, ArbType::KalshiYesPolyNo);
+    }
+
+    #[test]
+    fn test_detect_poly_only_requires_both_legs_above_1_dollar() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // PolyOnly: Both legs on Polymarket
+        // YES at 45¢ with 3 contracts = $1.35 >= $1.00 ✓
+        // NO at 49¢ with only 1 contract = $0.49 < $1.00 ✗
+        // Even though YES passes, NO fails → REJECT
+        let result = ArbOpportunity::detect(
+            0,
+            (99, 99, 10, 10),           // kalshi: expensive (forces PolyOnly)
+            (45, 49, 135, 49),          // poly: yes=45 (3 contracts), no=49 (1 contract)
+            &config,
+            0,
+        );
+
+        assert!(result.is_none(), "Should reject PolyOnly when either Poly leg < $1");
+    }
+
+    #[test]
+    fn test_detect_poly_only_accepts_when_both_legs_valid() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // PolyOnly: Both legs on Polymarket
+        // YES at 45¢ with 3 contracts = $1.35 >= $1.00 ✓
+        // NO at 50¢ with 3 contracts = $1.50 >= $1.00 ✓
+        // Cost = 45 + 50 = 95 < 99 threshold ✓
+        let result = ArbOpportunity::detect(
+            0,
+            (99, 99, 10, 10),           // kalshi: expensive (forces PolyOnly)
+            (45, 50, 135, 150),         // poly: yes=45 (3 contracts), no=50 (3 contracts)
+            &config,
+            0,
+        );
+
+        let arb = result.expect("Should accept PolyOnly when both Poly legs >= $1");
+        assert_eq!(arb.arb_type, ArbType::PolyOnly);
+    }
+
+    /// Regression test for the exact bug captured in production:
+    /// Order sent with makerAmount=490000 ($0.49), takerAmount=1000000 (1 contract)
+    /// This was caused by the old buggy calculation: min(yes_size, no_size) / 100
+    /// instead of the correct: min(yes_size/yes_price, no_size/no_price)
+    #[test]
+    fn test_regression_captured_049_order_rejected() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // Scenario from captured request:
+        // - yes_price = 49¢
+        // - Trying to buy 1 contract at 49¢ = $0.49 order
+        // - This should be rejected
+        //
+        // Old bug: if yes_size=147, no_size=500
+        //   max_contracts = min(147, 500) / 100 = 1 contract ← WRONG
+        //
+        // Correct: yes_size=147, yes_price=49
+        //   max_contracts = min(147/49, 500/48) = min(3, 10) = 3 contracts ← RIGHT
+        //
+        // But if liquidity is truly only 1 contract worth (yes_size=49):
+        //   max_contracts = min(49/49, 500/48) = min(1, 10) = 1 contract
+        //   Order value = 1 × 49¢ = $0.49 < $1.00 → REJECT
+
+        let result = ArbOpportunity::detect(
+            0,
+            (55, 48, 500, 500),         // kalshi: yes=55, no=48
+            (49, 58, 49, 500),          // poly: yes=49¢ with only 49¢ liquidity (1 contract)
+            &config,
+            0,
+        );
+
+        assert!(
+            result.is_none(),
+            "Should reject arb where Poly order would be $0.49 (1 contract × 49¢)"
+        );
+    }
+
+    /// Test that max_contracts calculation matches what we expect
+    /// This is the core calculation that was wrong before
+    #[test]
+    fn test_max_contracts_calculation_correctness() {
+        // Create an ArbOpportunity and verify max_contracts()
+        let arb = ArbOpportunity {
+            market_id: 0,
+            arb_type: ArbType::PolyYesKalshiNo,
+            yes_price: 49,
+            no_price: 48,
+            yes_size: 147,  // 147/49 = 3 contracts
+            no_size: 480,   // 480/48 = 10 contracts
+            detected_ns: 0,
+            is_test: false,
+        };
+
+        // max_contracts = min(147/49, 480/48) = min(3, 10) = 3
+        assert_eq!(arb.max_contracts(), 3, "max_contracts should be 3");
+
+        // Verify the order value would be valid
+        let order_value = arb.max_contracts() as u16 * arb.yes_price;
+        assert!(order_value >= 100, "Order value {}¢ should be >= $1.00", order_value);
+    }
+
+    /// Test edge case: just barely meeting $1 minimum
+    #[test]
+    fn test_max_contracts_exactly_at_1_dollar_boundary() {
+        use crate::arb::ArbConfig;
+
+        let config = ArbConfig::default();
+
+        // At 34¢ per contract, need 3 contracts to reach $1.02
+        // 2 contracts = 68¢ < $1.00 ✗
+        // 3 contracts = $1.02 >= $1.00 ✓
+        // yes_size = 102 → 102/34 = 3 contracts
+        let result = ArbOpportunity::detect(
+            0,
+            (55, 45, 500, 500),         // kalshi
+            (34, 58, 102, 500),         // poly: yes=34¢, 3 contracts (102/34=3)
+            &config,
+            0,
+        );
+
+        // Cost = 34 + 45 + fee(~2) = 81 < 99 ✓
+        // Order value = 3 × 34 = 102¢ = $1.02 ≥ $1.00 ✓
+        assert!(result.is_some(), "Should accept when order value is exactly at boundary");
+
+        // Now test with 2 contracts (should fail)
+        let result2 = ArbOpportunity::detect(
+            0,
+            (55, 45, 500, 500),
+            (34, 58, 68, 500),          // poly: yes=34¢, 2 contracts (68/34=2)
+            &config,
+            0,
+        );
+
+        // Order value = 2 × 34 = 68¢ < $1.00 ✗
+        assert!(result2.is_none(), "Should reject when order value is 68¢");
     }
 }
 

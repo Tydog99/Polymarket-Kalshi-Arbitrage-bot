@@ -168,7 +168,7 @@ impl ExecutionEngine {
 
         // Log detection early so we know what arb was found even if checks fail
         let profit_cents = req.profit_cents();
-        let est_max_contracts = (req.yes_size.min(req.no_size) / 100) as i64;
+        let est_max_contracts = req.max_contracts();
         info!(
             "[EXEC] 📡 Detected: {} | {:?} y={}¢ n={}¢ | est_profit={}¢ | size={}¢/{}¢ | est_max={}x",
             pair.description, req.arb_type, req.yes_price, req.no_price,
@@ -204,8 +204,9 @@ impl ExecutionEngine {
             });
         }
 
-        // Calculate max contracts from size (min of both sides)
-        let mut max_contracts = (req.yes_size.min(req.no_size) / 100) as i64;
+        // Calculate max contracts: min(yes_size/yes_price, no_size/no_price)
+        // This matches ArbOpportunity::max_contracts() used in confirmation
+        let mut max_contracts = req.max_contracts() as i64;
 
         // Safety: In test mode, cap position size at 10 contracts
         // Note: Polymarket enforces a $1 minimum order value. At 40¢ per contract,
@@ -218,10 +219,11 @@ impl ExecutionEngine {
 
         if max_contracts < 1 {
             warn!(
-                "[EXEC] ⚠️ Insufficient liquidity: {} | {:?} | yes={}¢ ({}¢ size) no={}¢ ({}¢ size) | need 100¢ min",
+                "[EXEC] ⚠️ Insufficient liquidity: {} | {:?} | yes={}¢ ({}¢ size) no={}¢ ({}¢ size) | max_contracts={}",
                 pair.description, req.arb_type,
                 req.yes_price, req.yes_size,
-                req.no_price, req.no_size
+                req.no_price, req.no_size,
+                max_contracts
             );
             // Use delayed release to avoid spam from low-liquidity markets
             self.release_in_flight_delayed(market_id);
@@ -262,6 +264,34 @@ impl ExecutionEngine {
                 capacity.per_market, capacity.total
             );
             max_contracts = capacity.effective;
+        }
+
+        // Re-check Polymarket $1 minimum after capacity capping
+        // (ArbOpportunity::detect() validates this initially, but circuit breaker may reduce contracts)
+        const POLY_MIN_ORDER_CENTS: i64 = 100;
+        let poly_order_value = match req.arb_type {
+            ArbType::PolyYesKalshiNo => max_contracts * req.yes_price as i64,
+            ArbType::KalshiYesPolyNo => max_contracts * req.no_price as i64,
+            ArbType::PolyOnly => {
+                // Both legs on Poly - use the smaller order value
+                (max_contracts * req.yes_price as i64).min(max_contracts * req.no_price as i64)
+            }
+            ArbType::KalshiOnly => POLY_MIN_ORDER_CENTS, // No Poly, always passes
+        };
+
+        if poly_order_value < POLY_MIN_ORDER_CENTS {
+            warn!(
+                "[EXEC] ⚠️ Poly min order (post-cap): {} | {:?} | {}x = {}¢ < $1.00 min",
+                pair.description, req.arb_type, max_contracts, poly_order_value
+            );
+            self.release_in_flight_delayed(market_id);
+            return Ok(ExecutionResult {
+                market_id,
+                success: false,
+                profit_cents: 0,
+                latency_ns: self.clock.now_ns() - req.detected_ns,
+                error: Some("Below Poly $1 min"),
+            });
         }
 
         // Safety net: verify with can_execute (should always pass after capping)
@@ -1135,7 +1165,7 @@ pub async fn run_execution_loop(
                     // Skip logging for errors that already have detailed logs
                     let already_logged = matches!(
                         result.error,
-                        Some("Already in-flight") | Some("Insufficient liquidity")
+                        Some("Already in-flight") | Some("Insufficient liquidity") | Some("Below Poly $1 min")
                     );
                     if !already_logged {
                         let detail = engine.state.get_by_id(result.market_id)
@@ -1457,6 +1487,93 @@ mod tests {
         let ids = position_ids.lock().unwrap();
         let unique_count = ids.iter().collect::<std::collections::HashSet<_>>().len();
         assert_eq!(unique_count, 100, "All position_ids should be unique across threads");
+    }
+
+    // =========================================================================
+    // Polymarket $1 Minimum Order Value Tests
+    // =========================================================================
+
+    /// Polymarket requires a minimum order value of $1.00
+    /// This function calculates the minimum contracts needed at a given price
+    #[inline]
+    fn poly_min_contracts_for_price(price_cents: i64) -> i64 {
+        const MIN_ORDER_CENTS: i64 = 100;
+        (MIN_ORDER_CENTS + price_cents - 1) / price_cents // ceil division
+    }
+
+    #[test]
+    fn test_poly_min_contracts_at_49_cents() {
+        // At 49¢ per contract:
+        // 1 × 49 = 49¢ < $1.00 ❌
+        // 2 × 49 = 98¢ < $1.00 ❌
+        // 3 × 49 = 147¢ ≥ $1.00 ✓
+        let min = poly_min_contracts_for_price(49);
+        assert_eq!(min, 3, "At 49¢, need 3 contracts to meet $1 minimum");
+    }
+
+    #[test]
+    fn test_poly_min_contracts_at_50_cents() {
+        // At 50¢ per contract:
+        // 1 × 50 = 50¢ < $1.00 ❌
+        // 2 × 50 = 100¢ = $1.00 ✓
+        let min = poly_min_contracts_for_price(50);
+        assert_eq!(min, 2, "At 50¢, need 2 contracts to meet $1 minimum");
+    }
+
+    #[test]
+    fn test_poly_min_contracts_at_10_cents() {
+        // At 10¢ per contract:
+        // 10 × 10 = 100¢ = $1.00 ✓
+        let min = poly_min_contracts_for_price(10);
+        assert_eq!(min, 10, "At 10¢, need 10 contracts to meet $1 minimum");
+    }
+
+    #[test]
+    fn test_poly_min_contracts_at_1_dollar() {
+        // At 100¢ per contract (rare but possible):
+        // 1 × 100 = 100¢ = $1.00 ✓
+        let min = poly_min_contracts_for_price(100);
+        assert_eq!(min, 1, "At $1.00, need 1 contract to meet $1 minimum");
+    }
+
+    #[test]
+    fn test_poly_order_would_be_rejected() {
+        // Simulating the user's scenario: 49¢ price, 1 contract
+        let price_cents = 49i64;
+        let contracts = 1i64;
+        let order_value_cents = price_cents * contracts;
+        let min_contracts = poly_min_contracts_for_price(price_cents);
+
+        assert!(
+            order_value_cents < 100,
+            "1 contract at 49¢ = {}¢ should be below $1 minimum",
+            order_value_cents
+        );
+        assert!(
+            contracts < min_contracts,
+            "1 contract is below minimum {} for 49¢ price",
+            min_contracts
+        );
+    }
+
+    #[test]
+    fn test_poly_order_would_succeed() {
+        // 3 contracts at 49¢ should work
+        let price_cents = 49i64;
+        let contracts = 3i64;
+        let order_value_cents = price_cents * contracts;
+        let min_contracts = poly_min_contracts_for_price(price_cents);
+
+        assert!(
+            order_value_cents >= 100,
+            "3 contracts at 49¢ = {}¢ should be >= $1 minimum",
+            order_value_cents
+        );
+        assert!(
+            contracts >= min_contracts,
+            "3 contracts should meet minimum {} for 49¢ price",
+            min_contracts
+        );
     }
 }
 
