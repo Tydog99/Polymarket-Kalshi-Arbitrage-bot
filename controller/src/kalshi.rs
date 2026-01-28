@@ -217,7 +217,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 static ORDER_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 pub struct KalshiApiClient {
-    http: reqwest::Client,
+    http: reqwest_middleware::ClientWithMiddleware,
     pub config: KalshiConfig,
     base_url: String,
 }
@@ -230,10 +230,7 @@ impl KalshiApiClient {
     /// Create a new client with a custom base URL (for testing with mock servers).
     pub fn new_with_base_url(config: KalshiConfig, base_url: &str) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("Failed to build HTTP client"),
+            http: trading::capture::build_kalshi_client(Duration::from_secs(10)),
             config,
             base_url: base_url.trim_end_matches('/').to_string(),
         }
@@ -341,6 +338,9 @@ impl KalshiApiClient {
         let msg = format!("{}POST{}", timestamp_ms, full_path);
         let signature = self.config.sign(&msg)?;
 
+        // Serialize body manually (reqwest-middleware doesn't expose .json())
+        let body_bytes = serde_json::to_vec(body)?;
+
         let resp = self.http
             .post(&url)
             .header("KALSHI-ACCESS-KEY", &self.config.api_key_id)
@@ -348,7 +348,7 @@ impl KalshiApiClient {
             .header("KALSHI-ACCESS-TIMESTAMP", timestamp_ms.to_string())
             .header("Content-Type", "application/json")
             .timeout(ORDER_TIMEOUT)
-            .json(body)
+            .body(body_bytes)
             .send()
             .await?;
 
@@ -357,7 +357,7 @@ impl KalshiApiClient {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("Kalshi API error {}: {}", status, body);
         }
-        
+
         let data: T = resp.json().await?;
         Ok(data)
     }
