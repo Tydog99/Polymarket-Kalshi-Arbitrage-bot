@@ -165,7 +165,7 @@ These variables control **where the controller listens** (IP/port) and which pla
 | `CB_ENABLED` | `true` | Enable/disable circuit breaker |
 | `CB_MAX_POSITION_PER_MARKET` | `100` | Max contracts per market |
 | `CB_MAX_TOTAL_POSITION` | `500` | Max total contracts across all markets |
-| `CB_MAX_DAILY_LOSS` | `5000` | Max daily loss in cents before halt |
+| `CB_MAX_DAILY_LOSS` | `5000` | Max daily loss in dollars before halt |
 | `CB_MAX_CONSECUTIVE_ERRORS` | `5` | Consecutive errors before halt |
 | `CB_COOLDOWN_SECS` | `60` | Cooldown period after circuit breaker trips |
 

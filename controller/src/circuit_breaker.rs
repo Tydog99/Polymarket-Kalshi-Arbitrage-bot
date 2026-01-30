@@ -289,6 +289,9 @@ impl CircuitBreaker {
         // Update positions
         let mut positions = self.positions.write().await;
         let pos = positions.entry(market_id.to_string()).or_default();
+        // Naively sets these as Kalshi-yes and Poly-no. In reality this doesn't matter
+        // because the circuit breaker doesn't care about that level of granularity.
+        // It's just tracking total overall exposure by recording each yes and no side.
         pos.kalshi_yes += kalshi_contracts;
         pos.poly_no += poly_contracts;
     }

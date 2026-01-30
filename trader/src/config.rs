@@ -49,7 +49,7 @@ impl Config {
             .or_else(|_| env::var("POLYMARKET_SIGNATURE_TYPE"))
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+            .unwrap_or(2);
 
         let dry_run = env::var("DRY_RUN")
             .map(|v| v == "1" || v == "true" || v == "yes")

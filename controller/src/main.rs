@@ -757,11 +757,11 @@ async fn main() -> Result<()> {
         .context("POLY_PRIVATE_KEY not set")?;
     let poly_funder = std::env::var("POLY_FUNDER")
         .context("POLY_FUNDER not set (your wallet address)")?;
-    // Signature type: 0=EOA, 1=poly proxy, 2=gnosis safe
+    // Signature type: 0=EOA, 1=poly proxy, 2=gnosis safe (default)
     let poly_signature_type: i32 = std::env::var("POLY_SIGNATURE_TYPE")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+        .unwrap_or(2);
 
     // Create async Polymarket client and derive API credentials
     info!("[POLYMARKET] Creating async client and deriving API credentials (signature_type={})...", poly_signature_type);

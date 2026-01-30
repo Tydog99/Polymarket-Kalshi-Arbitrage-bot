@@ -15,16 +15,30 @@ primary_region = 'ams'
 [env]
   RUST_LOG = "info"
   FORCE_DISCOVERY = "0"
+  DISCOVERY_INTERVAL_MINS = "5"
   PRICE_LOGGING = "0"
   POLY_SIGNATURE_TYPE = "2"
 
   # Circuit breaker settings
   CB_ENABLED = "true"
+
+  # Max position per market in contracts
   CB_MAX_POSITION_PER_MARKET = "10"
+
+  # Max total position across all markets contracts
   CB_MAX_TOTAL_POSITION = "100"
+
+  # Max daily loss in dollars (default: 500.0)
   CB_MAX_DAILY_LOSS = "100.0"
+
+  # Max consecutive errors before tripping (default: 5)
   CB_MAX_CONSECUTIVE_ERRORS = "5"
+
+  # Cooldown period in seconds after trip (default: 300 = 5 minutes)
   CB_COOLDOWN_SECS = "300"
+
+  #--confirm-mode-skip "nba,nfl"
+  # CONFIRM_MODE_SKIP = nba,nfl
 
 # Background daemon - restart always to keep running 24/7
 [[restart]]

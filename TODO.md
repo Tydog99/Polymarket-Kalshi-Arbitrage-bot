@@ -14,6 +14,14 @@ Last updated: 2026-01-20
   - [ ] Compute and display **drift** (per market + totals) and flag mismatches
   - [ ] Provide “reconcile hints” (which leg/side is missing)
 
+- [ ] **Positions.json improvements
+ - [ ] Positions are never closed
+ - [ ] Reconcile positions on Kalshi (via Kalshi order info? portfolio API req?)
+ - [ ] Reconcile positions on Poly (via Poly order id? portfolio API req?) (This might require a human to 'redeem' YES/NO tokens after an event closes first.)
+
+- [ ] **Circuit breaker improvement
+  - [ ] Each app start has no understanding of current open positions. It should read positions.json
+
 - [x] **Controller confirm mode**
   - [x] Add a mode that requires explicit confirmation before dispatching execution legs
   - [x] Ensure it works for cross-platform + same-platform arbs (and remote-trader routing)

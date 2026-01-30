@@ -36,7 +36,7 @@ Set `WEBSOCKET_URL` to the controller’s reachable address:
 - **Polymarket**
   - `POLY_PRIVATE_KEY`
   - `POLYMARKET_FUNDER` (or `POLY_FUNDER`)
-  - `POLY_SIGNATURE_TYPE` *(optional; default `0`)*
+  - `POLY_SIGNATURE_TYPE` *(optional; default `2`)*
   - `POLYMARKET_API_KEY` *(optional; will be derived if omitted)*
   - `POLYMARKET_API_SECRET` *(optional; will be derived if omitted)*
   - `POLYMARKET_API_PASSPHRASE` *(optional; will be derived if omitted)*
