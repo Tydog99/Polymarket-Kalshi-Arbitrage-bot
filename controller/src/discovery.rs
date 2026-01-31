@@ -183,9 +183,9 @@ impl DiscoveryClient {
                 };
             }
             Some(cache) if market_type_filter.is_none() => {
-                // Cache is stale - do incremental discovery
-                info!("📂 Cache expired (age: {}s), doing incremental refresh...", cache.age_secs());
-                return self.discover_incremental(leagues, cache, market_type_filter).await;
+                // Cache is stale - do full discovery to prune closed markets
+                info!("📂 Cache expired (age: {}s), doing full refresh...", cache.age_secs());
+                // Fall through to full discovery below
             }
             _ => {
                 // No cache or market type filter specified - do full discovery
@@ -356,80 +356,6 @@ impl DiscoveryClient {
         result.kalshi_events_found = result.pairs.len();
 
         result
-    }
-
-    /// Incremental discovery - merge cached pairs with newly discovered ones
-    async fn discover_incremental(&self, leagues: &[&str], cache: DiscoveryCache, market_type_filter: Option<MarketType>) -> DiscoveryResult {
-        let configs: Vec<_> = if leagues.is_empty() {
-            get_league_configs()
-        } else {
-            leagues.iter()
-                .filter_map(|l| get_league_config(l))
-                .collect()
-        };
-
-        // Build set of requested league codes for filtering
-        let requested_leagues: std::collections::HashSet<&str> = configs.iter()
-            .map(|c| c.league_code)
-            .collect();
-
-        // Discover with filter for known tickers
-        let league_futures: Vec<_> = configs.iter()
-            .map(|config| self.discover_league(config, Some(&cache), market_type_filter))
-            .collect();
-
-        let league_results = futures_util::future::join_all(league_futures).await;
-
-        // Merge cached pairs with newly discovered ones (full cache for persistence)
-        let mut all_pairs = cache.pairs;
-        let mut new_count = 0;
-        let mut stats = crate::types::DiscoveryStats::default();
-
-        for league_result in league_results {
-            for pair in league_result.pairs {
-                if !all_pairs.iter().any(|p| *p.kalshi_market_ticker == *pair.kalshi_market_ticker) {
-                    all_pairs.push(pair);
-                    new_count += 1;
-                }
-            }
-            stats.merge(league_result.stats);
-        }
-
-        // Filter to only requested leagues for return value
-        let filtered_pairs: Vec<_> = all_pairs.iter()
-            .filter(|p| requested_leagues.contains(p.league.as_ref()))
-            .cloned()
-            .collect();
-
-        if new_count > 0 {
-            info!("🆕 Found {} new market pairs", new_count);
-
-            // Update cache with ALL pairs (preserve other leagues)
-            let new_cache = DiscoveryCache::new(all_pairs);
-            if let Err(e) = Self::save_cache(&new_cache).await {
-                warn!("Failed to update discovery cache: {}", e);
-            } else {
-                info!("💾 Updated cache with {} total pairs ({} for requested leagues)",
-                      new_cache.pairs.len(), filtered_pairs.len());
-            }
-        } else {
-            info!("✅ No new markets found, using {} cached pairs for requested leagues", filtered_pairs.len());
-
-            // Just update timestamp to extend TTL (preserve full cache)
-            let refreshed_cache = DiscoveryCache::new(all_pairs);
-            if let Err(e) = Self::save_cache(&refreshed_cache).await {
-                tracing::warn!("[DISCOVERY] Failed to refresh cache TTL: {}", e);
-            }
-        }
-
-        DiscoveryResult {
-            pairs: filtered_pairs,
-            kalshi_events_found: new_count,
-            poly_matches: new_count,
-            poly_misses: 0,
-            errors: vec![],
-            stats,
-        }
     }
 
     /// Discover all market types for a single league (PARALLEL)
@@ -1156,6 +1082,24 @@ impl DiscoveryClient {
 
         result.kalshi_events_found = result.pairs.len();
         result.poly_matches = result.pairs.len();
+
+        // Persist newly discovered markets to disk cache
+        if !result.pairs.is_empty() {
+            if let Some(mut cache) = Self::load_cache().await {
+                for pair in &result.pairs {
+                    if !cache.pairs.iter().any(|p| p.kalshi_market_ticker == pair.kalshi_market_ticker) {
+                        cache.pairs.push(pair.clone());
+                    }
+                }
+                let updated_cache = DiscoveryCache::new(cache.pairs);
+                if let Err(e) = Self::save_cache(&updated_cache).await {
+                    warn!("Failed to persist new markets to cache: {}", e);
+                } else {
+                    info!("💾 Persisted {} new markets to cache", result.pairs.len());
+                }
+            }
+        }
+
         result
     }
 
@@ -3634,5 +3578,114 @@ mod tests {
 
         // Verify we didn't get EPL pairs (which was the bug)
         assert!(filtered_pairs.iter().all(|p| &*p.league != "epl"));
+    }
+
+    /// Test that merging new pairs into cache deduplicates by kalshi_market_ticker
+    #[test]
+    fn test_cache_merge_deduplicates_by_kalshi_ticker() {
+        // Existing cache has pairs 1, 2, 3
+        let mut cache_pairs = vec![
+            make_test_pair("1", "nba"),
+            make_test_pair("2", "nba"),
+            make_test_pair("3", "nba"),
+        ];
+
+        // New pairs includes a duplicate (2) and a new pair (4)
+        let new_pairs = vec![
+            make_test_pair("2", "nba"), // duplicate
+            make_test_pair("4", "nba"), // new
+        ];
+
+        // Simulate the merge logic from discover_since
+        for pair in &new_pairs {
+            if !cache_pairs.iter().any(|p| p.kalshi_market_ticker == pair.kalshi_market_ticker) {
+                cache_pairs.push(pair.clone());
+            }
+        }
+
+        // Should have 4 pairs (original 3 + new 1, duplicate not added)
+        assert_eq!(cache_pairs.len(), 4);
+
+        // Verify specific tickers present
+        let tickers: Vec<_> = cache_pairs.iter()
+            .map(|p| p.kalshi_market_ticker.to_string())
+            .collect();
+        assert!(tickers.contains(&"KX1-MKT".to_string()));
+        assert!(tickers.contains(&"KX2-MKT".to_string()));
+        assert!(tickers.contains(&"KX3-MKT".to_string()));
+        assert!(tickers.contains(&"KX4-MKT".to_string()));
+    }
+
+    /// Test that all new pairs are added when there are no duplicates
+    #[test]
+    fn test_cache_merge_adds_all_new_pairs() {
+        // Existing cache has pairs 1, 2
+        let mut cache_pairs = vec![
+            make_test_pair("1", "nba"),
+            make_test_pair("2", "epl"),
+        ];
+
+        // New pairs are all unique
+        let new_pairs = vec![
+            make_test_pair("3", "nfl"),
+            make_test_pair("4", "bundesliga"),
+        ];
+
+        // Simulate the merge logic
+        for pair in &new_pairs {
+            if !cache_pairs.iter().any(|p| p.kalshi_market_ticker == pair.kalshi_market_ticker) {
+                cache_pairs.push(pair.clone());
+            }
+        }
+
+        // Should have 4 pairs
+        assert_eq!(cache_pairs.len(), 4);
+    }
+
+    /// Test that no pairs are added when all are duplicates
+    #[test]
+    fn test_cache_merge_no_duplicates_added() {
+        // Existing cache has pairs 1, 2, 3
+        let mut cache_pairs = vec![
+            make_test_pair("1", "nba"),
+            make_test_pair("2", "nba"),
+            make_test_pair("3", "nba"),
+        ];
+        let original_len = cache_pairs.len();
+
+        // New pairs are all duplicates
+        let new_pairs = vec![
+            make_test_pair("1", "nba"),
+            make_test_pair("2", "nba"),
+        ];
+
+        // Simulate the merge logic
+        for pair in &new_pairs {
+            if !cache_pairs.iter().any(|p| p.kalshi_market_ticker == pair.kalshi_market_ticker) {
+                cache_pairs.push(pair.clone());
+            }
+        }
+
+        // Should still have 3 pairs (no duplicates added)
+        assert_eq!(cache_pairs.len(), original_len);
+    }
+
+    /// Test DiscoveryCache::new correctly populates known_kalshi_tickers
+    #[test]
+    fn test_discovery_cache_new_populates_known_tickers() {
+        let pairs = vec![
+            make_test_pair("1", "nba"),
+            make_test_pair("2", "epl"),
+            make_test_pair("3", "nfl"),
+        ];
+
+        let cache = DiscoveryCache::new(pairs);
+
+        assert_eq!(cache.pairs.len(), 3);
+        assert_eq!(cache.known_kalshi_tickers.len(), 3);
+        assert!(cache.has_ticker("KX1-MKT"));
+        assert!(cache.has_ticker("KX2-MKT"));
+        assert!(cache.has_ticker("KX3-MKT"));
+        assert!(!cache.has_ticker("KX4-MKT")); // Not in cache
     }
 }
