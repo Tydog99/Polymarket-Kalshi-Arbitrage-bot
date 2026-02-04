@@ -179,8 +179,17 @@ impl GammaClient {
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
 
-            // Extract neg_risk (defaults to false if not present)
-            let neg_risk = market.neg_risk.unwrap_or(false);
+            // Extract neg_risk - warn if missing since this could cause wrong contract address
+            let neg_risk = match market.neg_risk {
+                Some(nr) => nr,
+                None => {
+                    tracing::warn!(
+                        "[DISCOVERY] Market {} missing neg_risk field - defaulting to false (may cause order failures if actually neg_risk)",
+                        slug
+                    );
+                    false
+                }
+            };
 
             if token_ids.len() >= 2 {
                 results.insert(slug, (token_ids[0].clone(), token_ids[1].clone(), outcomes, neg_risk));

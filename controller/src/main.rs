@@ -781,7 +781,17 @@ async fn main() -> Result<()> {
     let neg_risk_cache_path = paths::resolve_user_path(".clob_market_cache.json");
     match poly_async.load_cache(&neg_risk_cache_path.to_string_lossy()) {
         Ok(count) => info!("[POLYMARKET] Loaded {} neg_risk entries from file cache", count),
-        Err(e) => tracing::debug!("[POLYMARKET] Could not load neg_risk file cache: {}", e),
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("No such file") || err_str.contains("cannot find the path") {
+                tracing::debug!("[POLYMARKET] No file cache found (expected for fresh installs)");
+            } else {
+                tracing::warn!(
+                    "[POLYMARKET] File cache load failed: {} - discovery will be sole source of neg_risk data",
+                    e
+                );
+            }
+        }
     }
 
     // Populate neg_risk cache from discovered pairs (this overrides file cache entries)

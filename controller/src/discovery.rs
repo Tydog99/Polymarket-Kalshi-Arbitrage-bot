@@ -1491,7 +1491,16 @@ impl DiscoveryClient {
                                             // Store with both key orderings
                                             let key1 = format!("{}:{}:{}", date, norm1, norm2);
                                             let key2 = format!("{}:{}:{}", date, norm2, norm1);
-                                            let neg_risk = event.neg_risk.unwrap_or(false);
+                                            let neg_risk = match event.neg_risk {
+                                                Some(nr) => nr,
+                                                None => {
+                                                    tracing::warn!(
+                                                        "[DISCOVERY] Event {} missing neg_risk field - defaulting to false",
+                                                        slug
+                                                    );
+                                                    false
+                                                }
+                                            };
                                             poly_lookup.insert(key1, (slug.clone(), team1_token.clone(), team2_token.clone(), poly_team1_norm.clone(), neg_risk));
                                             poly_lookup.insert(key2, (slug.clone(), team1_token, team2_token, poly_team1_norm, neg_risk));
                                         }
