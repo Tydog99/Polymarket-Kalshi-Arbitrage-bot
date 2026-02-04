@@ -273,11 +273,39 @@ impl ArbPosition {
         yes_total.min(no_total)
     }
     
-    /// Unmatched exposure (contracts without offsetting position)
+    /// Unmatched exposure (dollar value of contracts without offsetting position)
+    /// This is the cost basis of the excess contracts on one side
     pub fn unmatched_exposure(&self) -> f64 {
         let yes_total = self.kalshi_yes.contracts + self.poly_yes.contracts;
         let no_total = self.kalshi_no.contracts + self.poly_no.contracts;
-        (yes_total - no_total).abs()
+        let excess = yes_total - no_total;
+
+        if excess.abs() < 0.0001 {
+            return 0.0;
+        }
+
+        if excess > 0.0 {
+            // More YES than NO - exposure is the cost of excess YES contracts
+            // Use weighted average price across both platforms
+            let total_yes_cost =
+                self.kalshi_yes.cost_basis + self.poly_yes.cost_basis;
+            if yes_total > 0.0 {
+                let avg_yes_price = total_yes_cost / yes_total;
+                excess * avg_yes_price
+            } else {
+                0.0
+            }
+        } else {
+            // More NO than YES - exposure is the cost of excess NO contracts
+            let excess_no = -excess;
+            let total_no_cost = self.kalshi_no.cost_basis + self.poly_no.cost_basis;
+            if no_total > 0.0 {
+                let avg_no_price = total_no_cost / no_total;
+                excess_no * avg_no_price
+            } else {
+                0.0
+            }
+        }
     }
     
     /// Mark position as resolved with outcome
@@ -905,16 +933,21 @@ mod tests {
     #[test]
     fn test_unmatched_exposure() {
         let mut pos = ArbPosition::new("TEST-MARKET", "Test");
-        
-        // Buy 10 YES on Poly
+
+        // Buy 10 YES on Poly @ $0.45 each
         pos.poly_yes.add(10.0, 0.45);
-        
+
         // Buy only 8 NO on Kalshi (partial fill)
         pos.kalshi_no.add(8.0, 0.50);
-        
-        // Matched: 8, Unmatched: 2
+
+        // Matched: 8, Unmatched: 2 YES contracts
+        // Exposure = 2 contracts × $0.45 avg price = $0.90
         assert!((pos.matched_contracts() - 8.0).abs() < 0.001);
-        assert!((pos.unmatched_exposure() - 2.0).abs() < 0.001);
+        assert!(
+            (pos.unmatched_exposure() - 0.90).abs() < 0.001,
+            "Expected exposure $0.90, got ${}",
+            pos.unmatched_exposure()
+        );
     }
     
     #[test]
@@ -1584,5 +1617,332 @@ mod tests {
             None,
         );
         assert!(pos.should_be_marked_failed(), "Position with both legs failed should be marked failed");
+    }
+
+    // =========================================================================
+    // POSITION SUMMARY TESTS (for heartbeat monitoring)
+    // =========================================================================
+
+    #[test]
+    fn test_summary_empty_tracker() {
+        let tracker = PositionTracker::new();
+        let summary = tracker.summary();
+
+        assert_eq!(summary.open_positions, 0);
+        assert_eq!(summary.resolved_positions, 0);
+        assert!((summary.total_cost_basis - 0.0).abs() < 0.001);
+        assert!((summary.total_guaranteed_profit - 0.0).abs() < 0.001);
+        assert!((summary.total_unmatched_exposure - 0.0).abs() < 0.001);
+        assert!((summary.realized_pnl - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_summary_single_open_position() {
+        let mut tracker = PositionTracker::new();
+
+        // Create a complete arb: buy 10 YES at 45¢, buy 10 NO at 50¢
+        let yes_fill = FillRecord::with_details(
+            "TEST-MARKET", "Test Market", "polymarket", "yes",
+            10.0, 10.0, 0.45, 0.0, "order-1",
+            TradeReason::ArbLegYes, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&yes_fill);
+
+        let no_fill = FillRecord::with_details(
+            "TEST-MARKET", "Test Market", "kalshi", "no",
+            10.0, 10.0, 0.50, 0.0, "order-2",
+            TradeReason::ArbLegNo, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&no_fill);
+
+        let summary = tracker.summary();
+
+        assert_eq!(summary.open_positions, 1);
+        assert_eq!(summary.resolved_positions, 0);
+        // Cost: $4.50 (YES) + $5.00 (NO) = $9.50
+        assert!((summary.total_cost_basis - 9.50).abs() < 0.001);
+        // Profit: $10.00 payout - $9.50 cost = $0.50
+        assert!((summary.total_guaranteed_profit - 0.50).abs() < 0.001);
+        // No unmatched exposure (10 matched on each side)
+        assert!((summary.total_unmatched_exposure - 0.0).abs() < 0.001);
+        assert!((summary.realized_pnl - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_summary_multiple_open_positions() {
+        let mut tracker = PositionTracker::new();
+
+        // Position 1: 10 contracts, 5¢ profit ($9.50 cost)
+        let yes1 = FillRecord::with_details(
+            "MARKET-1", "Market 1", "polymarket", "yes",
+            10.0, 10.0, 0.45, 0.0, "o1",
+            TradeReason::ArbLegYes, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&yes1);
+        let no1 = FillRecord::with_details(
+            "MARKET-1", "Market 1", "kalshi", "no",
+            10.0, 10.0, 0.50, 0.0, "o2",
+            TradeReason::ArbLegNo, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&no1);
+
+        // Position 2: 5 contracts, 10¢ profit ($4.40 cost)
+        let yes2 = FillRecord::with_details(
+            "MARKET-2", "Market 2", "kalshi", "yes",
+            5.0, 5.0, 0.40, 0.0, "o3",
+            TradeReason::ArbLegYes, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&yes2);
+        let no2 = FillRecord::with_details(
+            "MARKET-2", "Market 2", "polymarket", "no",
+            5.0, 5.0, 0.48, 0.0, "o4",
+            TradeReason::ArbLegNo, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&no2);
+
+        let summary = tracker.summary();
+
+        assert_eq!(summary.open_positions, 2);
+        // Total cost: $9.50 + $4.40 = $13.90
+        assert!((summary.total_cost_basis - 13.90).abs() < 0.001);
+        // Total profit: $0.50 + $0.60 = $1.10
+        // Market 1: $10 - $9.50 = $0.50
+        // Market 2: $5 - $4.40 = $0.60
+        assert!((summary.total_guaranteed_profit - 1.10).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_summary_with_unmatched_exposure() {
+        let mut tracker = PositionTracker::new();
+
+        // Partial fill: 10 YES @ $0.45 but only 7 NO
+        let yes_fill = FillRecord::with_details(
+            "TEST-MARKET",
+            "Partial Fill Market",
+            "polymarket",
+            "yes",
+            10.0,
+            10.0,
+            0.45,
+            0.0,
+            "order-1",
+            TradeReason::ArbLegYes,
+            TradeStatus::Success,
+            None,
+        );
+        tracker.record_fill_internal(&yes_fill);
+
+        let no_fill = FillRecord::with_details(
+            "TEST-MARKET",
+            "Partial Fill Market",
+            "kalshi",
+            "no",
+            10.0,
+            7.0,
+            0.50,
+            0.0,
+            "order-2", // Only 7 filled
+            TradeReason::ArbLegNo,
+            TradeStatus::PartialFill,
+            None,
+        );
+        tracker.record_fill_internal(&no_fill);
+
+        let summary = tracker.summary();
+
+        assert_eq!(summary.open_positions, 1);
+        // 3 unmatched YES contracts @ $0.45 = $1.35 exposure
+        assert!(
+            (summary.total_unmatched_exposure - 1.35).abs() < 0.001,
+            "Expected exposure $1.35, got ${}",
+            summary.total_unmatched_exposure
+        );
+    }
+
+    #[test]
+    fn test_summary_with_resolved_positions() {
+        let mut tracker = PositionTracker::new();
+
+        // Create and resolve a position
+        let yes_fill = FillRecord::with_details(
+            "RESOLVED-MARKET", "Resolved Market", "polymarket", "yes",
+            10.0, 10.0, 0.45, 0.0, "order-1",
+            TradeReason::ArbLegYes, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&yes_fill);
+
+        let no_fill = FillRecord::with_details(
+            "RESOLVED-MARKET", "Resolved Market", "kalshi", "no",
+            10.0, 10.0, 0.50, 0.0, "order-2",
+            TradeReason::ArbLegNo, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&no_fill);
+
+        // Resolve: YES wins -> $10 payout, $9.50 cost -> $0.50 profit
+        tracker.resolve_position("RESOLVED-MARKET", true);
+
+        let summary = tracker.summary();
+
+        assert_eq!(summary.open_positions, 0);
+        assert_eq!(summary.resolved_positions, 1);
+        assert!((summary.realized_pnl - 0.50).abs() < 0.001);
+        // Resolved positions shouldn't contribute to open metrics
+        assert!((summary.total_cost_basis - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_summary_mixed_open_and_resolved() {
+        let mut tracker = PositionTracker::new();
+
+        // Open position
+        let yes1 = FillRecord::with_details(
+            "OPEN-MARKET", "Open Market", "polymarket", "yes",
+            10.0, 10.0, 0.45, 0.0, "o1",
+            TradeReason::ArbLegYes, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&yes1);
+        let no1 = FillRecord::with_details(
+            "OPEN-MARKET", "Open Market", "kalshi", "no",
+            10.0, 10.0, 0.50, 0.0, "o2",
+            TradeReason::ArbLegNo, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&no1);
+
+        // Resolved position
+        let yes2 = FillRecord::with_details(
+            "RESOLVED-MARKET", "Resolved Market", "kalshi", "yes",
+            5.0, 5.0, 0.60, 0.0, "o3",
+            TradeReason::ArbLegYes, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&yes2);
+        let no2 = FillRecord::with_details(
+            "RESOLVED-MARKET", "Resolved Market", "polymarket", "no",
+            5.0, 5.0, 0.35, 0.0, "o4",
+            TradeReason::ArbLegNo, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&no2);
+
+        // Resolve one position (NO wins -> Poly NO wins $5, cost was $4.75 -> $0.25 profit)
+        tracker.resolve_position("RESOLVED-MARKET", false);
+
+        let summary = tracker.summary();
+
+        assert_eq!(summary.open_positions, 1);
+        assert_eq!(summary.resolved_positions, 1);
+        // Open position cost
+        assert!((summary.total_cost_basis - 9.50).abs() < 0.001);
+        // Open position profit
+        assert!((summary.total_guaranteed_profit - 0.50).abs() < 0.001);
+        // Resolved position profit: $5 - $4.75 = $0.25
+        assert!((summary.realized_pnl - 0.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_open_positions_returns_only_open() {
+        let mut tracker = PositionTracker::new();
+
+        // Create 3 positions
+        for market_id in &["MARKET-1", "MARKET-2", "MARKET-3"] {
+            let yes = FillRecord::with_details(
+                market_id, *market_id, "polymarket", "yes",
+                10.0, 10.0, 0.45, 0.0, "o1",
+                TradeReason::ArbLegYes, TradeStatus::Success, None,
+            );
+            tracker.record_fill_internal(&yes);
+            let no = FillRecord::with_details(
+                market_id, *market_id, "kalshi", "no",
+                10.0, 10.0, 0.50, 0.0, "o2",
+                TradeReason::ArbLegNo, TradeStatus::Success, None,
+            );
+            tracker.record_fill_internal(&no);
+        }
+
+        // Resolve one
+        tracker.resolve_position("MARKET-2", true);
+
+        let open = tracker.open_positions();
+
+        assert_eq!(open.len(), 2);
+        let market_ids: Vec<&str> = open.iter().map(|p| p.market_id.as_str()).collect();
+        assert!(market_ids.contains(&"MARKET-1"));
+        assert!(market_ids.contains(&"MARKET-3"));
+        assert!(!market_ids.contains(&"MARKET-2"));
+    }
+
+    #[test]
+    fn test_open_positions_excludes_failed() {
+        let mut tracker = PositionTracker::new();
+
+        // Create an open position
+        let yes1 = FillRecord::with_details(
+            "OPEN-MARKET", "Open Market", "polymarket", "yes",
+            10.0, 10.0, 0.45, 0.0, "o1",
+            TradeReason::ArbLegYes, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&yes1);
+        let no1 = FillRecord::with_details(
+            "OPEN-MARKET", "Open Market", "kalshi", "no",
+            10.0, 10.0, 0.50, 0.0, "o2",
+            TradeReason::ArbLegNo, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&no1);
+
+        // Create a failed position (both legs fail)
+        let yes2 = FillRecord::with_details(
+            "FAILED-MARKET", "Failed Market", "kalshi", "yes",
+            10.0, 0.0, 0.80, 0.0, "",
+            TradeReason::ArbLegYes, TradeStatus::Failed, Some("No fill".to_string()),
+        );
+        tracker.record_fill_internal(&yes2);
+        let no2 = FillRecord::with_details(
+            "FAILED-MARKET", "Failed Market", "polymarket", "no",
+            10.0, 0.0, 0.14, 0.0, "",
+            TradeReason::ArbLegNo, TradeStatus::Failed, Some("No fill".to_string()),
+        );
+        tracker.record_fill_internal(&no2);
+
+        let open = tracker.open_positions();
+
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].market_id, "OPEN-MARKET");
+    }
+
+    #[test]
+    fn test_position_description_access() {
+        let mut tracker = PositionTracker::new();
+
+        let fill = FillRecord::with_details(
+            "TEST-MARKET", "Lakers vs Celtics - Spread (-4.5)", "polymarket", "yes",
+            10.0, 10.0, 0.45, 0.0, "o1",
+            TradeReason::ArbLegYes, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&fill);
+
+        let open = tracker.open_positions();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].description, "Lakers vs Celtics - Spread (-4.5)");
+    }
+
+    #[test]
+    fn test_summary_total_contracts() {
+        let mut tracker = PositionTracker::new();
+
+        // 10 matched contracts
+        let yes = FillRecord::with_details(
+            "TEST-MARKET", "Test", "polymarket", "yes",
+            10.0, 10.0, 0.45, 0.0, "o1",
+            TradeReason::ArbLegYes, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&yes);
+        let no = FillRecord::with_details(
+            "TEST-MARKET", "Test", "kalshi", "no",
+            10.0, 10.0, 0.50, 0.0, "o2",
+            TradeReason::ArbLegNo, TradeStatus::Success, None,
+        );
+        tracker.record_fill_internal(&no);
+
+        let summary = tracker.summary();
+        // total_contracts = poly_yes + kalshi_yes + poly_no + kalshi_no = 10 + 0 + 0 + 10 = 20
+        assert!((summary.total_contracts - 20.0).abs() < 0.001);
     }
 }

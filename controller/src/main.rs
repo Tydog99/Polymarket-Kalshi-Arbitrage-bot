@@ -888,6 +888,8 @@ async fn main() -> Result<()> {
     let position_tracker = Arc::new(RwLock::new(position_tracker));
     let (position_channel, position_rx) = create_position_channel();
 
+    // Clone position_tracker for heartbeat monitoring before spawning writer
+    let heartbeat_position_tracker = position_tracker.clone();
     tokio::spawn(position_writer_loop(position_rx, position_tracker));
 
     let threshold_cents: PriceCents = ((ARB_THRESHOLD * 100.0).round() as u16).max(1);
@@ -1426,6 +1428,7 @@ async fn main() -> Result<()> {
     let heartbeat_threshold = threshold_cents;
     let heartbeat_tui_state = tui_state.clone();
     let heartbeat_log_tx = tui_log_tx.clone();
+    let heartbeat_position_tracker = heartbeat_position_tracker;
     let heartbeat_handle = tokio::spawn(async move {
         use crate::arb::kalshi_fee;
         use std::collections::HashMap;
@@ -1761,6 +1764,67 @@ async fn main() -> Result<()> {
             } else if with_both == 0 {
                 log_line(format!("[{}]  WARN controller: ⚠️  No markets with both Kalshi and Polymarket prices - verify WebSocket connections",
                     chrono::Local::now().format("%H:%M:%S")));
+            }
+
+            // Print position summary
+            {
+                let tracker = heartbeat_position_tracker.read().await;
+                let summary = tracker.summary();
+
+                if summary.open_positions > 0 || summary.resolved_positions > 0 || summary.realized_pnl.abs() > 0.001 {
+                    // Aggregate summary line
+                    log_line(format!(
+                        "[{}]  INFO controller: 💰 POSITIONS: {} open | Cost: ${:.2} | Profit: ${:.2} | Exposure: ${:.2} | Realized: ${:.2}",
+                        chrono::Local::now().format("%H:%M:%S"),
+                        summary.open_positions,
+                        summary.total_cost_basis,
+                        summary.total_guaranteed_profit,
+                        summary.total_unmatched_exposure,
+                        summary.realized_pnl
+                    ));
+
+                    // Individual position details
+                    let open = tracker.open_positions();
+                    for (i, pos) in open.iter().enumerate() {
+                        let is_last = i == open.len() - 1;
+                        let branch = if is_last { "└" } else { "├" };
+                        let continuation = if is_last { " " } else { "│" };
+                        let desc: String = if pos.description.chars().count() > 45 {
+                            format!("{}...", pos.description.chars().take(42).collect::<String>())
+                        } else {
+                            pos.description.clone()
+                        };
+
+                        // Build position strings showing non-zero legs
+                        let mut parts: Vec<String> = Vec::new();
+                        if pos.poly_yes.contracts.abs() > 0.001 {
+                            parts.push(format!("P: {:.0} YES @ ${:.2}", pos.poly_yes.contracts, pos.poly_yes.cost_basis));
+                        }
+                        if pos.poly_no.contracts.abs() > 0.001 {
+                            parts.push(format!("P: {:.0} NO @ ${:.2}", pos.poly_no.contracts, pos.poly_no.cost_basis));
+                        }
+                        if pos.kalshi_yes.contracts.abs() > 0.001 {
+                            parts.push(format!("K: {:.0} YES @ ${:.2}", pos.kalshi_yes.contracts, pos.kalshi_yes.cost_basis));
+                        }
+                        if pos.kalshi_no.contracts.abs() > 0.001 {
+                            parts.push(format!("K: {:.0} NO @ ${:.2}", pos.kalshi_no.contracts, pos.kalshi_no.cost_basis));
+                        }
+                        let positions_str = if parts.is_empty() { "No contracts".to_string() } else { parts.join(" | ") };
+
+                        // Line 1: Market description
+                        log_line(format!("   {}─ {}", branch, desc));
+                        // Line 2: Positions
+                        log_line(format!("   {}     {}", continuation, positions_str));
+                        // Line 3: Cost, profit and exposure
+                        log_line(format!(
+                            "   {}     Cost: ${:.2} | Exp Profit: ${:.2} | Unmatched: ${:.2}",
+                            continuation,
+                            pos.total_cost(),
+                            pos.guaranteed_profit(),
+                            pos.unmatched_exposure()
+                        ));
+                    }
+                }
             }
 
             // Print league summary table
