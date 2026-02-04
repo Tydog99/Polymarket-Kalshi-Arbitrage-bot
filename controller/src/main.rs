@@ -803,6 +803,40 @@ async fn main() -> Result<()> {
     // Create Kalshi API client
     let kalshi_api = Arc::new(KalshiApiClient::new(kalshi_config));
 
+    // Fetch balances from both platforms in parallel
+    let (kalshi_balance_result, poly_balance_result) = tokio::join!(
+        kalshi_api.get_balance(),
+        poly_async.get_balance()
+    );
+
+    // Log balances together
+    match (&kalshi_balance_result, &poly_balance_result) {
+        (Ok(kb), Ok(pb)) => {
+            let kalshi_dollars = kb.balance as f64 / 100.0;
+            let poly_dollars = pb.balance_as_cents() as f64 / 100.0;
+            let total = kalshi_dollars + poly_dollars;
+            info!("💰 Account Balances:");
+            info!("   Kalshi:     ${:.2} (portfolio: ${:.2})", kalshi_dollars, kb.portfolio_value as f64 / 100.0);
+            info!("   Polymarket: ${:.2}", poly_dollars);
+            info!("   Total Cash: ${:.2}", total);
+        }
+        (Err(e), Ok(pb)) => {
+            warn!("💰 Account Balances:");
+            warn!("   Kalshi:     Failed to fetch - {}", e);
+            info!("   Polymarket: ${:.2}", pb.balance_as_cents() as f64 / 100.0);
+        }
+        (Ok(kb), Err(e)) => {
+            info!("💰 Account Balances:");
+            info!("   Kalshi:     ${:.2} (portfolio: ${:.2})", kb.balance as f64 / 100.0, kb.portfolio_value as f64 / 100.0);
+            warn!("   Polymarket: Failed to fetch - {}", e);
+        }
+        (Err(ke), Err(pe)) => {
+            warn!("💰 Account Balances: Failed to fetch");
+            warn!("   Kalshi error:     {}", ke);
+            warn!("   Polymarket error: {}", pe);
+        }
+    }
+
     // Build global state with arb config loaded from environment
     let arb_config = arb::ArbConfig::from_env();
     info!("   Arb threshold: {}¢ | min contracts: {}",
@@ -834,7 +868,16 @@ async fn main() -> Result<()> {
     let tui_state = Arc::new(RwLock::new(TuiState::new()));
 
     if confirm_enabled {
-        info!("   Confirmation mode: ENABLED (some leagues require manual approval)");
+        let skipped = config::confirm_mode_skip_leagues();
+        let all_leagues: Vec<_> = config::get_league_configs().iter().map(|c| c.league_code.to_lowercase()).collect();
+        let mut requiring: Vec<_> = all_leagues.iter().filter(|l| !skipped.contains(*l)).cloned().collect();
+        let mut auto_exec: Vec<_> = all_leagues.iter().filter(|l| skipped.contains(*l)).cloned().collect();
+        requiring.sort();
+        auto_exec.sort();
+
+        info!("   Confirmation mode: ENABLED");
+        info!("      Manual approval: {}", if requiring.is_empty() { "none".to_string() } else { requiring.join(", ") });
+        info!("      Auto-execute:    {}", if auto_exec.is_empty() { "none".to_string() } else { auto_exec.join(", ") });
     }
 
     // Create shutdown channel for WebSocket reconnection

@@ -141,6 +141,18 @@ pub struct KalshiOrderDetails {
     pub maker_fees: Option<i64>,
 }
 
+/// Response from GET /portfolio/balance
+#[derive(Debug, Clone, Deserialize)]
+pub struct KalshiBalance {
+    /// Available cash balance in cents
+    pub balance: i64,
+    /// Total value of open positions in cents
+    pub portfolio_value: i64,
+    /// Last update timestamp (milliseconds since epoch)
+    #[serde(default)]
+    pub updated_ts: Option<i64>,
+}
+
 #[allow(dead_code)]
 impl KalshiOrderDetails {
     /// Total filled contracts
@@ -324,6 +336,11 @@ impl KalshiApiClient {
         let path = format!("/markets?event_ticker={}&status=open&limit=100", event_ticker);
         let resp: KalshiMarketsResponse = self.get(&path).await?;
         Ok(resp.markets)
+    }
+
+    /// Get portfolio balance
+    pub async fn get_balance(&self) -> Result<KalshiBalance> {
+        self.get("/portfolio/balance").await
     }
 
     /// Generic authenticated POST request
