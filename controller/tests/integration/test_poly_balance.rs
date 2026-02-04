@@ -51,13 +51,16 @@ fn create_test_client(server: &MockServer) -> SharedAsyncClient {
 async fn test_poly_get_balance_success() {
     let server = MockServer::start().await;
 
-    // Mock the /balance-allowance endpoint
+    // Mock the /balance-allowance endpoint (new format with allowances map)
     Mock::given(method("GET"))
         .and(path("/balance-allowance"))
         .and(query_param("asset_type", "COLLATERAL"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "balance": "1500000000",
-            "allowance": "2000000000"
+            "allowances": {
+                "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E": "2000000000",
+                "0xC5d563A36AE78145C45a50134d48A1215220f80a": "1000000000"
+            }
         })))
         .expect(1)
         .mount(&server)
@@ -70,7 +73,7 @@ async fn test_poly_get_balance_success() {
 
     // Verify the response fields
     assert_eq!(balance.balance, "1500000000", "balance string should match");
-    assert_eq!(balance.allowance, "2000000000", "allowance string should match");
+    assert_eq!(balance.allowances.len(), 2, "should have 2 allowance entries");
 
     // Verify cents conversion: 1500000000 / 10000 = 150000 cents ($1500.00)
     assert_eq!(
@@ -78,10 +81,11 @@ async fn test_poly_get_balance_success() {
         150000,
         "balance should convert to 150000 cents"
     );
+    // allowance_as_cents returns the max allowance (2000000000 / 10000 = 200000)
     assert_eq!(
         balance.allowance_as_cents(),
         200000,
-        "allowance should convert to 200000 cents"
+        "allowance should convert to 200000 cents (max of all allowances)"
     );
 }
 
@@ -99,7 +103,9 @@ async fn test_poly_get_balance_zero() {
         .and(query_param("asset_type", "COLLATERAL"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "balance": "0",
-            "allowance": "0"
+            "allowances": {
+                "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E": "0"
+            }
         })))
         .expect(1)
         .mount(&server)
@@ -128,7 +134,9 @@ async fn test_poly_get_balance_small_amount() {
         .and(query_param("asset_type", "COLLATERAL"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "balance": "5000",
-            "allowance": "5000"
+            "allowances": {
+                "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E": "5000"
+            }
         })))
         .expect(1)
         .mount(&server)

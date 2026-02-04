@@ -404,14 +404,14 @@ pub struct PolymarketOrderResponse {
 
 /// Response from GET /balance-allowance?asset_type=COLLATERAL
 ///
-/// Balance and allowance are returned as strings in 6-decimal USDC format.
+/// Balance and allowances are returned as strings in 6-decimal USDC format.
 /// For example, "1500000000" represents 1500 USDC ($1500.00 = 150000 cents).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PolyBalance {
     /// USDC.e balance in 6 decimals (string)
     pub balance: String,
-    /// Approved allowance in 6 decimals (string)
-    pub allowance: String,
+    /// Approved allowances per contract address in 6 decimals (map of address -> string)
+    pub allowances: std::collections::HashMap<String, String>,
 }
 
 impl PolyBalance {
@@ -424,8 +424,14 @@ impl PolyBalance {
     }
 
     /// Convert allowance string to cents (divide by 10000).
+    /// Returns the maximum allowance across all contracts.
     pub fn allowance_as_cents(&self) -> i64 {
-        self.allowance.parse::<i64>().unwrap_or(0) / 10000
+        self.allowances
+            .values()
+            .filter_map(|v| v.parse::<i64>().ok())
+            .max()
+            .unwrap_or(0)
+            / 10000
     }
 }
 
@@ -563,11 +569,17 @@ impl PolymarketAsyncClient {
 
     /// Get balance and allowance for the wallet.
     ///
-    /// Makes authenticated GET request to /balance-allowance?asset_type=COLLATERAL
+    /// Makes authenticated GET request to /balance-allowance?asset_type=COLLATERAL&signature_type=N
+    /// The signature_type parameter is required for proxy wallets (1=poly proxy, 2=gnosis safe)
+    /// to return the funder's balance instead of the signer's balance.
     pub async fn get_balance_async(&self, creds: &PreparedCreds) -> Result<PolyBalance> {
-        let path = "/balance-allowance?asset_type=COLLATERAL";
-        let url = format!("{}{}", self.host, path);
-        let headers = self.build_l2_headers("GET", path, None, creds)?;
+        // Signature is computed over base path only (per Polymarket py-clob-client)
+        let sign_path = "/balance-allowance";
+        let url = format!(
+            "{}/balance-allowance?asset_type=COLLATERAL&signature_type={}",
+            self.host, self.signature_type
+        );
+        let headers = self.build_l2_headers("GET", sign_path, None, creds)?;
 
         let resp = self.http
             .get(&url)
