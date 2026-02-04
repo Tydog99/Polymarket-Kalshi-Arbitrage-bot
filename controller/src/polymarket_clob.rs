@@ -531,6 +531,7 @@ impl PolymarketAsyncClient {
     }
 
     /// Check neg_risk for token - with caching
+    /// Returns an error if the API response is malformed (missing neg_risk field or wrong type)
     pub async fn check_neg_risk(&self, token_id: &str) -> Result<bool> {
         let url = format!("{}/neg-risk?token_id={}", self.host, token_id);
         let resp = self.http
@@ -539,8 +540,26 @@ impl PolymarketAsyncClient {
             .send()
             .await?;
 
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("neg-risk API returned {}: {}", status, body));
+        }
+
         let val: serde_json::Value = resp.json().await?;
-        Ok(val["neg_risk"].as_bool().unwrap_or(false))
+        match val.get("neg_risk") {
+            Some(serde_json::Value::Bool(b)) => Ok(*b),
+            Some(other) => Err(anyhow!(
+                "neg-risk API returned non-boolean neg_risk for token {}: {:?}",
+                token_id,
+                other
+            )),
+            None => Err(anyhow!(
+                "neg-risk API response missing neg_risk field for token {}: {}",
+                token_id,
+                val
+            )),
+        }
     }
 
     #[allow(dead_code)]
@@ -586,6 +605,20 @@ impl SharedAsyncClient {
         let mut cache = self.neg_risk_cache.write().unwrap();
         *cache = map;
         Ok(count)
+    }
+
+    /// Populate neg_risk cache directly from MarketPairs discovered at runtime.
+    /// This eliminates the need for the separate Python cache-warming script.
+    pub fn populate_cache_from_pairs(&self, pairs: &[crate::types::MarketPair]) -> usize {
+        let mut cache = self.neg_risk_cache.write().unwrap();
+        let mut count = 0;
+        for pair in pairs {
+            // Insert both YES and NO tokens with the same neg_risk value
+            cache.insert(pair.poly_yes_token.to_string(), pair.neg_risk);
+            cache.insert(pair.poly_no_token.to_string(), pair.neg_risk);
+            count += 2;
+        }
+        count
     }
 
     /// Execute FAK buy order - 
@@ -708,6 +741,12 @@ impl SharedAsyncClient {
         let neg_risk = match neg_risk {
             Some(nr) => nr,
             None => {
+                // WARNING: neg_risk not in cache - this means discovery didn't populate it
+                // This triggers an extra API call and may indicate a bug in discovery
+                tracing::warn!(
+                    "⚠️ [POLY] neg_risk CACHE MISS for token {}... - fetching from API (discovery may have failed to populate)",
+                    &token_id[..token_id.len().min(20)]
+                );
                 let nr = self.inner.check_neg_risk(token_id).await?;
                 let mut cache = self.neg_risk_cache.write().unwrap();
                 cache.insert(token_id.to_string(), nr);
@@ -1164,5 +1203,142 @@ mod tests {
         assert_eq!(order_status, "matched");
         assert_eq!(shares, 3.0, "Should extract partial fill of 3 shares");
         assert_eq!(cost, 1.47, "Should extract cost of $1.47");
+    }
+
+    // Helper to create a SharedAsyncClient for testing cache behavior
+    fn create_test_shared_client() -> SharedAsyncClient {
+        let client = PolymarketAsyncClient::new(
+            "https://clob.polymarket.com",
+            137,
+            TEST_PRIVATE_KEY,
+            TEST_FUNDER,
+            0,
+        ).expect("should create client");
+
+        let api_creds = super::ApiCreds {
+            api_key: "test_key".to_string(),
+            api_secret: "dGVzdF9zZWNyZXQ=".to_string(), // base64 encoded "test_secret"
+            api_passphrase: "test_pass".to_string(),
+        };
+        let creds = PreparedCreds::from_api_creds(&api_creds).expect("should create creds");
+
+        SharedAsyncClient::new(client, creds, 137)
+    }
+
+    // Helper to create a MarketPair for testing
+    fn create_test_market_pair(
+        pair_id: &str,
+        yes_token: &str,
+        no_token: &str,
+        neg_risk: bool,
+    ) -> crate::types::MarketPair {
+        crate::types::MarketPair {
+            pair_id: pair_id.into(),
+            league: "test".into(),
+            market_type: crate::types::MarketType::Moneyline,
+            description: "Test market".into(),
+            kalshi_event_ticker: "TEST-EVENT".into(),
+            kalshi_market_ticker: "TEST-MARKET".into(),
+            kalshi_event_slug: "test-event".into(),
+            poly_slug: "test-slug".into(),
+            poly_yes_token: yes_token.into(),
+            poly_no_token: no_token.into(),
+            line_value: None,
+            team_suffix: None,
+            neg_risk,
+        }
+    }
+
+    #[test]
+    fn test_populate_cache_from_pairs_empty() {
+        let client = create_test_shared_client();
+        let pairs: Vec<crate::types::MarketPair> = vec![];
+
+        let count = client.populate_cache_from_pairs(&pairs);
+
+        assert_eq!(count, 0, "Empty pairs should return 0");
+        let cache = client.neg_risk_cache.read().unwrap();
+        assert!(cache.is_empty(), "Cache should be empty");
+    }
+
+    #[test]
+    fn test_populate_cache_from_pairs_single() {
+        let client = create_test_shared_client();
+        let pairs = vec![
+            create_test_market_pair("pair1", "yes_token_1", "no_token_1", false),
+        ];
+
+        let count = client.populate_cache_from_pairs(&pairs);
+
+        assert_eq!(count, 2, "Single pair should add 2 entries (YES + NO)");
+
+        let cache = client.neg_risk_cache.read().unwrap();
+        assert_eq!(cache.get("yes_token_1"), Some(&false));
+        assert_eq!(cache.get("no_token_1"), Some(&false));
+    }
+
+    #[test]
+    fn test_populate_cache_from_pairs_multiple_mixed() {
+        let client = create_test_shared_client();
+        let pairs = vec![
+            create_test_market_pair("pair1", "yes_token_1", "no_token_1", false),
+            create_test_market_pair("pair2", "yes_token_2", "no_token_2", true),
+            create_test_market_pair("pair3", "yes_token_3", "no_token_3", false),
+        ];
+
+        let count = client.populate_cache_from_pairs(&pairs);
+
+        assert_eq!(count, 6, "3 pairs should add 6 entries");
+
+        let cache = client.neg_risk_cache.read().unwrap();
+        // neg_risk=false pair
+        assert_eq!(cache.get("yes_token_1"), Some(&false));
+        assert_eq!(cache.get("no_token_1"), Some(&false));
+        // neg_risk=true pair
+        assert_eq!(cache.get("yes_token_2"), Some(&true));
+        assert_eq!(cache.get("no_token_2"), Some(&true));
+        // neg_risk=false pair
+        assert_eq!(cache.get("yes_token_3"), Some(&false));
+        assert_eq!(cache.get("no_token_3"), Some(&false));
+    }
+
+    #[test]
+    fn test_populate_cache_overwrites_existing() {
+        let client = create_test_shared_client();
+
+        // Pre-populate cache with a different value
+        {
+            let mut cache = client.neg_risk_cache.write().unwrap();
+            cache.insert("yes_token_1".to_string(), true); // Will be overwritten
+            cache.insert("no_token_1".to_string(), true);  // Will be overwritten
+        }
+
+        // Now populate from pairs with neg_risk=false
+        let pairs = vec![
+            create_test_market_pair("pair1", "yes_token_1", "no_token_1", false),
+        ];
+
+        let count = client.populate_cache_from_pairs(&pairs);
+        assert_eq!(count, 2);
+
+        // Verify overwrite occurred
+        let cache = client.neg_risk_cache.read().unwrap();
+        assert_eq!(cache.get("yes_token_1"), Some(&false), "Should overwrite with discovery value");
+        assert_eq!(cache.get("no_token_1"), Some(&false), "Should overwrite with discovery value");
+    }
+
+    #[test]
+    fn test_populate_cache_neg_risk_true() {
+        let client = create_test_shared_client();
+        let pairs = vec![
+            create_test_market_pair("pair_neg", "neg_yes", "neg_no", true),
+        ];
+
+        let count = client.populate_cache_from_pairs(&pairs);
+        assert_eq!(count, 2);
+
+        let cache = client.neg_risk_cache.read().unwrap();
+        assert_eq!(cache.get("neg_yes"), Some(&true), "neg_risk=true should be stored");
+        assert_eq!(cache.get("neg_no"), Some(&true), "neg_risk=true should be stored");
     }
 }

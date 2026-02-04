@@ -82,7 +82,7 @@ impl GammaClient {
     }
 
     /// Batch lookup multiple Polymarket markets by slug.
-    /// Returns HashMap keyed by slug with (token1, token2, outcomes) values.
+    /// Returns HashMap keyed by slug with (token1, token2, outcomes, neg_risk) values.
     /// Slugs not found or inactive are simply not included in the result.
     ///
     /// This is much more efficient than individual lookups:
@@ -91,7 +91,7 @@ impl GammaClient {
     pub async fn lookup_markets_batch(
         &self,
         slugs: &[String],
-    ) -> Result<std::collections::HashMap<String, (String, String, Vec<String>)>> {
+    ) -> Result<std::collections::HashMap<String, (String, String, Vec<String>, bool)>> {
         use std::collections::HashMap;
 
         if slugs.is_empty() {
@@ -151,7 +151,7 @@ impl GammaClient {
     fn parse_gamma_batch_response(
         &self,
         markets: Vec<GammaMarket>,
-    ) -> std::collections::HashMap<String, (String, String, Vec<String>)> {
+    ) -> std::collections::HashMap<String, (String, String, Vec<String>, bool)> {
         use std::collections::HashMap;
 
         let mut results = HashMap::new();
@@ -179,8 +179,20 @@ impl GammaClient {
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
 
+            // Extract neg_risk - warn if missing since this could cause wrong contract address
+            let neg_risk = match market.neg_risk {
+                Some(nr) => nr,
+                None => {
+                    tracing::warn!(
+                        "[DISCOVERY] Market {} missing neg_risk field - defaulting to false (may cause order failures if actually neg_risk)",
+                        slug
+                    );
+                    false
+                }
+            };
+
             if token_ids.len() >= 2 {
-                results.insert(slug, (token_ids[0].clone(), token_ids[1].clone(), outcomes));
+                results.insert(slug, (token_ids[0].clone(), token_ids[1].clone(), outcomes, neg_risk));
             }
         }
 
@@ -216,6 +228,9 @@ struct GammaMarket {
     outcomes: Option<String>,
     active: Option<bool>,
     closed: Option<bool>,
+    /// Whether this market uses negative risk (determines exchange contract address)
+    #[serde(rename = "negRisk")]
+    neg_risk: Option<bool>,
 }
 
 /// Polymarket event from /events endpoint (for esports discovery)
@@ -224,6 +239,9 @@ pub struct PolyEvent {
     pub slug: Option<String>,
     pub title: Option<String>,
     pub markets: Option<Vec<PolyEventMarket>>,
+    /// Whether this event uses negative risk (determines exchange contract address)
+    #[serde(rename = "negRisk")]
+    pub neg_risk: Option<bool>,
 }
 
 /// Market within a Polymarket event
@@ -888,6 +906,7 @@ mod tests {
             poly_no_token: token_thieves.clone().into(),
             line_value: None,
             team_suffix: Some("OPTIC".into()),
+            neg_risk: false,
         };
 
         // Market 2: "Will LA Thieves win?"
@@ -906,6 +925,7 @@ mod tests {
             poly_no_token: token_optic.clone().into(),     // SWAPPED
             line_value: None,
             team_suffix: Some("THIEVES".into()),
+            neg_risk: false,
         };
 
         state.add_pair(pair1);
@@ -1088,6 +1108,7 @@ mod tests {
             poly_no_token: token_b.clone().into(),
             line_value: None,
             team_suffix: Some("A".into()),
+            neg_risk: false,
         };
 
         // Market pair 2: YES=token_b, NO=token_a (swapped)
@@ -1104,6 +1125,7 @@ mod tests {
             poly_no_token: token_a.clone().into(),
             line_value: None,
             team_suffix: Some("B".into()),
+            neg_risk: false,
         };
 
         state.add_pair(pair1);
@@ -1163,6 +1185,7 @@ mod tests {
             poly_no_token: "unique_no_token_456".into(),
             line_value: None,
             team_suffix: Some("LAL".into()),
+            neg_risk: false,
         };
 
         state.add_pair(pair);

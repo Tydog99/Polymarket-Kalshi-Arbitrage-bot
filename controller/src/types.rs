@@ -65,6 +65,9 @@ pub struct MarketPair {
     pub line_value: Option<f64>,
     /// Team suffix for team-specific markets
     pub team_suffix: Option<Arc<str>>,
+    /// Whether this market uses negative risk (determines Polymarket exchange contract)
+    #[serde(default)]
+    pub neg_risk: bool,
 }
 
 /// Price representation in cents (1-99 for $0.01-$0.99), 0 indicates no price available
@@ -802,6 +805,7 @@ mod tests {
             poly_no_token: format!("no_token_{}", id).into(),
             line_value: None,
             team_suffix: None,
+            neg_risk: false,
         }
     }
 
@@ -1207,6 +1211,7 @@ mod tests {
             poly_no_token: "no_token_cfc".into(),
             line_value: None,
             team_suffix: Some("CFC".into()),
+            neg_risk: false,
         };
 
         let poly_yes_token = pair.poly_yes_token.clone();

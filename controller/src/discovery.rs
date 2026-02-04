@@ -284,7 +284,7 @@ impl DiscoveryClient {
         // Step 5: Build MarketPairs for successful matches
         let mut pairs = Vec::new();
         for (poly_slug, market) in slugs_to_lookup {
-            if let Some((yes_token, no_token, _)) = results.get(&poly_slug) {
+            if let Some((yes_token, no_token, _, neg_risk)) = results.get(&poly_slug) {
                 info!("   ✅ Matched: {} -> {}", market.ticker, poly_slug);
 
                 let desc = if market_type == MarketType::Moneyline {
@@ -314,6 +314,7 @@ impl DiscoveryClient {
                     poly_no_token: no_token.clone().into(),
                     line_value: market.floor_strike,
                     team_suffix: team_suffix.map(|s| s.into()),
+                    neg_risk: *neg_risk,
                 });
             } else {
                 info!("   ❌ No match: {} -> {}", market.ticker, poly_slug);
@@ -665,7 +666,7 @@ impl DiscoveryClient {
         );
 
         // Step 2: Batch lookup all slugs (in chunks to avoid URL length limits)
-        let mut slug_results: HashMap<String, (String, String, Vec<String>)> = HashMap::new();
+        let mut slug_results: HashMap<String, (String, String, Vec<String>, bool)> = HashMap::new();
         for chunk in slugs.chunks(GAMMA_BATCH_SIZE) {
             let chunk_vec: Vec<String> = chunk.to_vec();
             match self.gamma.lookup_markets_batch(&chunk_vec).await {
@@ -723,10 +724,11 @@ impl DiscoveryClient {
             let lookup_result = slug_results.get(&task.poly_slug);
 
             match lookup_result {
-                Some((token1, token2, outcomes)) => {
+                Some((token1, token2, outcomes, neg_risk)) => {
                     let token1 = token1.clone();
                     let token2 = token2.clone();
                     let outcomes = outcomes.clone();
+                    let neg_risk = *neg_risk;
                     let team_suffix = extract_team_suffix(&task.market.ticker);
 
                     // DIAGNOSTIC: Log API response for token-outcome verification
@@ -897,6 +899,7 @@ impl DiscoveryClient {
                         poly_no_token: no_token.into(),
                         line_value: task.market.floor_strike,
                         team_suffix: team_suffix.map(|s| s.into()),
+                        neg_risk,
                     });
                 }
                 None => {
@@ -1226,7 +1229,7 @@ impl DiscoveryClient {
 
             // Step 2: Batch lookup all slugs
             let slugs: Vec<String> = tasks.iter().map(|(_, slug)| slug.clone()).collect();
-            let mut slug_results: HashMap<String, (String, String, Vec<String>)> = HashMap::new();
+            let mut slug_results: HashMap<String, (String, String, Vec<String>, bool)> = HashMap::new();
 
             for chunk in slugs.chunks(GAMMA_BATCH_SIZE) {
                 let chunk_vec: Vec<String> = chunk.to_vec();
@@ -1263,7 +1266,7 @@ impl DiscoveryClient {
 
             // Step 4: Process results
             for (market, poly_slug) in tasks {
-                let Some((token1, token2, outcomes)) = slug_results.get(&poly_slug) else {
+                let Some((token1, token2, outcomes, neg_risk)) = slug_results.get(&poly_slug) else {
                     if pairing_debug {
                         info!(
                             "❌ [PAIR] NO_MATCH league={} type={:?} market={} poly_slug={}",
@@ -1276,6 +1279,7 @@ impl DiscoveryClient {
                 let token1 = token1.clone();
                 let token2 = token2.clone();
                 let outcomes = outcomes.clone();
+                let neg_risk = *neg_risk;
                 let team_suffix = extract_team_suffix(&market.ticker);
 
                 // Use outcomes to determine which token is YES for this Kalshi market
@@ -1386,6 +1390,7 @@ impl DiscoveryClient {
                     poly_no_token: no_token.into(),
                     line_value: market.floor_strike,
                     team_suffix: team_suffix.map(|s| s.into()),
+                    neg_risk,
                 });
             }
         }
@@ -1415,9 +1420,9 @@ impl DiscoveryClient {
             }
         };
 
-        // Build lookup: (date:norm_team1:norm_team2) -> (slug, yes_token, no_token, poly_team1)
+        // Build lookup: (date:norm_team1:norm_team2) -> (slug, yes_token, no_token, poly_team1, neg_risk)
         // poly_team1 is the normalized name of the team that the YES token represents
-        let mut poly_lookup: HashMap<String, (String, String, String, String)> = HashMap::new();
+        let mut poly_lookup: HashMap<String, (String, String, String, String, bool)> = HashMap::new();
 
         for event in &poly_events {
             let slug = match &event.slug {
@@ -1486,8 +1491,18 @@ impl DiscoveryClient {
                                             // Store with both key orderings
                                             let key1 = format!("{}:{}:{}", date, norm1, norm2);
                                             let key2 = format!("{}:{}:{}", date, norm2, norm1);
-                                            poly_lookup.insert(key1, (slug.clone(), team1_token.clone(), team2_token.clone(), poly_team1_norm.clone()));
-                                            poly_lookup.insert(key2, (slug.clone(), team1_token, team2_token, poly_team1_norm));
+                                            let neg_risk = match event.neg_risk {
+                                                Some(nr) => nr,
+                                                None => {
+                                                    tracing::warn!(
+                                                        "[DISCOVERY] Event {} missing neg_risk field - defaulting to false",
+                                                        slug
+                                                    );
+                                                    false
+                                                }
+                                            };
+                                            poly_lookup.insert(key1, (slug.clone(), team1_token.clone(), team2_token.clone(), poly_team1_norm.clone(), neg_risk));
+                                            poly_lookup.insert(key2, (slug.clone(), team1_token, team2_token, poly_team1_norm, neg_risk));
                                         }
                                     }
                                 } else {
@@ -1555,7 +1570,7 @@ impl DiscoveryClient {
                     let norm2 = normalize_esports_team(&team2);
                     let key = format!("{}:{}:{}", date, norm1, norm2);
 
-                    if let Some((slug, yes_token, no_token, poly_team1)) = poly_lookup.get(&key) {
+                    if let Some((slug, yes_token, no_token, poly_team1, neg_risk)) = poly_lookup.get(&key) {
                         // Use pre-fetched markets (no API call needed)
                         let markets = markets_by_event.get(&event.event_ticker).cloned().unwrap_or_default();
 
@@ -1631,6 +1646,7 @@ impl DiscoveryClient {
                                 poly_no_token: poly_no.into(),
                                 line_value: market.floor_strike,
                                 team_suffix: team_suffix.map(|s| s.into()),
+                                neg_risk: *neg_risk,
                             });
                         }
                     }
@@ -2454,6 +2470,7 @@ mod tests {
                 poly_no_token: "no".into(),
                 line_value: None,
                 team_suffix: None,
+                neg_risk: false,
             },
             MarketPair {
                 pair_id: "p2".into(),
@@ -2468,6 +2485,7 @@ mod tests {
                 poly_no_token: "no".into(),
                 line_value: None,
                 team_suffix: None,
+                neg_risk: false,
             },
         ];
 
@@ -3430,6 +3448,7 @@ mod tests {
             poly_no_token: "no_token".into(),
             line_value: None,
             team_suffix: None,
+            neg_risk: false,
         }
     }
 

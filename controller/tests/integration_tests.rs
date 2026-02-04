@@ -450,6 +450,17 @@ mod infra_integration_tests {
         poly_yes: PriceCents,
         poly_no: PriceCents,
     ) -> (GlobalState, u16) {
+        setup_market_with_neg_risk(kalshi_yes, kalshi_no, poly_yes, poly_no, false)
+    }
+
+    /// Helper to create market state with prices and explicit neg_risk flag
+    fn setup_market_with_neg_risk(
+        kalshi_yes: PriceCents,
+        kalshi_no: PriceCents,
+        poly_yes: PriceCents,
+        poly_no: PriceCents,
+        neg_risk: bool,
+    ) -> (GlobalState, u16) {
         let state = GlobalState::default();
 
         let pair = MarketPair {
@@ -465,6 +476,7 @@ mod infra_integration_tests {
             poly_no_token: "arb_no_token".into(),
             line_value: None,
             team_suffix: Some("CFC".into()),
+            neg_risk,
         };
 
         let market_id = state.add_pair(pair).unwrap();
@@ -500,6 +512,32 @@ mod infra_integration_tests {
 
         let arb = arb.expect("Should detect arb");
         assert_eq!(arb.arb_type, ArbType::PolyYesKalshiNo, "Should detect Poly YES + Kalshi NO arb");
+    }
+
+    /// Test: arb detection works with neg_risk=true markets
+    /// This exercises the neg_risk code path to ensure the field is properly propagated
+    #[test]
+    fn test_detects_arb_with_neg_risk_true() {
+        // Same as poly_yes_kalshi_no test but with neg_risk=true
+        let (state, market_id) = setup_market_with_neg_risk(55, 50, 40, 65, true);
+
+        let market = state.get_by_id(market_id).unwrap();
+
+        // Verify neg_risk was stored correctly via the pair() accessor
+        let pair = market.pair().expect("Should have pair");
+        assert!(pair.neg_risk, "neg_risk should be true");
+
+        // Arb detection should work the same regardless of neg_risk
+        let arb = ArbOpportunity::detect(
+            market_id,
+            market.kalshi.load(),
+            market.poly.load(),
+            state.arb_config(),
+            0,
+        );
+
+        let arb = arb.expect("Should detect arb with neg_risk=true market");
+        assert_eq!(arb.arb_type, ArbType::PolyYesKalshiNo);
     }
 
     /// Test: detects clear cross-platform arb (Kalshi YES + Poly NO)
@@ -733,6 +771,7 @@ mod infra_integration_tests {
                 poly_no_token: format!("no_{}", i).into(),
                 line_value: None,
                 team_suffix: None,
+                neg_risk: false,
             };
 
             let id = state.add_pair(pair).unwrap();
@@ -1362,6 +1401,7 @@ mod process_mock_tests {
             poly_no_token: "pf_no_token".into(),
             line_value: None,
             team_suffix: None,
+            neg_risk: false,
         }
     }
 
@@ -2135,6 +2175,7 @@ mod startup_sweep_tests {
             poly_no_token: format!("no-{}", id).into(),
             line_value: None,
             team_suffix: None,
+            neg_risk: false,
         }
     }
 
@@ -2340,6 +2381,7 @@ mod startup_sweep_tests {
                 poly_no_token: format!("no-{}", id).into(),
                 line_value: None,
                 team_suffix: None,
+                neg_risk: false,
             }
         }
 

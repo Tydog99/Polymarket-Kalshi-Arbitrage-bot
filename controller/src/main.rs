@@ -776,12 +776,27 @@ async fn main() -> Result<()> {
     let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
     let poly_async = Arc::new(SharedAsyncClient::new(poly_async_client, prepared_creds, POLYGON_CHAIN_ID));
 
-    // Load neg_risk cache from Python script output
+    // Load neg_risk cache from file (fallback) and discovery (primary)
+    // File cache can fill gaps for markets not yet discovered
     let neg_risk_cache_path = paths::resolve_user_path(".clob_market_cache.json");
     match poly_async.load_cache(&neg_risk_cache_path.to_string_lossy()) {
-        Ok(count) => info!("[POLYMARKET] Loaded {} neg_risk entries from cache", count),
-        Err(e) => warn!("[POLYMARKET] Could not load neg_risk cache: {}", e),
+        Ok(count) => info!("[POLYMARKET] Loaded {} neg_risk entries from file cache", count),
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("No such file") || err_str.contains("cannot find the path") {
+                tracing::debug!("[POLYMARKET] No file cache found (expected for fresh installs)");
+            } else {
+                tracing::warn!(
+                    "[POLYMARKET] File cache load failed: {} - discovery will be sole source of neg_risk data",
+                    e
+                );
+            }
+        }
     }
+
+    // Populate neg_risk cache from discovered pairs (this overrides file cache entries)
+    let cache_count = poly_async.populate_cache_from_pairs(&result.pairs);
+    info!("[POLYMARKET] Populated {} neg_risk entries from discovery", cache_count);
 
     info!("[POLYMARKET] Client ready for {}", &poly_funder[..10]);
 

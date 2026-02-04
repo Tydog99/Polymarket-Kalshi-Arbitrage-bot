@@ -70,6 +70,7 @@ fn create_test_market_pair() -> MarketPair {
         poly_no_token: "poly-no-token-67890".into(),
         line_value: None,
         team_suffix: Some("SAS".into()),
+        neg_risk: false,
     }
 }
 
