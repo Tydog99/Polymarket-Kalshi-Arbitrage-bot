@@ -588,6 +588,20 @@ impl SharedAsyncClient {
         Ok(count)
     }
 
+    /// Populate neg_risk cache directly from MarketPairs discovered at runtime.
+    /// This eliminates the need for the separate Python cache-warming script.
+    pub fn populate_cache_from_pairs(&self, pairs: &[crate::types::MarketPair]) -> usize {
+        let mut cache = self.neg_risk_cache.write().unwrap();
+        let mut count = 0;
+        for pair in pairs {
+            // Insert both YES and NO tokens with the same neg_risk value
+            cache.insert(pair.poly_yes_token.to_string(), pair.neg_risk);
+            cache.insert(pair.poly_no_token.to_string(), pair.neg_risk);
+            count += 2;
+        }
+        count
+    }
+
     /// Execute FAK buy order - 
     pub async fn buy_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         debug_assert!(!token_id.is_empty(), "token_id must not be empty");
@@ -708,6 +722,12 @@ impl SharedAsyncClient {
         let neg_risk = match neg_risk {
             Some(nr) => nr,
             None => {
+                // WARNING: neg_risk not in cache - this means discovery didn't populate it
+                // This triggers an extra API call and may indicate a bug in discovery
+                tracing::warn!(
+                    "⚠️ [POLY] neg_risk CACHE MISS for token {}... - fetching from API (discovery may have failed to populate)",
+                    &token_id[..token_id.len().min(20)]
+                );
                 let nr = self.inner.check_neg_risk(token_id).await?;
                 let mut cache = self.neg_risk_cache.write().unwrap();
                 cache.insert(token_id.to_string(), nr);

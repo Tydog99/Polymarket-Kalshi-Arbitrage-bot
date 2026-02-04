@@ -317,6 +317,7 @@ mod tests {
             poly_no_token: "0x5678".into(),
             line_value: None,
             team_suffix: None,
+            neg_risk: false,
         })
     }
 

@@ -34,6 +34,21 @@ Last updated: 2026-01-20
 
 - [ ] **Push Notifications to our phones for arbs**
 
+- [ ] **Monitor open positions for premature leg closure**
+  - [ ] Scan positions periodically for one leg closing early (e.g., market resolves on one platform)
+  - [ ] Surface this information to operator (logs, alerts, TUI)
+  - [ ] Optionally take action (close remaining leg, flag for manual review)
+
+- [ ] **Audit circuit breaker behavior for repeated Poly failures**
+  - [ ] Understand current flow: arb detected → Kalshi fills → Poly fails → Kalshi unwinds at loss → arb re-appears → repeat
+  - [ ] Determine if market-specific blacklisting exists (or should exist)
+  - [ ] Review cooldown logic: does consecutive error tracking prevent this loop?
+  - [ ] Document circuit_breaker.rs behavior for this scenario
+
+- [ ] **Document Polymarket order placement flow (3 API calls)**
+  - [ ] Explain pre-signing API calls and why they're needed
+  - [ ] Document the sequence: create order → sign → submit (or similar)
+
 ## Notes / decisions
 
 - Keep this file as the source of truth for “what’s next” and mark items done as we land changes.

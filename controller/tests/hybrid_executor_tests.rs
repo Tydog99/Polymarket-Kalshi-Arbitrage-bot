@@ -34,6 +34,7 @@ fn make_test_pair() -> MarketPair {
         poly_no_token: "0xhybrid_no".into(),
         line_value: None,
         team_suffix: None,
+        neg_risk: false,
     }
 }
 
