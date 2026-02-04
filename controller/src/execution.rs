@@ -394,25 +394,41 @@ impl ExecutionEngine {
 
                     info!("[EXEC] ⏳ Poly order delayed ({}), spawning reconciliation", poly_order_id);
 
-                    // Record Kalshi fill immediately WITH reconciliation_pending marker
-                    if kalshi_filled > 0 {
-                        let kalshi_price = kalshi_cost as f64 / 100.0 / kalshi_filled as f64;
-                        self.position_channel.record_fill(FillRecord::with_pending_reconciliation(
-                            &position_id,
-                            &pair.description,
-                            "kalshi",
-                            kalshi_side,
-                            max_contracts as f64,
-                            kalshi_filled as f64,
-                            kalshi_price,
-                            kalshi_fees as f64 / 100.0,
-                            &kalshi_order_id,
-                            if kalshi_side == "yes" { TradeReason::ArbLegYes } else { TradeReason::ArbLegNo },
-                            if kalshi_filled == max_contracts { TradeStatus::Success } else { TradeStatus::PartialFill },
-                            None,
-                            poly_order_id.clone(),
-                        ));
-                    }
+                    // Record Kalshi fill/attempt immediately WITH reconciliation_pending marker
+                    // Always record, even if kalshi_filled=0, so we have an audit trail
+                    let kalshi_price = if kalshi_filled > 0 {
+                        kalshi_cost as f64 / 100.0 / kalshi_filled as f64
+                    } else {
+                        // Use the requested price for failed orders
+                        cents_to_price(if kalshi_side == "yes" { req.yes_price } else { req.no_price })
+                    };
+                    let kalshi_status = if kalshi_filled == max_contracts {
+                        TradeStatus::Success
+                    } else if kalshi_filled > 0 {
+                        TradeStatus::PartialFill
+                    } else {
+                        TradeStatus::Failed
+                    };
+                    let kalshi_failure_reason = if kalshi_filled == 0 {
+                        Some("No fill".to_string())
+                    } else {
+                        None
+                    };
+                    self.position_channel.record_fill(FillRecord::with_pending_reconciliation(
+                        &position_id,
+                        &pair.description,
+                        "kalshi",
+                        kalshi_side,
+                        max_contracts as f64,
+                        kalshi_filled as f64,
+                        kalshi_price,
+                        kalshi_fees as f64 / 100.0,
+                        &kalshi_order_id,
+                        if kalshi_side == "yes" { TradeReason::ArbLegYes } else { TradeReason::ArbLegNo },
+                        kalshi_status,
+                        kalshi_failure_reason,
+                        poly_order_id.clone(),
+                    ));
 
                     // Read timeout from env var (default 5000ms)
                     let timeout_ms: u64 = std::env::var("POLY_DELAYED_TIMEOUT_MS")
@@ -1001,6 +1017,12 @@ impl ExecutionEngine {
         let mut total_proceeds_cents: i64 = 0;
         let mut attempt = 0u32;
 
+        // Read timeout from env var for delayed order polling (default 5000ms)
+        let delayed_timeout_ms: u64 = std::env::var("POLY_DELAYED_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000);
+
         while remaining > 0 && current_price_cents >= min_price_cents {
             attempt += 1;
             let price_decimal = cents_to_price(current_price_cents as u16);
@@ -1008,8 +1030,33 @@ impl ExecutionEngine {
 
             match poly_async.sell_fak(token, price_decimal, requested).await {
                 Ok(fill) => {
-                    let filled = fill.filled_size as i64;
-                    let proceeds_cents = (fill.fill_cost * 100.0) as i64;
+                    // Handle delayed orders by polling for final status (same as BUY reconciliation)
+                    let (filled, proceeds_cents) = if fill.is_delayed {
+                        info!(
+                            "[EXEC] 🔄 Poly close attempt #{} @ {}c returned delayed ({}), polling...",
+                            attempt, current_price_cents, fill.order_id
+                        );
+
+                        // Poll until terminal state or timeout
+                        match poly_async.poll_delayed_order(&fill.order_id, price_decimal, delayed_timeout_ms).await {
+                            Ok((matched, cost)) => {
+                                info!(
+                                    "[EXEC] 🔄 Poly close delayed order {} resolved: filled={:.0}, cost=${:.2}",
+                                    fill.order_id, matched, cost
+                                );
+                                (matched as i64, (cost * 100.0) as i64)
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "[EXEC] ⚠️ Poly close delayed order {} timeout/error: {} - assuming no fill",
+                                    fill.order_id, e
+                                );
+                                (0, 0)
+                            }
+                        }
+                    } else {
+                        (fill.filled_size as i64, (fill.fill_cost * 100.0) as i64)
+                    };
 
                     info!(
                         "[EXEC] 🔄 Poly close attempt #{}: filled {}/{} @ {}c (total: {}/{})",
@@ -1020,7 +1067,7 @@ impl ExecutionEngine {
                     // Always use limit price for consistency with what we requested
                     record_close(
                         position_channel, "polymarket", side,
-                        requested, fill.filled_size, price_decimal,
+                        requested, filled as f64, price_decimal,
                         &fill.order_id, attempt
                     );
 

@@ -392,7 +392,17 @@ impl KalshiApiClient {
         debug!("[KALSHI] IOC {} {} @{}¢ x{}", side, ticker, price_cents, count);
 
         let resp = self.create_order(&order).await?;
-        debug!("[KALSHI] {} filled={}", resp.order.status, resp.order.filled_count());
+        let filled = resp.order.filled_count();
+        debug!("[KALSHI] {} filled={}", resp.order.status, filled);
+
+        // Warn if IOC order was canceled with no fills (likely no liquidity at requested price)
+        if resp.order.status == "canceled" && filled == 0 {
+            warn!(
+                "[KALSHI] IOC BUY {} {} @{}¢ x{} was CANCELED with 0 fills (no liquidity at price?)",
+                side, ticker, price_cents, count
+            );
+        }
+
         Ok(resp)
     }
 
@@ -419,7 +429,17 @@ impl KalshiApiClient {
         debug!("[KALSHI] SELL {} {} @{}¢ x{}", side, ticker, price_cents, count);
 
         let resp = self.create_order(&order).await?;
-        debug!("[KALSHI] {} filled={}", resp.order.status, resp.order.filled_count());
+        let filled = resp.order.filled_count();
+        debug!("[KALSHI] {} filled={}", resp.order.status, filled);
+
+        // Warn if IOC order was canceled with no fills (likely no liquidity at price)
+        if resp.order.status == "canceled" && filled == 0 {
+            warn!(
+                "[KALSHI] IOC SELL {} {} @{}¢ x{} was CANCELED with 0 fills (no liquidity at price?)",
+                side, ticker, price_cents, count
+            );
+        }
+
         Ok(resp)
     }
 }
