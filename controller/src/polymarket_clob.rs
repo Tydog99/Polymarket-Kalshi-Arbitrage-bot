@@ -399,6 +399,37 @@ pub struct PolymarketOrderResponse {
 }
 
 // ============================================================================
+// BALANCE RESPONSE
+// ============================================================================
+
+/// Response from GET /balance-allowance?asset_type=COLLATERAL
+///
+/// Balance and allowance are returned as strings in 6-decimal USDC format.
+/// For example, "1500000000" represents 1500 USDC ($1500.00 = 150000 cents).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PolyBalance {
+    /// USDC.e balance in 6 decimals (string)
+    pub balance: String,
+    /// Approved allowance in 6 decimals (string)
+    pub allowance: String,
+}
+
+impl PolyBalance {
+    /// Convert balance string to cents (divide by 10000).
+    ///
+    /// USDC has 6 decimals, so 1000000 = 1 USDC = 100 cents.
+    /// To convert to cents: value / 10000
+    pub fn balance_as_cents(&self) -> i64 {
+        self.balance.parse::<i64>().unwrap_or(0) / 10000
+    }
+
+    /// Convert allowance string to cents (divide by 10000).
+    pub fn allowance_as_cents(&self) -> i64 {
+        self.allowance.parse::<i64>().unwrap_or(0) / 10000
+    }
+}
+
+// ============================================================================
 // ASYNC CLIENT
 // ============================================================================
 
@@ -530,6 +561,31 @@ impl PolymarketAsyncClient {
             .map_err(|e| anyhow!("get_order {} parse error: {} (body: {})", order_id, e, body))
     }
 
+    /// Get balance and allowance for the wallet.
+    ///
+    /// Makes authenticated GET request to /balance-allowance?asset_type=COLLATERAL
+    pub async fn get_balance_async(&self, creds: &PreparedCreds) -> Result<PolyBalance> {
+        let path = "/balance-allowance?asset_type=COLLATERAL";
+        let url = format!("{}{}", self.host, path);
+        let headers = self.build_l2_headers("GET", path, None, creds)?;
+
+        let resp = self.http
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            return Err(anyhow!("get_balance failed {}: {}", status, body));
+        }
+
+        serde_json::from_str(&body)
+            .map_err(|e| anyhow!("get_balance parse error: {} (body: {})", e, body))
+    }
+
     /// Check neg_risk for token - with caching
     /// Returns an error if the API response is malformed (missing neg_risk field or wrong type)
     pub async fn check_neg_risk(&self, token_id: &str) -> Result<bool> {
@@ -619,6 +675,14 @@ impl SharedAsyncClient {
             count += 2;
         }
         count
+    }
+
+    /// Get balance and allowance for the wallet.
+    ///
+    /// Returns USDC.e balance and approved allowance.
+    /// Use `balance.balance_as_cents()` to convert to cents.
+    pub async fn get_balance(&self) -> Result<PolyBalance> {
+        self.inner.get_balance_async(&self.creds).await
     }
 
     /// Execute FAK buy order - 
