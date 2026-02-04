@@ -1745,16 +1745,37 @@ async fn main() -> Result<()> {
                     for (i, pos) in open.iter().enumerate() {
                         let is_last = i == open.len() - 1;
                         let branch = if is_last { "└" } else { "├" };
+                        let continuation = if is_last { " " } else { "│" };
                         let desc: String = if pos.description.chars().count() > 45 {
                             format!("{}...", pos.description.chars().take(42).collect::<String>())
                         } else {
                             pos.description.clone()
                         };
+
+                        // Build position strings showing non-zero legs
+                        let mut parts: Vec<String> = Vec::new();
+                        if pos.poly_yes.contracts.abs() > 0.001 {
+                            parts.push(format!("P: {:.0} YES @ ${:.2}", pos.poly_yes.contracts, pos.poly_yes.cost_basis));
+                        }
+                        if pos.poly_no.contracts.abs() > 0.001 {
+                            parts.push(format!("P: {:.0} NO @ ${:.2}", pos.poly_no.contracts, pos.poly_no.cost_basis));
+                        }
+                        if pos.kalshi_yes.contracts.abs() > 0.001 {
+                            parts.push(format!("K: {:.0} YES @ ${:.2}", pos.kalshi_yes.contracts, pos.kalshi_yes.cost_basis));
+                        }
+                        if pos.kalshi_no.contracts.abs() > 0.001 {
+                            parts.push(format!("K: {:.0} NO @ ${:.2}", pos.kalshi_no.contracts, pos.kalshi_no.cost_basis));
+                        }
+                        let positions_str = if parts.is_empty() { "No contracts".to_string() } else { parts.join(" | ") };
+
+                        // Line 1: Market description
+                        log_line(format!("   {}─ {}", branch, desc));
+                        // Line 2: Positions
+                        log_line(format!("   {}     {}", continuation, positions_str));
+                        // Line 3: Cost, profit and exposure
                         log_line(format!(
-                            "   {}─ {:<45} | {:>5.1} contracts | cost: ${:>6.2} | profit: ${:>5.2} | exposure: ${:.2}",
-                            branch,
-                            desc,
-                            pos.matched_contracts(),
+                            "   {}     Cost: ${:.2} | Exp Profit: ${:.2} | Unmatched: ${:.2}",
+                            continuation,
                             pos.total_cost(),
                             pos.guaranteed_profit(),
                             pos.unmatched_exposure()

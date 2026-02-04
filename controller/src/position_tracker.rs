@@ -273,11 +273,39 @@ impl ArbPosition {
         yes_total.min(no_total)
     }
     
-    /// Unmatched exposure (contracts without offsetting position)
+    /// Unmatched exposure (dollar value of contracts without offsetting position)
+    /// This is the cost basis of the excess contracts on one side
     pub fn unmatched_exposure(&self) -> f64 {
         let yes_total = self.kalshi_yes.contracts + self.poly_yes.contracts;
         let no_total = self.kalshi_no.contracts + self.poly_no.contracts;
-        (yes_total - no_total).abs()
+        let excess = yes_total - no_total;
+
+        if excess.abs() < 0.0001 {
+            return 0.0;
+        }
+
+        if excess > 0.0 {
+            // More YES than NO - exposure is the cost of excess YES contracts
+            // Use weighted average price across both platforms
+            let total_yes_cost =
+                self.kalshi_yes.cost_basis + self.poly_yes.cost_basis;
+            if yes_total > 0.0 {
+                let avg_yes_price = total_yes_cost / yes_total;
+                excess * avg_yes_price
+            } else {
+                0.0
+            }
+        } else {
+            // More NO than YES - exposure is the cost of excess NO contracts
+            let excess_no = -excess;
+            let total_no_cost = self.kalshi_no.cost_basis + self.poly_no.cost_basis;
+            if no_total > 0.0 {
+                let avg_no_price = total_no_cost / no_total;
+                excess_no * avg_no_price
+            } else {
+                0.0
+            }
+        }
     }
     
     /// Mark position as resolved with outcome
@@ -905,16 +933,21 @@ mod tests {
     #[test]
     fn test_unmatched_exposure() {
         let mut pos = ArbPosition::new("TEST-MARKET", "Test");
-        
-        // Buy 10 YES on Poly
+
+        // Buy 10 YES on Poly @ $0.45 each
         pos.poly_yes.add(10.0, 0.45);
-        
+
         // Buy only 8 NO on Kalshi (partial fill)
         pos.kalshi_no.add(8.0, 0.50);
-        
-        // Matched: 8, Unmatched: 2
+
+        // Matched: 8, Unmatched: 2 YES contracts
+        // Exposure = 2 contracts × $0.45 avg price = $0.90
         assert!((pos.matched_contracts() - 8.0).abs() < 0.001);
-        assert!((pos.unmatched_exposure() - 2.0).abs() < 0.001);
+        assert!(
+            (pos.unmatched_exposure() - 0.90).abs() < 0.001,
+            "Expected exposure $0.90, got ${}",
+            pos.unmatched_exposure()
+        );
     }
     
     #[test]
@@ -1682,26 +1715,48 @@ mod tests {
     fn test_summary_with_unmatched_exposure() {
         let mut tracker = PositionTracker::new();
 
-        // Partial fill: 10 YES but only 7 NO
+        // Partial fill: 10 YES @ $0.45 but only 7 NO
         let yes_fill = FillRecord::with_details(
-            "TEST-MARKET", "Partial Fill Market", "polymarket", "yes",
-            10.0, 10.0, 0.45, 0.0, "order-1",
-            TradeReason::ArbLegYes, TradeStatus::Success, None,
+            "TEST-MARKET",
+            "Partial Fill Market",
+            "polymarket",
+            "yes",
+            10.0,
+            10.0,
+            0.45,
+            0.0,
+            "order-1",
+            TradeReason::ArbLegYes,
+            TradeStatus::Success,
+            None,
         );
         tracker.record_fill_internal(&yes_fill);
 
         let no_fill = FillRecord::with_details(
-            "TEST-MARKET", "Partial Fill Market", "kalshi", "no",
-            10.0, 7.0, 0.50, 0.0, "order-2",  // Only 7 filled
-            TradeReason::ArbLegNo, TradeStatus::PartialFill, None,
+            "TEST-MARKET",
+            "Partial Fill Market",
+            "kalshi",
+            "no",
+            10.0,
+            7.0,
+            0.50,
+            0.0,
+            "order-2", // Only 7 filled
+            TradeReason::ArbLegNo,
+            TradeStatus::PartialFill,
+            None,
         );
         tracker.record_fill_internal(&no_fill);
 
         let summary = tracker.summary();
 
         assert_eq!(summary.open_positions, 1);
-        // 3 unmatched YES contracts
-        assert!((summary.total_unmatched_exposure - 3.0).abs() < 0.001);
+        // 3 unmatched YES contracts @ $0.45 = $1.35 exposure
+        assert!(
+            (summary.total_unmatched_exposure - 1.35).abs() < 0.001,
+            "Expected exposure $1.35, got ${}",
+            summary.total_unmatched_exposure
+        );
     }
 
     #[test]
