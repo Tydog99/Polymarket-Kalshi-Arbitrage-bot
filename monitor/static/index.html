@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Arb Monitor • Live Markets</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script src="/static/app.js" defer></script>
+    <script src="/static/markets.js" defer></script>
+  </head>
+  <body>
+    <div class="nav">
+      <div class="nav-inner">
+        <div class="brand">
+          <div>Arb Monitor</div>
+          <small class="mono">local</small>
+        </div>
+        <div class="menu">
+          <a data-nav href="/">Live Markets</a>
+          <a data-nav href="/positions">Positions</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="container">
+      <div class="header">
+        <div>
+          <h1>Live Markets</h1>
+          <p class="sub">
+            Streams live market snapshots from the controller debug WebSocket.
+            Start the controller with <span class="mono">--verbose-heartbeat --debug-ws</span>.
+          </p>
+        </div>
+        <div class="pill" title="Connection state">
+          <span id="connDot" class="dot"></span>
+          <span id="connText">Connecting…</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div style="padding: 12px; border-bottom: 1px solid var(--border); display:flex; gap:12px; align-items:center; justify-content:space-between;">
+          <div class="muted" id="summary">—</div>
+          <input id="filter" placeholder="Filter markets…" style="min-width: 260px; background: rgba(15,23,42,0.6); color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px;" />
+        </div>
+        <table class="table" aria-label="Live markets table">
+          <thead>
+            <tr>
+              <th>League</th>
+              <th>Type</th>
+              <th>Description</th>
+              <th class="mono">Kalshi</th>
+              <th class="mono">Poly</th>
+              <th class="mono">Gap</th>
+              <th class="mono">Size</th>
+              <th class="mono">Updates</th>
+              <th class="mono">Age</th>
+            </tr>
+          </thead>
+          <tbody id="rows">
+            <tr><td colspan="9" class="empty">Waiting for controller stream…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </body>
+</html>
+

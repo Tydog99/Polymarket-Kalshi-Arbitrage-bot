@@ -3,6 +3,8 @@ resolver = "2"
 members = [
   "bootstrap",
   "controller",
+  "debug_web",
+  "monitor",
   "tailscale",
   "trader",
   "trading",
