@@ -126,6 +126,42 @@ async function fetchSnapshot() {
   renderPositions(json);
 }
 
+function setExternalStatus(text) {
+  const el = document.getElementById("externalStatus");
+  if (el) el.textContent = text;
+}
+
+function renderExternalOverview(overview) {
+  const externalPre = document.getElementById("externalJson");
+  const recPre = document.getElementById("reconcileJson");
+
+  if (externalPre) {
+    externalPre.textContent = JSON.stringify(overview?.external ?? {}, null, 2);
+  }
+  if (recPre) {
+    recPre.textContent = JSON.stringify(overview?.reconciliation ?? {}, null, 2);
+  }
+
+  const errs = overview?.external?.errors || {};
+  const parts = [];
+  if (errs.kalshi) parts.push(`kalshi_error`);
+  if (errs.polymarket) parts.push(`polymarket_error`);
+  const errStr = parts.length ? ` (${parts.join(", ")})` : "";
+  const ts = overview?.external?.snapshot_time || overview?.snapshot_time || "—";
+  setExternalStatus(`External: ${ts}${errStr}`);
+}
+
+async function fetchOverview(force = false) {
+  const url = force
+    ? "/api/positions/overview?refresh_external=1"
+    : "/api/positions/overview";
+  const res = await fetch(url, { cache: "no-store" });
+  const json = await res.json();
+  // Use internal payload if present (helps first paint); SSE will keep it fresh.
+  if (json?.internal) renderPositions(json.internal);
+  renderExternalOverview(json);
+}
+
 function startStream() {
   const es = new EventSource("/api/positions/stream");
 
@@ -154,6 +190,35 @@ window.addEventListener("DOMContentLoaded", async () => {
   } catch {
     // ignore; stream will fill
   }
+  try {
+    await fetchOverview(false);
+  } catch {
+    // ignore; user can refresh
+  }
+
+  const btn = document.getElementById("externalRefreshBtn");
+  if (btn) {
+    btn.addEventListener("click", () => {
+      fetchOverview(true).catch(() => {});
+    });
+  }
+
+  const auto = document.getElementById("externalAutoRefresh");
+  let timer = null;
+  if (auto) {
+    auto.addEventListener("change", () => {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      if (auto.checked) {
+        timer = setInterval(() => {
+          fetchOverview(false).catch(() => {});
+        }, 30000);
+      }
+    });
+  }
+
   startStream();
 });
 

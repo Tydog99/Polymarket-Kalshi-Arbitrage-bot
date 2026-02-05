@@ -31,9 +31,19 @@
             in automatically when the file changes.
           </p>
         </div>
-        <div class="pill" title="Connection state">
-          <span id="connDot" class="dot"></span>
-          <span id="connText">Connecting…</span>
+        <div class="headerRight">
+          <div class="pill" title="Connection state">
+            <span id="connDot" class="dot"></span>
+            <span id="connText">Connecting…</span>
+          </div>
+          <div class="actions">
+            <button id="externalRefreshBtn" class="btn">Refresh external</button>
+            <label class="toggle">
+              <input id="externalAutoRefresh" type="checkbox" />
+              <span>Auto (30s)</span>
+            </label>
+            <span id="externalStatus" class="muted mono">External: —</span>
+          </div>
         </div>
       </div>
 
@@ -60,6 +70,30 @@
             </tr>
           </tbody>
         </table>
+      </div>
+
+      <div class="panel" style="margin-top: 14px">
+        <div class="panelHeader">
+          <div>
+            <div class="panelTitle">External snapshot + reconciliation</div>
+            <div class="muted" style="margin-top: 6px; font-size: 13px">
+              Fetched server-side by <span class="mono">monitor</span>. No keys are
+              exposed to the browser.
+            </div>
+          </div>
+        </div>
+        <div class="panelBody">
+          <div class="twoCol">
+            <div>
+              <div class="muted" style="margin-bottom: 6px">Overview (external)</div>
+              <pre id="externalJson" class="codeBlock">Loading…</pre>
+            </div>
+            <div>
+              <div class="muted" style="margin-bottom: 6px">Reconciliation</div>
+              <pre id="reconcileJson" class="codeBlock">Loading…</pre>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </body>

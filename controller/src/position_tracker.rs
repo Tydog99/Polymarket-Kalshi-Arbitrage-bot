@@ -16,6 +16,47 @@ use tracing::{info, warn};
 // TRADE HISTORY TYPES
 // =============================================================================
 
+/// Optional identifiers that allow deterministic joins to external holdings APIs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExternalIds {
+    /// Kalshi stable market identifier (typically the market ticker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kalshi_market_ticker: Option<String>,
+
+    /// Polymarket Data API `asset` identifiers for the YES/NO sides (if known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poly_asset_yes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poly_asset_no: Option<String>,
+
+    /// Polymarket Data API `conditionId` (useful for grouping/filtering).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poly_condition_id: Option<String>,
+
+    /// Optional: Polymarket CLOB token IDs (if/when we reconcile via CLOB holdings).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poly_token_id_yes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poly_token_id_no: Option<String>,
+
+    /// UI/debug only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poly_market_slug: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_ids: Option<AccountIds>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AccountIds {
+    /// Wallet / proxy wallet address used for Polymarket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poly_address: Option<String>,
+    /// Kalshi member/account identifier if available from API responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kalshi_member_id: Option<String>,
+}
+
 /// Reason for a trade attempt (for audit trail)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -133,6 +174,10 @@ pub struct ArbPosition {
 
     /// Description for logging
     pub description: String,
+
+    /// Optional identifiers for external holdings reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ids: Option<ExternalIds>,
 
     /// Kalshi YES position
     pub kalshi_yes: PositionLeg,

@@ -2663,8 +2663,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
+ "dotenvy",
  "futures-util",
  "notify",
+ "reqwest 0.12.28",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-stream",
@@ -2672,6 +2676,7 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "trading",
 ]
 
 [[package]]
