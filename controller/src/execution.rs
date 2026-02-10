@@ -1016,6 +1016,11 @@ impl ExecutionEngine {
         let mut total_closed: i64 = 0;
         let mut total_proceeds_cents: i64 = 0;
         let mut attempt = 0u32;
+        let mut settlement_retries = 0u32;
+        let max_settlement_retries: u32 = std::env::var("POLY_SETTLEMENT_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
 
         // Read timeout from env var for delayed order polling (default 5000ms)
         let delayed_timeout_ms: u64 = std::env::var("POLY_DELAYED_TIMEOUT_MS")
@@ -1078,6 +1083,35 @@ impl ExecutionEngine {
                     }
                 }
                 Err(e) => {
+                    let err_msg = e.to_string();
+                    let is_settlement_error = err_msg.contains("not enough balance")
+                        || err_msg.contains("not enough allowance");
+
+                    if is_settlement_error {
+                        settlement_retries += 1;
+                        if settlement_retries > max_settlement_retries {
+                            error!(
+                                "[EXEC] ❌ Settlement never completed after {} retries, giving up",
+                                settlement_retries
+                            );
+                            record_close(
+                                position_channel, "polymarket", side,
+                                requested, 0.0, price_decimal, "", attempt
+                            );
+                            break;
+                        }
+                        warn!(
+                            "[EXEC] ⏳ Settlement pending, retry #{} at same price {}c",
+                            settlement_retries, current_price_cents
+                        );
+                        record_close(
+                            position_channel, "polymarket", side,
+                            requested, 0.0, price_decimal, "", attempt
+                        );
+                        tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                        continue;
+                    }
+
                     warn!(
                         "[EXEC] ⚠️ Poly close attempt #{} failed @ {}c: {}",
                         attempt, current_price_cents, e
@@ -1962,6 +1996,120 @@ mod tests {
             "3 contracts should meet minimum {} for 49¢ price",
             min_contracts
         );
+    }
+
+    // =========================================================================
+    // Settlement retry tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_settlement_retry_keeps_same_price() {
+        use crate::poly_executor::mock::{MockPolyClient, MockResponse};
+        use crate::position_tracker::create_position_channel;
+
+        let mock_client = MockPolyClient::new();
+
+        // Return "not enough balance" 3 times, then succeed with full fill
+        mock_client.set_response_sequence("test-token", vec![
+            MockResponse::Error("not enough balance".to_string()),
+            MockResponse::Error("not enough balance".to_string()),
+            MockResponse::Error("not enough balance".to_string()),
+            MockResponse::FullFill { size: 5.0, price: 0.39 },
+        ]);
+
+        let mock: Arc<dyn crate::poly_executor::PolyExecutor> = Arc::new(mock_client);
+        let (position_channel, mut _rx) = create_position_channel();
+
+        // Track recorded prices to verify they don't step down
+        let recorded_prices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prices_clone = recorded_prices.clone();
+
+        let record_close = move |_ch: &PositionChannel, _platform: &str, _side: &str,
+                                  _requested: f64, _filled: f64, price: f64, _oid: &str, _attempt: u32| {
+            prices_clone.lock().unwrap().push(price);
+        };
+
+        let log_final = |_platform: &str, _closed: i64, _proceeds: i64, _remaining: i64| {};
+
+        ExecutionEngine::close_poly_with_retry(
+            &mock,
+            &position_channel,
+            "test-token",
+            "yes",
+            40,    // start at 40c
+            5,     // close 5 contracts
+            1,     // min 1c
+            1,     // step 1c
+            1,     // 1ms delay for fast test
+            record_close,
+            log_final,
+        ).await;
+
+        let prices = recorded_prices.lock().unwrap();
+        // 3 failed attempts + 1 success = 4 records
+        assert_eq!(prices.len(), 4, "Expected 4 recorded attempts, got {}", prices.len());
+
+        // All settlement retries should be at the same price (39c = start - 1 initial step)
+        // The price should NOT step down during settlement errors
+        let expected_price = 0.39; // (40 - 1) / 100
+        for (i, &price) in prices.iter().enumerate() {
+            assert!(
+                (price - expected_price).abs() < 0.001,
+                "Attempt {} price was {}, expected {} (price should not step down on settlement error)",
+                i + 1, price, expected_price
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_settlement_retry_exhaustion_breaks() {
+        use crate::poly_executor::mock::MockPolyClient;
+        use crate::position_tracker::create_position_channel;
+
+        let mock_client = MockPolyClient::new();
+
+        // Always return settlement error
+        mock_client.set_error("test-token", "not enough balance");
+
+        let mock: Arc<dyn crate::poly_executor::PolyExecutor> = Arc::new(mock_client);
+        let (position_channel, mut _rx) = create_position_channel();
+        let call_count = Arc::new(std::sync::Mutex::new(0u32));
+        let count_clone = call_count.clone();
+
+        let record_close = move |_ch: &PositionChannel, _platform: &str, _side: &str,
+                                  _requested: f64, _filled: f64, _price: f64, _oid: &str, _attempt: u32| {
+            *count_clone.lock().unwrap() += 1;
+        };
+
+        let log_final = |_platform: &str, _closed: i64, _proceeds: i64, _remaining: i64| {};
+
+        // Set max retries to 5 via env var for this test
+        std::env::set_var("POLY_SETTLEMENT_RETRIES", "5");
+
+        ExecutionEngine::close_poly_with_retry(
+            &mock,
+            &position_channel,
+            "test-token",
+            "yes",
+            40,
+            5,
+            1,
+            1,
+            1, // 1ms delay
+            record_close,
+            log_final,
+        ).await;
+
+        std::env::remove_var("POLY_SETTLEMENT_RETRIES");
+
+        // Should have stopped after max_settlement_retries + 1 (the one that triggers the break)
+        let count = *call_count.lock().unwrap();
+        assert!(
+            count <= 7, // 5 retries + small tolerance for the breaking attempt
+            "Expected ~6 attempts with max 5 settlement retries, got {}",
+            count
+        );
+
     }
 }
 
