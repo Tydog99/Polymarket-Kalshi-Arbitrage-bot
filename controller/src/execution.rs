@@ -1063,16 +1063,27 @@ impl ExecutionEngine {
                         (fill.filled_size as i64, (fill.fill_cost * 100.0) as i64)
                     };
 
-                    info!(
-                        "[EXEC] 🔄 Poly close attempt #{}: filled {}/{} @ {}c (total: {}/{})",
-                        attempt, filled, remaining, current_price_cents, total_closed + filled, total_to_close
-                    );
+                    // Use actual fill price when available (Poly gives taker price improvement)
+                    let record_price = if filled > 0 {
+                        proceeds_cents as f64 / 100.0 / filled as f64
+                    } else {
+                        price_decimal
+                    };
 
-                    // Record every attempt (even zero fills) for complete audit trail
-                    // Always use limit price for consistency with what we requested
+                    if filled > 0 && (record_price - price_decimal).abs() > 0.005 {
+                        info!(
+                            "[EXEC] 🔄 Poly close attempt #{}: filled {}/{} @ {:.0}c (limit {}c, price improvement) (total: {}/{})",
+                            attempt, filled, remaining, record_price * 100.0, current_price_cents, total_closed + filled, total_to_close
+                        );
+                    } else {
+                        info!(
+                            "[EXEC] 🔄 Poly close attempt #{}: filled {}/{} @ {}c (total: {}/{})",
+                            attempt, filled, remaining, current_price_cents, total_closed + filled, total_to_close
+                        );
+                    }
                     record_close(
                         position_channel, "polymarket", side,
-                        requested, filled as f64, price_decimal,
+                        requested, filled as f64, record_price,
                         &fill.order_id, attempt
                     );
 
@@ -2110,6 +2121,118 @@ mod tests {
             count
         );
 
+    }
+
+    // =========================================================================
+    // Price recording tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_close_records_actual_fill_price_not_limit() {
+        use crate::poly_executor::mock::MockPolyClient;
+        use crate::position_tracker::create_position_channel;
+
+        let mock_client = MockPolyClient::new();
+
+        // Poly gives price improvement: limit is 20c but fills at 37c
+        // fill_cost = size * price = 5 * 0.37 = 1.85
+        mock_client.set_full_fill("test-token", 5.0, 0.37);
+
+        let mock: Arc<dyn crate::poly_executor::PolyExecutor> = Arc::new(mock_client);
+        let (position_channel, mut _rx) = create_position_channel();
+
+        let recorded_prices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prices_clone = recorded_prices.clone();
+
+        let record_close = move |_ch: &PositionChannel, _platform: &str, _side: &str,
+                                  _requested: f64, _filled: f64, price: f64, _oid: &str, _attempt: u32| {
+            prices_clone.lock().unwrap().push(price);
+        };
+
+        let log_final = |_platform: &str, _closed: i64, _proceeds: i64, _remaining: i64| {};
+
+        ExecutionEngine::close_poly_with_retry(
+            &mock,
+            &position_channel,
+            "test-token",
+            "yes",
+            21,    // start at 21c (limit will be 20c after initial step-down)
+            5,     // close 5 contracts
+            1,
+            1,
+            1,
+            record_close,
+            log_final,
+        ).await;
+
+        let prices = recorded_prices.lock().unwrap();
+        assert_eq!(prices.len(), 1, "Expected 1 recorded attempt, got {}", prices.len());
+
+        // Should record 0.37 (actual fill price), NOT 0.20 (limit price)
+        let recorded = prices[0];
+        assert!(
+            (recorded - 0.37).abs() < 0.001,
+            "Recorded price {:.4} should be actual fill price 0.37, not the limit price",
+            recorded
+        );
+    }
+
+    #[tokio::test]
+    async fn test_close_records_limit_price_on_zero_fill() {
+        use crate::poly_executor::mock::{MockPolyClient, MockResponse};
+        use crate::position_tracker::create_position_channel;
+
+        let mock_client = MockPolyClient::new();
+
+        // Zero fill followed by full fill to terminate the loop
+        mock_client.set_response_sequence("test-token", vec![
+            MockResponse::FullFill { size: 0.0, price: 0.0 },  // zero fill
+            MockResponse::FullFill { size: 5.0, price: 0.37 }, // actual fill
+        ]);
+
+        let mock: Arc<dyn crate::poly_executor::PolyExecutor> = Arc::new(mock_client);
+        let (position_channel, mut _rx) = create_position_channel();
+
+        let recorded_prices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prices_clone = recorded_prices.clone();
+
+        let record_close = move |_ch: &PositionChannel, _platform: &str, _side: &str,
+                                  _requested: f64, _filled: f64, price: f64, _oid: &str, _attempt: u32| {
+            prices_clone.lock().unwrap().push(price);
+        };
+
+        let log_final = |_platform: &str, _closed: i64, _proceeds: i64, _remaining: i64| {};
+
+        ExecutionEngine::close_poly_with_retry(
+            &mock,
+            &position_channel,
+            "test-token",
+            "yes",
+            40,
+            5,
+            1,
+            1,
+            1,
+            record_close,
+            log_final,
+        ).await;
+
+        let prices = recorded_prices.lock().unwrap();
+        assert_eq!(prices.len(), 2, "Expected 2 recorded attempts, got {}", prices.len());
+
+        // First attempt (zero fill): should use limit price (39c)
+        assert!(
+            (prices[0] - 0.39).abs() < 0.001,
+            "Zero-fill should record limit price 0.39, got {:.4}",
+            prices[0]
+        );
+
+        // Second attempt (actual fill): should use actual fill price (37c)
+        assert!(
+            (prices[1] - 0.37).abs() < 0.001,
+            "Fill should record actual price 0.37, got {:.4}",
+            prices[1]
+        );
     }
 }
 
