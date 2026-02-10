@@ -21,12 +21,13 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{connect_async, tungstenite::{http::Request, Message}};
 use tracing::{debug, error, info, warn};
 
+use crate::arb::detect_arb;
 use crate::config::{self, KALSHI_WS_URL, KALSHI_API_BASE, KALSHI_API_DELAY_MS};
 use crate::execution::NanoClock;
 use crate::types::{
     KalshiEventsResponse, KalshiMarketsResponse, KalshiEvent, KalshiMarket,
     GlobalState, ArbOpportunity, PriceCents, SizeCents, fxhash_str,
-    MarketPair,
+    MarketPair, OrderbookDepth, PriceLevel, DEPTH_LEVELS,
 };
 use crate::debug_socket::{DebugBroadcaster, build_market_update_json};
 
@@ -630,11 +631,14 @@ pub async fn run_ws(
                                                 }
                                             }
 
-                                            // Check for arbs using ArbOpportunity::detect()
-                                            if let Some(req) = ArbOpportunity::detect(
+                                            // Check for arbs using detect_arb() (routes to depth or top-of-book based on USE_DEPTH)
+                                            // Clone depth data before the if-let to avoid holding the read guard across await
+                                            let kalshi_depth = market.kalshi.read().clone();
+                                            let poly_depth = market.poly.read().clone();
+                                            if let Some(req) = detect_arb(
                                                 market_id,
-                                                market.kalshi.load(),
-                                                market.poly.load(),
+                                                &kalshi_depth,
+                                                &poly_depth,
                                                 state.arb_config(),
                                                 clock.now_ns(),
                                             ) {
@@ -656,11 +660,14 @@ pub async fn run_ws(
                                                 }
                                             }
 
-                                            // Check for arbs using ArbOpportunity::detect()
-                                            if let Some(req) = ArbOpportunity::detect(
+                                            // Check for arbs using detect_arb() (routes to depth or top-of-book based on USE_DEPTH)
+                                            // Clone depth data before the if-let to avoid holding the read guard across await
+                                            let kalshi_depth = market.kalshi.read().clone();
+                                            let poly_depth = market.poly.read().clone();
+                                            if let Some(req) = detect_arb(
                                                 market_id,
-                                                market.kalshi.load(),
-                                                market.poly.load(),
+                                                &kalshi_depth,
+                                                &poly_depth,
                                                 state.arb_config(),
                                                 clock.now_ns(),
                                             ) {
@@ -702,6 +709,7 @@ pub async fn run_ws(
 
 /// Process Kalshi orderbook snapshot
 /// Note: Kalshi sends BIDS - to buy YES you pay (100 - best_NO_bid), to buy NO you pay (100 - best_YES_bid)
+/// Collects top 3 price levels for depth-aware arbitrage detection.
 #[inline]
 fn process_kalshi_snapshot(market: &crate::types::AtomicMarketState, body: &KalshiWsMsgBody) {
     let ticker = body.market_ticker.as_deref().unwrap_or("unknown");
@@ -726,66 +734,75 @@ fn process_kalshi_snapshot(market: &crate::types::AtomicMarketState, body: &Kals
         );
     }
 
-    // Find best YES bid (highest price) - this determines NO ask
-    let (no_ask, no_size) = body.yes.as_ref()
-        .and_then(|levels| {
-            levels.iter()
-                .filter_map(|l| {
-                    if l.len() >= 2 && l[1] > 0 {  // Has quantity
-                        Some((l[0], l[1]))  // (price, qty)
-                    } else {
-                        None
-                    }
-                })
-                .max_by_key(|(p, _)| *p)  // Highest bid
-                .map(|(price, qty)| {
-                    let ask = (100 - price) as PriceCents;  // To buy NO, pay 100 - YES_bid
-                    let size = (qty * price / 100) as SizeCents;
-                    (ask, size)
-                })
-        })
-        .unwrap_or((0, 0));
+    // Collect top 3 YES bids (highest prices) - these determine NO asks
+    // Sort by bid price descending (best bid first), then convert to asks (ascending order)
+    let mut no_levels = [PriceLevel::default(); DEPTH_LEVELS];
+    if let Some(levels) = body.yes.as_ref() {
+        let mut bids: Vec<_> = levels.iter()
+            .filter_map(|l| {
+                if l.len() >= 2 && l[1] > 0 {
+                    Some((l[0], l[1]))  // (price, qty)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Sort by price descending (best bid = highest price first)
+        bids.sort_by(|a, b| b.0.cmp(&a.0));
 
-    // Find best NO bid (highest price) - this determines YES ask
-    let (yes_ask, yes_size) = body.no.as_ref()
-        .and_then(|levels| {
-            levels.iter()
-                .filter_map(|l| {
-                    if l.len() >= 2 && l[1] > 0 {
-                        Some((l[0], l[1]))
-                    } else {
-                        None
-                    }
-                })
-                .max_by_key(|(p, _)| *p)
-                .map(|(price, qty)| {
-                    let ask = (100 - price) as PriceCents;  // To buy YES, pay 100 - NO_bid
-                    let size = (qty * price / 100) as SizeCents;
-                    (ask, size)
-                })
-        })
-        .unwrap_or((0, 0));
+        for (i, (bid_price, qty)) in bids.iter().take(DEPTH_LEVELS).enumerate() {
+            let ask_price = (100 - bid_price) as PriceCents;  // To buy NO, pay 100 - YES_bid
+            let size = (qty * bid_price / 100) as SizeCents;
+            no_levels[i] = PriceLevel { price: ask_price, size };
+        }
+    }
+
+    // Collect top 3 NO bids (highest prices) - these determine YES asks
+    // Sort by bid price descending (best bid first), then convert to asks (ascending order)
+    let mut yes_levels = [PriceLevel::default(); DEPTH_LEVELS];
+    if let Some(levels) = body.no.as_ref() {
+        let mut bids: Vec<_> = levels.iter()
+            .filter_map(|l| {
+                if l.len() >= 2 && l[1] > 0 {
+                    Some((l[0], l[1]))  // (price, qty)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Sort by price descending (best bid = highest price first)
+        bids.sort_by(|a, b| b.0.cmp(&a.0));
+
+        for (i, (bid_price, qty)) in bids.iter().take(DEPTH_LEVELS).enumerate() {
+            let ask_price = (100 - bid_price) as PriceCents;  // To buy YES, pay 100 - NO_bid
+            let size = (qty * bid_price / 100) as SizeCents;
+            yes_levels[i] = PriceLevel { price: ask_price, size };
+        }
+    }
 
     // Debug: log computed prices
     tracing::debug!(
-        "[KALSHI-SNAP] {} | COMPUTED: yes_ask={}¢ no_ask={}¢ yes_size={}¢ no_size={}¢",
-        ticker, yes_ask, no_ask, yes_size, no_size
+        "[KALSHI-SNAP] {} | COMPUTED: yes_ask={}¢ no_ask={}¢ yes_size={}¢ no_size={}¢ (top-of-book)",
+        ticker, yes_levels[0].price, no_levels[0].price, yes_levels[0].size, no_levels[0].size
     );
 
-    // Store
-    market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
+    // Store depth using write lock
+    let depth = OrderbookDepth { yes_levels, no_levels };
+    *market.kalshi.write() = depth;
     market.inc_kalshi_updates();
 }
 
 /// Process Kalshi orderbook delta
-/// Note: Deltas update bid levels; we recompute asks from best bids
+/// Note: Deltas update bid levels; we recompute asks from best bids.
+/// Collects top 3 price levels for depth-aware arbitrage detection.
+/// If a side has no delta, we preserve the current levels for that side.
 #[inline]
 fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiWsMsgBody) {
     let ticker = body.market_ticker.as_deref().unwrap_or("unknown");
 
-    // For deltas, recompute from snapshot-like format
-    // Kalshi deltas have yes/no as arrays of [price, new_qty]
-    let (current_yes, current_no, current_yes_size, current_no_size) = market.kalshi.load();
+    // Read current depth state
+    let current_depth = { *market.kalshi.read() };
+    let (current_yes, current_no) = (current_depth.yes_levels[0].price, current_depth.no_levels[0].price);
 
     // Debug: log delta updates
     if body.yes.is_some() || body.no.is_some() {
@@ -795,56 +812,66 @@ fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiW
         );
     }
 
-    // Process YES bid updates (affects NO ask)
-    let (no_ask, no_size) = if let Some(levels) = &body.yes {
-        // Find best (highest) YES bid with non-zero quantity
-        levels.iter()
+    // Process YES bid updates (affects NO asks)
+    let no_levels = if let Some(levels) = &body.yes {
+        let mut bids: Vec<_> = levels.iter()
             .filter_map(|l| {
                 if l.len() >= 2 && l[1] > 0 {
-                    Some((l[0], l[1]))
+                    Some((l[0], l[1]))  // (price, qty)
                 } else {
                     None
                 }
             })
-            .max_by_key(|(p, _)| *p)
-            .map(|(price, qty)| {
-                let ask = (100 - price) as PriceCents;
-                let size = (qty * price / 100) as SizeCents;
-                (ask, size)
-            })
-            .unwrap_or((current_no, current_no_size))
+            .collect();
+        // Sort by price descending (best bid = highest price first)
+        bids.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut no_lvls = [PriceLevel::default(); DEPTH_LEVELS];
+        for (i, (bid_price, qty)) in bids.iter().take(DEPTH_LEVELS).enumerate() {
+            let ask_price = (100 - bid_price) as PriceCents;
+            let size = (qty * bid_price / 100) as SizeCents;
+            no_lvls[i] = PriceLevel { price: ask_price, size };
+        }
+        // If delta has fewer levels than DEPTH_LEVELS, the rest stay at default (0, 0)
+        no_lvls
     } else {
-        (current_no, current_no_size)
+        current_depth.no_levels
     };
 
-    // Process NO bid updates (affects YES ask)
-    let (yes_ask, yes_size) = if let Some(levels) = &body.no {
-        levels.iter()
+    // Process NO bid updates (affects YES asks)
+    let yes_levels = if let Some(levels) = &body.no {
+        let mut bids: Vec<_> = levels.iter()
             .filter_map(|l| {
                 if l.len() >= 2 && l[1] > 0 {
-                    Some((l[0], l[1]))
+                    Some((l[0], l[1]))  // (price, qty)
                 } else {
                     None
                 }
             })
-            .max_by_key(|(p, _)| *p)
-            .map(|(price, qty)| {
-                let ask = (100 - price) as PriceCents;
-                let size = (qty * price / 100) as SizeCents;
-                (ask, size)
-            })
-            .unwrap_or((current_yes, current_yes_size))
+            .collect();
+        // Sort by price descending (best bid = highest price first)
+        bids.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut yes_lvls = [PriceLevel::default(); DEPTH_LEVELS];
+        for (i, (bid_price, qty)) in bids.iter().take(DEPTH_LEVELS).enumerate() {
+            let ask_price = (100 - bid_price) as PriceCents;
+            let size = (qty * bid_price / 100) as SizeCents;
+            yes_lvls[i] = PriceLevel { price: ask_price, size };
+        }
+        yes_lvls
     } else {
-        (current_yes, current_yes_size)
+        current_depth.yes_levels
     };
 
     // Debug: log computed prices after delta
     tracing::debug!(
         "[KALSHI-DELTA] {} | COMPUTED: yes_ask={}¢ no_ask={}¢ (was yes={}¢ no={}¢)",
-        ticker, yes_ask, no_ask, current_yes, current_no
+        ticker, yes_levels[0].price, no_levels[0].price, current_yes, current_no
     );
 
-    market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
+    // Store depth using write lock
+    let depth = OrderbookDepth { yes_levels, no_levels };
+    *market.kalshi.write() = depth;
     market.inc_kalshi_updates();
 }
 
@@ -889,5 +916,279 @@ async fn route_arb_to_channel(
                 market_id, e
             );
         }
+    }
+}
+
+// =============================================================================
+// Helper functions for orderbook parsing (testable)
+// =============================================================================
+
+/// Convert Kalshi bid levels to ask levels.
+///
+/// Kalshi sends bids for YES/NO. To buy the OPPOSITE side, we pay `100 - bid_price`.
+/// For example:
+/// - If someone bids 52 cents for YES, we can buy NO at 48 cents (100 - 52).
+/// - The size in cents is `qty * bid_price / 100` (Kalshi uses whole contracts).
+///
+/// # Arguments
+/// * `bids` - Array of [price_cents, quantity] pairs
+///
+/// # Returns
+/// Array of `DEPTH_LEVELS` PriceLevel structs, sorted by ask price ascending.
+/// Empty levels (beyond available bids) are default (price=0, size=0).
+pub fn convert_bids_to_asks(bids: &[Vec<i64>]) -> [PriceLevel; DEPTH_LEVELS] {
+    let mut levels = [PriceLevel::default(); DEPTH_LEVELS];
+
+    // Filter valid bids (len >= 2, qty > 0) and collect as (price, qty)
+    let mut valid_bids: Vec<(i64, i64)> = bids.iter()
+        .filter_map(|l| {
+            if l.len() >= 2 && l[1] > 0 {
+                Some((l[0], l[1]))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Sort by price descending (best bid = highest price first)
+    // This gives us the best asks (lowest prices) first after conversion
+    valid_bids.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // Convert top bids to asks
+    for (i, (bid_price, qty)) in valid_bids.iter().take(DEPTH_LEVELS).enumerate() {
+        let ask_price = (100 - bid_price) as PriceCents;  // To buy opposite side
+        let size = (qty * bid_price / 100) as SizeCents;  // Convert to cents
+        levels[i] = PriceLevel { price: ask_price, size };
+    }
+
+    levels
+}
+
+#[cfg(test)]
+mod orderbook_depth_tests {
+    use super::*;
+
+    // =========================================================================
+    // Tests for Kalshi bid-to-ask conversion logic
+    // =========================================================================
+
+    #[test]
+    fn test_exactly_three_bids() {
+        // Bids at 52, 50, 48 cents with quantities 100, 200, 150
+        let bids = vec![
+            vec![52, 100],
+            vec![50, 200],
+            vec![48, 150],
+        ];
+
+        let asks = convert_bids_to_asks(&bids);
+
+        // Best bid (52) → best ask (48 = 100 - 52)
+        // ask_price = 100 - bid_price
+        // size = qty * bid_price / 100
+
+        // Level 0: bid 52 → ask 48, size = 100 * 52 / 100 = 52
+        assert_eq!(asks[0].price, 48, "Level 0 ask price should be 100 - 52 = 48");
+        assert_eq!(asks[0].size, 52, "Level 0 size should be 100 * 52 / 100 = 52");
+
+        // Level 1: bid 50 → ask 50, size = 200 * 50 / 100 = 100
+        assert_eq!(asks[1].price, 50, "Level 1 ask price should be 100 - 50 = 50");
+        assert_eq!(asks[1].size, 100, "Level 1 size should be 200 * 50 / 100 = 100");
+
+        // Level 2: bid 48 → ask 52, size = 150 * 48 / 100 = 72
+        assert_eq!(asks[2].price, 52, "Level 2 ask price should be 100 - 48 = 52");
+        assert_eq!(asks[2].size, 72, "Level 2 size should be 150 * 48 / 100 = 72");
+    }
+
+    #[test]
+    fn test_fewer_than_three_bids() {
+        // Only one bid at 50 cents
+        let bids = vec![vec![50, 100]];
+
+        let asks = convert_bids_to_asks(&bids);
+
+        // Level 0 should be populated
+        assert_eq!(asks[0].price, 50, "Level 0 ask price should be 100 - 50 = 50");
+        assert_eq!(asks[0].size, 50, "Level 0 size should be 100 * 50 / 100 = 50");
+
+        // Levels 1 and 2 should be zero (default)
+        assert_eq!(asks[1].price, 0, "Level 1 should be empty (price = 0)");
+        assert_eq!(asks[1].size, 0, "Level 1 should be empty (size = 0)");
+        assert_eq!(asks[2].price, 0, "Level 2 should be empty (price = 0)");
+        assert_eq!(asks[2].size, 0, "Level 2 should be empty (size = 0)");
+    }
+
+    #[test]
+    fn test_more_than_three_bids_takes_top_three() {
+        // 5 bids, should take top 3 (highest prices = best asks)
+        let bids = vec![
+            vec![30, 100],  // Lowest bid, worst ask (70)
+            vec![60, 200],  // Third highest bid, should be included (40)
+            vec![40, 150],  //
+            vec![80, 300],  // Highest bid, best ask (20)
+            vec![70, 250],  // Second highest bid (30)
+        ];
+
+        let asks = convert_bids_to_asks(&bids);
+
+        // Should take bids at 80, 70, 60 (highest first)
+        // Ask prices: 20, 30, 40 (ascending from best bid descending)
+
+        // Level 0: bid 80 → ask 20, size = 300 * 80 / 100 = 240
+        assert_eq!(asks[0].price, 20, "Best ask should be 100 - 80 = 20");
+        assert_eq!(asks[0].size, 240, "Size should be 300 * 80 / 100 = 240");
+
+        // Level 1: bid 70 → ask 30, size = 250 * 70 / 100 = 175
+        assert_eq!(asks[1].price, 30, "Second ask should be 100 - 70 = 30");
+        assert_eq!(asks[1].size, 175, "Size should be 250 * 70 / 100 = 175");
+
+        // Level 2: bid 60 → ask 40, size = 200 * 60 / 100 = 120
+        assert_eq!(asks[2].price, 40, "Third ask should be 100 - 60 = 40");
+        assert_eq!(asks[2].size, 120, "Size should be 200 * 60 / 100 = 120");
+    }
+
+    #[test]
+    fn test_empty_bids() {
+        let bids: Vec<Vec<i64>> = vec![];
+        let asks = convert_bids_to_asks(&bids);
+
+        // All levels should be zero
+        for (i, level) in asks.iter().enumerate() {
+            assert_eq!(level.price, 0, "Level {} price should be 0", i);
+            assert_eq!(level.size, 0, "Level {} size should be 0", i);
+        }
+    }
+
+    #[test]
+    fn test_bids_with_zero_quantity_filtered() {
+        // Zero quantity bids should be filtered out
+        let bids = vec![
+            vec![50, 0],   // Invalid: zero qty
+            vec![45, 100], // Valid
+            vec![40, 0],   // Invalid: zero qty
+        ];
+
+        let asks = convert_bids_to_asks(&bids);
+
+        // Only the 45 cent bid should be used
+        assert_eq!(asks[0].price, 55, "Should use bid at 45, ask = 55");
+        assert_eq!(asks[0].size, 45, "Size = 100 * 45 / 100 = 45");
+
+        // Rest should be zero
+        assert_eq!(asks[1].price, 0);
+        assert_eq!(asks[2].price, 0);
+    }
+
+    #[test]
+    fn test_bids_with_malformed_data_filtered() {
+        // Bids with less than 2 elements should be filtered
+        let bids = vec![
+            vec![50],        // Invalid: only 1 element
+            vec![45, 100],   // Valid
+            vec![],          // Invalid: empty
+        ];
+
+        let asks = convert_bids_to_asks(&bids);
+
+        assert_eq!(asks[0].price, 55, "Should use only valid bid");
+        assert_eq!(asks[0].size, 45);
+        assert_eq!(asks[1].price, 0);
+        assert_eq!(asks[2].price, 0);
+    }
+
+    #[test]
+    fn test_bid_to_ask_price_conversion_edge_cases() {
+        // Test edge case prices
+
+        // Bid at 1 cent → ask at 99 cents
+        let bids_low = vec![vec![1, 100]];
+        let asks_low = convert_bids_to_asks(&bids_low);
+        assert_eq!(asks_low[0].price, 99, "Bid 1 → Ask 99");
+        assert_eq!(asks_low[0].size, 1, "Size = 100 * 1 / 100 = 1");
+
+        // Bid at 99 cents → ask at 1 cent
+        let bids_high = vec![vec![99, 100]];
+        let asks_high = convert_bids_to_asks(&bids_high);
+        assert_eq!(asks_high[0].price, 1, "Bid 99 → Ask 1");
+        assert_eq!(asks_high[0].size, 99, "Size = 100 * 99 / 100 = 99");
+
+        // Bid at 50 cents → ask at 50 cents (symmetric case)
+        let bids_mid = vec![vec![50, 100]];
+        let asks_mid = convert_bids_to_asks(&bids_mid);
+        assert_eq!(asks_mid[0].price, 50, "Bid 50 → Ask 50 (symmetric)");
+        assert_eq!(asks_mid[0].size, 50, "Size = 100 * 50 / 100 = 50");
+    }
+
+    #[test]
+    fn test_size_calculation_precision() {
+        // Test that size calculation handles rounding correctly
+        // size = qty * bid_price / 100
+
+        // Large quantity: 1000 contracts at 75 cents → 750 cents size
+        let bids = vec![vec![75, 1000]];
+        let asks = convert_bids_to_asks(&bids);
+        assert_eq!(asks[0].size, 750, "1000 * 75 / 100 = 750");
+
+        // Small quantity: 10 contracts at 33 cents → 3 cents (integer division)
+        let bids2 = vec![vec![33, 10]];
+        let asks2 = convert_bids_to_asks(&bids2);
+        assert_eq!(asks2[0].size, 3, "10 * 33 / 100 = 3 (integer division)");
+
+        // Edge: 1 contract at 50 cents → 0 cents (too small)
+        let bids3 = vec![vec![50, 1]];
+        let asks3 = convert_bids_to_asks(&bids3);
+        assert_eq!(asks3[0].size, 0, "1 * 50 / 100 = 0 (integer division truncates)");
+    }
+
+    #[test]
+    fn test_bids_already_sorted_descending() {
+        // Bids already in descending order
+        let bids = vec![
+            vec![90, 100],
+            vec![80, 200],
+            vec![70, 300],
+        ];
+
+        let asks = convert_bids_to_asks(&bids);
+
+        // Should preserve order: best bid (90) → best ask (10)
+        assert_eq!(asks[0].price, 10);
+        assert_eq!(asks[1].price, 20);
+        assert_eq!(asks[2].price, 30);
+    }
+
+    #[test]
+    fn test_bids_in_ascending_order() {
+        // Bids in ascending order (needs sorting)
+        let bids = vec![
+            vec![70, 300],
+            vec![80, 200],
+            vec![90, 100],
+        ];
+
+        let asks = convert_bids_to_asks(&bids);
+
+        // After sorting, should get same result as descending input
+        assert_eq!(asks[0].price, 10);
+        assert_eq!(asks[1].price, 20);
+        assert_eq!(asks[2].price, 30);
+    }
+
+    #[test]
+    fn test_two_bids_leaves_third_level_empty() {
+        let bids = vec![
+            vec![60, 100],
+            vec![55, 200],
+        ];
+
+        let asks = convert_bids_to_asks(&bids);
+
+        // First two levels populated
+        assert_eq!(asks[0].price, 40, "Bid 60 → Ask 40");
+        assert_eq!(asks[1].price, 45, "Bid 55 → Ask 45");
+
+        // Third level empty
+        assert_eq!(asks[2].price, 0);
+        assert_eq!(asks[2].size, 0);
     }
 }

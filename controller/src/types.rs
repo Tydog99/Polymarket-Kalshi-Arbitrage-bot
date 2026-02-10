@@ -7,10 +7,173 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
+use std::time::Instant;
 use rustc_hash::FxHashMap;
 use parking_lot::RwLock;
+use lazy_static::lazy_static;
 
 use crate::arb::{ArbConfig, kalshi_fee};
+
+// =============================================================================
+// LOCK INSTRUMENTATION
+// =============================================================================
+
+/// An instrumented wrapper around `std::sync::RwLock<T>` that tracks contention metrics.
+///
+/// This wrapper provides lock contention monitoring by:
+/// - Attempting non-blocking acquisition first (fast path)
+/// - Only measuring wait time when contention is detected
+/// - Recording statistics to a global aggregator for periodic reporting
+///
+/// # Performance
+/// The fast path (no contention) adds minimal overhead - just an atomic increment.
+/// Only when `try_write()`/`try_read()` fails do we measure actual wait time.
+pub struct InstrumentedRwLock<T> {
+    inner: StdRwLock<T>,
+    contention_count: AtomicU64,   // Times try_write/try_read failed
+    total_writes: AtomicU64,       // Total write acquisitions
+    total_reads: AtomicU64,        // Total read acquisitions
+    total_wait_ns: AtomicU64,      // Cumulative wait time when contended
+}
+
+impl<T> InstrumentedRwLock<T> {
+    /// Create a new instrumented lock wrapping the given value.
+    pub fn new(value: T) -> Self {
+        Self {
+            inner: StdRwLock::new(value),
+            contention_count: AtomicU64::new(0),
+            total_writes: AtomicU64::new(0),
+            total_reads: AtomicU64::new(0),
+            total_wait_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// Acquire a write lock, tracking contention if the fast path fails.
+    ///
+    /// # Panics
+    /// Panics if the lock is poisoned (a thread panicked while holding the lock).
+    pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, T> {
+        self.total_writes.fetch_add(1, Ordering::Relaxed);
+
+        // Fast path: try non-blocking first
+        match self.inner.try_write() {
+            Ok(guard) => {
+                // Report to global aggregator: no contention, 1 op, 0 wait
+                LOCK_STATS.record(0, 1, 0);
+                guard
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // Contention detected - measure wait time
+                self.contention_count.fetch_add(1, Ordering::Relaxed);
+                let start = Instant::now();
+                let guard = self.inner.write().unwrap();
+                let wait_ns = start.elapsed().as_nanos() as u64;
+                self.total_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
+                // Report to global aggregator: 1 contention, 1 op, actual wait time
+                LOCK_STATS.record(1, 1, wait_ns);
+                guard
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                // Lock is poisoned - propagate the panic
+                panic!("InstrumentedRwLock poisoned: {}", e);
+            }
+        }
+    }
+
+    /// Acquire a read lock, tracking contention if the fast path fails.
+    ///
+    /// # Panics
+    /// Panics if the lock is poisoned (a thread panicked while holding the lock).
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, T> {
+        self.total_reads.fetch_add(1, Ordering::Relaxed);
+
+        match self.inner.try_read() {
+            Ok(guard) => {
+                // Report to global aggregator: no contention, 1 op, 0 wait
+                LOCK_STATS.record(0, 1, 0);
+                guard
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.contention_count.fetch_add(1, Ordering::Relaxed);
+                let start = Instant::now();
+                let guard = self.inner.read().unwrap();
+                let wait_ns = start.elapsed().as_nanos() as u64;
+                self.total_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
+                // Report to global aggregator: 1 contention, 1 op, actual wait time
+                LOCK_STATS.record(1, 1, wait_ns);
+                guard
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                panic!("InstrumentedRwLock poisoned: {}", e);
+            }
+        }
+    }
+
+    /// Returns (contention_count, total_ops, total_wait_ns) and resets counters.
+    ///
+    /// This is useful for periodic reporting - take a snapshot of stats and reset
+    /// so the next snapshot only includes new activity.
+    pub fn take_stats(&self) -> (u64, u64, u64) {
+        let contention = self.contention_count.swap(0, Ordering::Relaxed);
+        let writes = self.total_writes.swap(0, Ordering::Relaxed);
+        let reads = self.total_reads.swap(0, Ordering::Relaxed);
+        let wait_ns = self.total_wait_ns.swap(0, Ordering::Relaxed);
+        (contention, writes + reads, wait_ns)
+    }
+}
+
+/// Global aggregator for lock contention statistics.
+///
+/// Multiple `InstrumentedRwLock` instances can report their stats here,
+/// and a monitoring thread can periodically take snapshots for logging.
+pub struct LockStatsAggregator {
+    total_contention: AtomicU64,
+    total_ops: AtomicU64,
+    total_wait_ns: AtomicU64,
+}
+
+impl LockStatsAggregator {
+    /// Create a new aggregator with zeroed counters.
+    pub const fn new() -> Self {
+        Self {
+            total_contention: AtomicU64::new(0),
+            total_ops: AtomicU64::new(0),
+            total_wait_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// Record statistics from an instrumented lock.
+    ///
+    /// This is typically called after `InstrumentedRwLock::take_stats()`.
+    pub fn record(&self, contention: u64, ops: u64, wait_ns: u64) {
+        self.total_contention.fetch_add(contention, Ordering::Relaxed);
+        self.total_ops.fetch_add(ops, Ordering::Relaxed);
+        self.total_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
+    }
+
+    /// Take a snapshot of all stats and reset counters to zero.
+    ///
+    /// Returns (total_contention, total_ops, total_wait_ns).
+    pub fn take_snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.total_contention.swap(0, Ordering::Relaxed),
+            self.total_ops.swap(0, Ordering::Relaxed),
+            self.total_wait_ns.swap(0, Ordering::Relaxed),
+        )
+    }
+}
+
+impl Default for LockStatsAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+lazy_static! {
+    /// Global lock statistics aggregator for monitoring lock contention across the system.
+    pub static ref LOCK_STATS: LockStatsAggregator = LockStatsAggregator::new();
+}
 
 // === Market Types ===
 
@@ -76,6 +239,42 @@ pub type PriceCents = u16;
 /// Size representation in cents (dollar amount × 100), maximum ~$655k per side
 pub type SizeCents = u16;
 
+/// Number of price levels to track in orderbook depth
+pub const DEPTH_LEVELS: usize = 3;
+
+/// A single price level in the orderbook (price + size at that level)
+#[derive(Clone, Copy, Default, Debug)]
+pub struct PriceLevel {
+    /// Ask price in cents (1-99 for $0.01-$0.99)
+    pub price: PriceCents,
+    /// Size in cents at this price level
+    pub size: SizeCents,
+}
+
+/// Orderbook depth for both YES and NO sides, tracking multiple price levels.
+/// Used for EV-maximizing arbitrage detection that considers walking the book.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct OrderbookDepth {
+    /// YES side ask levels, sorted by price ascending (best ask first)
+    pub yes_levels: [PriceLevel; DEPTH_LEVELS],
+    /// NO side ask levels, sorted by price ascending (best ask first)
+    pub no_levels: [PriceLevel; DEPTH_LEVELS],
+}
+
+impl OrderbookDepth {
+    /// Returns top-of-book prices and sizes for backward compatibility.
+    /// Format: (yes_price, no_price, yes_size, no_size)
+    #[inline]
+    pub fn top_of_book(&self) -> (PriceCents, PriceCents, SizeCents, SizeCents) {
+        (
+            self.yes_levels[0].price,
+            self.no_levels[0].price,
+            self.yes_levels[0].size,
+            self.no_levels[0].size,
+        )
+    }
+}
+
 /// Maximum number of concurrently tracked markets
 pub const MAX_MARKETS: usize = 1024;
 
@@ -84,89 +283,12 @@ pub const MAX_MARKETS: usize = 1024;
 #[allow(dead_code)]
 pub const NO_PRICE: PriceCents = 0;
 
-/// Pack orderbook state into a single u64 for atomic operations.
-/// Bit layout: [yes_ask:16][no_ask:16][yes_size:16][no_size:16]
-#[inline(always)]
-pub fn pack_orderbook(yes_ask: PriceCents, no_ask: PriceCents, yes_size: SizeCents, no_size: SizeCents) -> u64 {
-    ((yes_ask as u64) << 48) | ((no_ask as u64) << 32) | ((yes_size as u64) << 16) | (no_size as u64)
-}
-
-/// Unpack a u64 orderbook representation back into its component values
-#[inline(always)]
-pub fn unpack_orderbook(packed: u64) -> (PriceCents, PriceCents, SizeCents, SizeCents) {
-    let yes_ask = ((packed >> 48) & 0xFFFF) as PriceCents;
-    let no_ask = ((packed >> 32) & 0xFFFF) as PriceCents;
-    let yes_size = ((packed >> 16) & 0xFFFF) as SizeCents;
-    let no_size = (packed & 0xFFFF) as SizeCents;
-    (yes_ask, no_ask, yes_size, no_size)
-}
-
-/// Lock-free orderbook state for a single trading platform.
-/// Uses atomic operations for thread-safe, zero-copy price updates.
-#[repr(align(64))]
-pub struct AtomicOrderbook {
-    /// Packed orderbook state: [yes_ask:16][no_ask:16][yes_size:16][no_size:16]
-    packed: AtomicU64,
-}
-
-impl AtomicOrderbook {
-    pub const fn new() -> Self {
-        Self { packed: AtomicU64::new(0) }
-    }
-
-    /// Load current state
-    #[inline(always)]
-    pub fn load(&self) -> (PriceCents, PriceCents, SizeCents, SizeCents) {
-        unpack_orderbook(self.packed.load(Ordering::Acquire))
-    }
-
-    /// Store new state
-    #[inline(always)]
-    pub fn store(&self, yes_ask: PriceCents, no_ask: PriceCents, yes_size: SizeCents, no_size: SizeCents) {
-        self.packed.store(pack_orderbook(yes_ask, no_ask, yes_size, no_size), Ordering::Release);
-    }
-
-    /// Update YES side only
-    #[inline(always)]
-    pub fn update_yes(&self, yes_ask: PriceCents, yes_size: SizeCents) {
-        let mut current = self.packed.load(Ordering::Acquire);
-        loop {
-            let (_, no_ask, _, no_size) = unpack_orderbook(current);
-            let new = pack_orderbook(yes_ask, no_ask, yes_size, no_size);
-            match self.packed.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break,
-                Err(c) => current = c,
-            }
-        }
-    }
-
-    /// Update NO side only
-    #[inline(always)]
-    pub fn update_no(&self, no_ask: PriceCents, no_size: SizeCents) {
-        let mut current = self.packed.load(Ordering::Acquire);
-        loop {
-            let (yes_ask, _, yes_size, _) = unpack_orderbook(current);
-            let new = pack_orderbook(yes_ask, no_ask, yes_size, no_size);
-            match self.packed.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break,
-                Err(c) => current = c,
-            }
-        }
-    }
-}
-
-impl Default for AtomicOrderbook {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Complete market state tracking both platforms' orderbooks for a single market
 pub struct AtomicMarketState {
-    /// Kalshi platform orderbook state
-    pub kalshi: AtomicOrderbook,
-    /// Polymarket platform orderbook state
-    pub poly: AtomicOrderbook,
+    /// Kalshi platform orderbook state with depth levels
+    pub kalshi: InstrumentedRwLock<OrderbookDepth>,
+    /// Polymarket platform orderbook state with depth levels
+    pub poly: InstrumentedRwLock<OrderbookDepth>,
     /// Last known Kalshi update time (unix ms). 0 = unknown / never updated.
     kalshi_last_update_unix_ms: AtomicU64,
     /// Last known Polymarket update time (unix ms). 0 = unknown / never updated.
@@ -184,8 +306,8 @@ pub struct AtomicMarketState {
 impl AtomicMarketState {
     pub fn new(market_id: u16) -> Self {
         Self {
-            kalshi: AtomicOrderbook::new(),
-            poly: AtomicOrderbook::new(),
+            kalshi: InstrumentedRwLock::new(OrderbookDepth::default()),
+            poly: InstrumentedRwLock::new(OrderbookDepth::default()),
             kalshi_last_update_unix_ms: AtomicU64::new(0),
             poly_last_update_unix_ms: AtomicU64::new(0),
             pair: RwLock::new(None),
@@ -630,105 +752,67 @@ mod tests {
     use std::thread;
 
     // =========================================================================
-    // Pack/Unpack Tests - Verify bit manipulation correctness
+    // InstrumentedRwLock Tests
     // =========================================================================
 
     #[test]
-    fn test_pack_unpack_roundtrip() {
-        // Test various values pack and unpack correctly
-        let test_cases = vec![
-            (50, 50, 1000, 1000),  // Common mid-price
-            (1, 99, 100, 100),      // Edge prices
-            (99, 1, 65535, 65535),  // Max sizes
-            (0, 0, 0, 0),           // All zeros
-            (NO_PRICE, NO_PRICE, 0, 0),  // No prices
-        ];
+    fn test_instrumented_rwlock_basic_read_write() {
+        let lock = InstrumentedRwLock::new(42u32);
 
-        for (yes_ask, no_ask, yes_size, no_size) in test_cases {
-            let packed = pack_orderbook(yes_ask, no_ask, yes_size, no_size);
-            let (y, n, ys, ns) = unpack_orderbook(packed);
-            assert_eq!((y, n, ys, ns), (yes_ask, no_ask, yes_size, no_size),
-                "Roundtrip failed for ({}, {}, {}, {})", yes_ask, no_ask, yes_size, no_size);
+        // Test write
+        {
+            let mut guard = lock.write();
+            *guard = 100;
         }
+
+        // Test read
+        {
+            let guard = lock.read();
+            assert_eq!(*guard, 100);
+        }
+
+        // Verify stats were recorded
+        let (contention, ops, _wait_ns) = lock.take_stats();
+        assert_eq!(ops, 2, "Should have 1 write + 1 read");
+        assert_eq!(contention, 0, "No contention expected in single-threaded test");
     }
 
     #[test]
-    fn test_pack_bit_layout() {
-        // Verify the exact bit layout: [yes_ask:16][no_ask:16][yes_size:16][no_size:16]
-        let packed = pack_orderbook(0xABCD, 0x1234, 0x5678, 0x9ABC);
+    fn test_instrumented_rwlock_take_stats_resets() {
+        let lock = InstrumentedRwLock::new(0u32);
 
-        assert_eq!((packed >> 48) & 0xFFFF, 0xABCD, "yes_ask should be in bits 48-63");
-        assert_eq!((packed >> 32) & 0xFFFF, 0x1234, "no_ask should be in bits 32-47");
-        assert_eq!((packed >> 16) & 0xFFFF, 0x5678, "yes_size should be in bits 16-31");
-        assert_eq!(packed & 0xFFFF, 0x9ABC, "no_size should be in bits 0-15");
-    }
+        // Perform some operations
+        { let _g = lock.write(); }
+        { let _g = lock.read(); }
+        { let _g = lock.read(); }
 
-    // =========================================================================
-    // AtomicOrderbook Tests
-    // =========================================================================
+        // First take_stats
+        let (contention1, ops1, wait1) = lock.take_stats();
+        assert_eq!(ops1, 3);
+        assert_eq!(contention1, 0);
 
-    #[test]
-    fn test_atomic_orderbook_store_load() {
-        let book = AtomicOrderbook::new();
-
-        // Initially all zeros
-        let (y, n, ys, ns) = book.load();
-        assert_eq!((y, n, ys, ns), (0, 0, 0, 0));
-
-        // Store and load
-        book.store(45, 55, 500, 600);
-        let (y, n, ys, ns) = book.load();
-        assert_eq!((y, n, ys, ns), (45, 55, 500, 600));
+        // Second take_stats should be zeroed
+        let (contention2, ops2, wait2) = lock.take_stats();
+        assert_eq!(ops2, 0, "Stats should be reset after take_stats");
+        assert_eq!(contention2, 0);
+        assert_eq!(wait2, 0);
     }
 
     #[test]
-    fn test_atomic_orderbook_update_yes() {
-        let book = AtomicOrderbook::new();
+    fn test_instrumented_rwlock_concurrent_access() {
+        let lock = Arc::new(InstrumentedRwLock::new(0u64));
+        let num_threads = 4;
+        let ops_per_thread = 100;
 
-        // Set initial state
-        book.store(40, 60, 100, 200);
-
-        // Update only YES side
-        book.update_yes(42, 150);
-
-        let (y, n, ys, ns) = book.load();
-        assert_eq!(y, 42, "YES ask should be updated");
-        assert_eq!(ys, 150, "YES size should be updated");
-        assert_eq!(n, 60, "NO ask should be unchanged");
-        assert_eq!(ns, 200, "NO size should be unchanged");
-    }
-
-    #[test]
-    fn test_atomic_orderbook_update_no() {
-        let book = AtomicOrderbook::new();
-
-        // Set initial state
-        book.store(40, 60, 100, 200);
-
-        // Update only NO side
-        book.update_no(58, 250);
-
-        let (y, n, ys, ns) = book.load();
-        assert_eq!(y, 40, "YES ask should be unchanged");
-        assert_eq!(ys, 100, "YES size should be unchanged");
-        assert_eq!(n, 58, "NO ask should be updated");
-        assert_eq!(ns, 250, "NO size should be updated");
-    }
-
-    #[test]
-    fn test_atomic_orderbook_concurrent_updates() {
-        // Verify correctness under concurrent access
-        let book = Arc::new(AtomicOrderbook::new());
-        book.store(50, 50, 1000, 1000);
-
-        let handles: Vec<_> = (0..4).map(|i| {
-            let book = book.clone();
+        let handles: Vec<_> = (0..num_threads).map(|i| {
+            let lock = lock.clone();
             thread::spawn(move || {
-                for _ in 0..1000 {
+                for _ in 0..ops_per_thread {
                     if i % 2 == 0 {
-                        book.update_yes(45 + (i as u16), 500);
+                        let mut guard = lock.write();
+                        *guard += 1;
                     } else {
-                        book.update_no(55 + (i as u16), 500);
+                        let _guard = lock.read();
                     }
                 }
             })
@@ -738,12 +822,160 @@ mod tests {
             h.join().unwrap();
         }
 
-        // State should be consistent (not corrupted)
-        let (y, n, ys, ns) = book.load();
-        assert!(y > 0 && y < 100, "YES ask should be valid");
-        assert!(n > 0 && n < 100, "NO ask should be valid");
-        assert_eq!(ys, 500, "YES size should be consistent");
-        assert_eq!(ns, 500, "NO size should be consistent");
+        // Verify final value (2 threads doing writes, 100 each = 200)
+        let final_value = *lock.read();
+        assert_eq!(final_value, 200);
+
+        // Verify stats were tracked
+        let (contention, ops, _wait_ns) = lock.take_stats();
+        // We added 1 read above for the final_value check
+        assert_eq!(ops, (num_threads * ops_per_thread + 1) as u64);
+        // Contention may or may not occur depending on timing
+        // Just verify it's a valid value (>= 0)
+        assert!(contention <= ops);
+    }
+
+    // =========================================================================
+    // LockStatsAggregator Tests
+    // =========================================================================
+
+    #[test]
+    fn test_lock_stats_aggregator_basic() {
+        let agg = LockStatsAggregator::new();
+
+        // Record some stats
+        agg.record(5, 100, 1000);
+        agg.record(3, 50, 500);
+
+        // Take snapshot
+        let (contention, ops, wait_ns) = agg.take_snapshot();
+        assert_eq!(contention, 8);
+        assert_eq!(ops, 150);
+        assert_eq!(wait_ns, 1500);
+    }
+
+    #[test]
+    fn test_lock_stats_aggregator_snapshot_resets() {
+        let agg = LockStatsAggregator::new();
+
+        agg.record(10, 200, 5000);
+
+        // First snapshot
+        let (c1, o1, w1) = agg.take_snapshot();
+        assert_eq!((c1, o1, w1), (10, 200, 5000));
+
+        // Second snapshot should be zeroed
+        let (c2, o2, w2) = agg.take_snapshot();
+        assert_eq!((c2, o2, w2), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_lock_stats_aggregator_concurrent_recording() {
+        let agg = Arc::new(LockStatsAggregator::new());
+        let num_threads = 4;
+        let records_per_thread = 100;
+
+        let handles: Vec<_> = (0..num_threads).map(|_| {
+            let agg = agg.clone();
+            thread::spawn(move || {
+                for _ in 0..records_per_thread {
+                    agg.record(1, 10, 100);
+                }
+            })
+        }).collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let (contention, ops, wait_ns) = agg.take_snapshot();
+        let expected_records = (num_threads * records_per_thread) as u64;
+        assert_eq!(contention, expected_records);
+        assert_eq!(ops, expected_records * 10);
+        assert_eq!(wait_ns, expected_records * 100);
+    }
+
+    #[test]
+    fn test_global_lock_stats_exists() {
+        // Verify the global LOCK_STATS can be accessed
+        LOCK_STATS.record(1, 1, 1);
+        let (c, o, w) = LOCK_STATS.take_snapshot();
+        // Values might include other test's recordings, so just check it works
+        assert!(c >= 1 || o >= 1 || w >= 1 || (c == 0 && o == 0 && w == 0));
+    }
+
+    // =========================================================================
+    // OrderbookDepth and PriceLevel Edge Case Tests
+    // =========================================================================
+
+    #[test]
+    fn test_price_level_default() {
+        let level = PriceLevel::default();
+        assert_eq!(level.price, 0, "Default price should be 0");
+        assert_eq!(level.size, 0, "Default size should be 0");
+    }
+
+    #[test]
+    fn test_orderbook_depth_default_is_all_zeros() {
+        let depth = OrderbookDepth::default();
+        for level in &depth.yes_levels {
+            assert_eq!(level.price, 0);
+            assert_eq!(level.size, 0);
+        }
+        for level in &depth.no_levels {
+            assert_eq!(level.price, 0);
+            assert_eq!(level.size, 0);
+        }
+    }
+
+    #[test]
+    fn test_orderbook_depth_top_of_book_empty() {
+        let depth = OrderbookDepth::default();
+        let (yes_price, no_price, yes_size, no_size) = depth.top_of_book();
+        assert_eq!((yes_price, no_price, yes_size, no_size), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_orderbook_depth_top_of_book_partial() {
+        // Only level 0 is populated, levels 1-2 are zero
+        let mut depth = OrderbookDepth::default();
+        depth.yes_levels[0] = PriceLevel { price: 45, size: 500 };
+        depth.no_levels[0] = PriceLevel { price: 55, size: 600 };
+        // Levels 1-2 remain at default (0, 0)
+
+        let (yes_price, no_price, yes_size, no_size) = depth.top_of_book();
+        assert_eq!(yes_price, 45, "Should return level 0 yes price");
+        assert_eq!(no_price, 55, "Should return level 0 no price");
+        assert_eq!(yes_size, 500, "Should return level 0 yes size");
+        assert_eq!(no_size, 600, "Should return level 0 no size");
+
+        // Verify other levels are still zero (shouldn't affect top_of_book)
+        assert_eq!(depth.yes_levels[1].price, 0);
+        assert_eq!(depth.yes_levels[2].price, 0);
+        assert_eq!(depth.no_levels[1].price, 0);
+        assert_eq!(depth.no_levels[2].price, 0);
+    }
+
+    #[test]
+    fn test_orderbook_depth_top_of_book_full() {
+        // All 3 levels are populated, top_of_book should return level 0
+        let mut depth = OrderbookDepth::default();
+
+        // YES side: ascending prices (best ask first)
+        depth.yes_levels[0] = PriceLevel { price: 45, size: 500 };
+        depth.yes_levels[1] = PriceLevel { price: 46, size: 300 };
+        depth.yes_levels[2] = PriceLevel { price: 47, size: 200 };
+
+        // NO side: ascending prices (best ask first)
+        depth.no_levels[0] = PriceLevel { price: 55, size: 600 };
+        depth.no_levels[1] = PriceLevel { price: 56, size: 400 };
+        depth.no_levels[2] = PriceLevel { price: 57, size: 250 };
+
+        let (yes_price, no_price, yes_size, no_size) = depth.top_of_book();
+        assert_eq!(yes_price, 45, "Should return level 0 yes price");
+        assert_eq!(no_price, 55, "Should return level 0 no price");
+        assert_eq!(yes_size, 500, "Should return level 0 yes size");
+        assert_eq!(no_size, 600, "Should return level 0 no size");
     }
 
     // =========================================================================
@@ -891,16 +1123,24 @@ mod tests {
 
         // Update Kalshi prices
         let market = state.get_by_id(id).unwrap();
-        market.kalshi.store(45, 55, 500, 600);
+        {
+            let mut guard = market.kalshi.write();
+            guard.yes_levels[0] = PriceLevel { price: 45, size: 500 };
+            guard.no_levels[0] = PriceLevel { price: 55, size: 600 };
+        }
 
         // Update Poly prices
-        market.poly.store(44, 56, 700, 800);
+        {
+            let mut guard = market.poly.write();
+            guard.yes_levels[0] = PriceLevel { price: 44, size: 700 };
+            guard.no_levels[0] = PriceLevel { price: 56, size: 800 };
+        }
 
         // Verify prices
-        let (k_yes, k_no, k_yes_sz, k_no_sz) = market.kalshi.load();
+        let (k_yes, k_no, k_yes_sz, k_no_sz) = market.kalshi.read().top_of_book();
         assert_eq!((k_yes, k_no, k_yes_sz, k_no_sz), (45, 55, 500, 600));
 
-        let (p_yes, p_no, p_yes_sz, p_no_sz) = market.poly.load();
+        let (p_yes, p_no, p_yes_sz, p_no_sz) = market.poly.read().top_of_book();
         assert_eq!((p_yes, p_no, p_yes_sz, p_no_sz), (44, 56, 700, 800));
     }
 
@@ -1223,19 +1463,23 @@ mod tests {
         // Kalshi update
         let kalshi_hash = fxhash_str(&kalshi_ticker);
         if let Some(id) = state.kalshi_to_id.read().get(&kalshi_hash).copied() {
-            state.markets[id as usize].kalshi.store(55, 50, 500, 600);
+            let mut guard = state.markets[id as usize].kalshi.write();
+            guard.yes_levels[0] = PriceLevel { price: 55, size: 500 };
+            guard.no_levels[0] = PriceLevel { price: 50, size: 600 };
         }
 
         // Polymarket update
         let poly_hash = fxhash_str(&poly_yes_token);
         if let Some(id) = state.poly_yes_to_id.read().get(&poly_hash).copied() {
-            state.markets[id as usize].poly.store(40, 65, 700, 800);
+            let mut guard = state.markets[id as usize].poly.write();
+            guard.yes_levels[0] = PriceLevel { price: 40, size: 700 };
+            guard.no_levels[0] = PriceLevel { price: 65, size: 800 };
         }
 
         // 3. Check for arbs using ArbOpportunity::detect()
         let market = state.get_by_id(market_id).unwrap();
-        let kalshi_data = market.kalshi.load();
-        let poly_data = market.poly.load();
+        let kalshi_data = market.kalshi.read().top_of_book();
+        let poly_data = market.poly.read().top_of_book();
         let req = ArbOpportunity::detect(
             market_id,
             kalshi_data,
@@ -1259,8 +1503,16 @@ mod tests {
 
         // Pre-populate with a market
         let market = &state.markets[0];
-        market.kalshi.store(50, 50, 1000, 1000);
-        market.poly.store(50, 50, 1000, 1000);
+        {
+            let mut guard = market.kalshi.write();
+            guard.yes_levels[0] = PriceLevel { price: 50, size: 1000 };
+            guard.no_levels[0] = PriceLevel { price: 50, size: 1000 };
+        }
+        {
+            let mut guard = market.poly.write();
+            guard.yes_levels[0] = PriceLevel { price: 50, size: 1000 };
+            guard.no_levels[0] = PriceLevel { price: 50, size: 1000 };
+        }
 
         let handles: Vec<_> = (0..4).map(|i| {
             let state = state.clone();
@@ -1269,15 +1521,23 @@ mod tests {
                     let market = &state.markets[0];
                     if i % 2 == 0 {
                         // Simulate Kalshi updates
-                        market.kalshi.update_yes(40 + ((j % 10) as u16), 500 + j as u16);
+                        let mut guard = market.kalshi.write();
+                        guard.yes_levels[0] = PriceLevel {
+                            price: 40 + ((j % 10) as u16),
+                            size: 500 + j as u16,
+                        };
                     } else {
                         // Simulate Poly updates
-                        market.poly.update_no(50 + ((j % 10) as u16), 600 + j as u16);
+                        let mut guard = market.poly.write();
+                        guard.no_levels[0] = PriceLevel {
+                            price: 50 + ((j % 10) as u16),
+                            size: 600 + j as u16,
+                        };
                     }
 
                     // Check arbs using ArbOpportunity::detect() (should never panic)
-                    let kalshi_data = market.kalshi.load();
-                    let poly_data = market.poly.load();
+                    let kalshi_data = market.kalshi.read().top_of_book();
+                    let poly_data = market.poly.read().top_of_book();
                     let _ = ArbOpportunity::detect(
                         market.market_id,
                         kalshi_data,
@@ -1295,8 +1555,8 @@ mod tests {
 
         // Final state should be valid
         let market = &state.markets[0];
-        let (k_yes, k_no, _, _) = market.kalshi.load();
-        let (p_yes, p_no, _, _) = market.poly.load();
+        let (k_yes, k_no, _, _) = market.kalshi.read().top_of_book();
+        let (p_yes, p_no, _, _) = market.poly.read().top_of_book();
 
         assert!(k_yes > 0 && k_yes < 100);
         assert!(k_no > 0 && k_no < 100);

@@ -13,11 +13,13 @@ use tokio::time::{interval, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
+use crate::arb::detect_arb;
 use crate::config::{self, POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS, GAMMA_API_BASE, POLY_MAX_TOKENS_PER_WS};
 use crate::execution::NanoClock;
 use crate::types::{
     GlobalState, ArbOpportunity, MarketPair, PriceCents, SizeCents,
-    parse_price, fxhash_str,
+    parse_price, fxhash_str, DEPTH_LEVELS,
+    PriceLevel as TypesPriceLevel,
 };
 use crate::debug_socket::{DebugBroadcaster, build_market_update_json};
 
@@ -617,20 +619,25 @@ async fn process_book(
 ) {
     let token_hash = fxhash_str(&book.asset_id);
 
-    // Debug: log raw orderbook data
-    let asks_debug: Vec<(u16, u16)> = book.asks.iter()
+    // Collect all valid asks and sort by price ascending (best ask = lowest price first)
+    let mut asks: Vec<(PriceCents, SizeCents)> = book.asks.iter()
         .filter_map(|l| {
             let price = parse_price(&l.price);
             let size = parse_size(&l.size);
             if price > 0 { Some((price, size)) } else { None }
         })
         .collect();
+    asks.sort_by_key(|(p, _)| *p);
 
-    // Find best ask (lowest price)
-    let (best_ask, ask_size) = asks_debug.iter()
-        .min_by_key(|(p, _)| *p)
-        .copied()
-        .unwrap_or((0, 0));
+    // Build price levels array (top 3 or fewer)
+    let mut levels = [TypesPriceLevel::default(); DEPTH_LEVELS];
+    for (i, (price, size)) in asks.iter().take(DEPTH_LEVELS).enumerate() {
+        levels[i] = TypesPriceLevel { price: *price, size: *size };
+    }
+
+    // Debug: log raw asks and top levels
+    let best_ask = levels[0].price;
+    let ask_size = levels[0].size;
 
     // A token can be YES for one market AND NO for another (e.g., esports where
     // Kalshi has separate markets for each team winning the same match).
@@ -649,14 +656,19 @@ async fn process_book(
         // Debug: log raw asks and computed best ask
         tracing::debug!(
             "[POLY-SNAP] {} | YES asks: {:?} | best_yes_ask: {}¢ size={}",
-            ticker, asks_debug, best_ask, ask_size
+            ticker, &asks[..asks.len().min(5)], best_ask, ask_size
         );
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        market.poly.update_yes(best_ask, ask_size);
+
+        // Update YES levels in OrderbookDepth
+        {
+            let mut guard = market.poly.write();
+            guard.yes_levels = levels;
+        }
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
         if let Some(dbg) = debug {
@@ -665,11 +677,14 @@ async fn process_book(
             }
         }
 
-        // Check arbs using ArbOpportunity::detect()
-        if let Some(req) = ArbOpportunity::detect(
+        // Check arbs using detect_arb() (routes to depth or top-of-book based on USE_DEPTH)
+        // Clone depth data before the if-let to avoid holding RwLockReadGuard across await
+        let kalshi_depth = market.kalshi.read().clone();
+        let poly_depth = market.poly.read().clone();
+        if let Some(req) = detect_arb(
             market_id,
-            market.kalshi.load(),
-            market.poly.load(),
+            &kalshi_depth,
+            &poly_depth,
             state.arb_config(),
             clock.now_ns(),
         ) {
@@ -689,14 +704,19 @@ async fn process_book(
         // Debug: log raw asks and computed best ask
         tracing::debug!(
             "[POLY-SNAP] {} | NO asks: {:?} | best_no_ask: {}¢ size={}",
-            ticker, asks_debug, best_ask, ask_size
+            ticker, &asks[..asks.len().min(5)], best_ask, ask_size
         );
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        market.poly.update_no(best_ask, ask_size);
+
+        // Update NO levels in OrderbookDepth
+        {
+            let mut guard = market.poly.write();
+            guard.no_levels = levels;
+        }
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
         if let Some(dbg) = debug {
@@ -705,11 +725,14 @@ async fn process_book(
             }
         }
 
-        // Check arbs using ArbOpportunity::detect()
-        if let Some(req) = ArbOpportunity::detect(
+        // Check arbs using detect_arb() (routes to depth or top-of-book based on USE_DEPTH)
+        // Clone depth data before the if-let to avoid holding RwLockReadGuard across await
+        let kalshi_depth = market.kalshi.read().clone();
+        let poly_depth = market.poly.read().clone();
+        if let Some(req) = detect_arb(
             market_id,
-            market.kalshi.load(),
-            market.poly.load(),
+            &kalshi_depth,
+            &poly_depth,
             state.arb_config(),
             clock.now_ns(),
         ) {
@@ -758,7 +781,9 @@ async fn process_price_change(
     let yes_market_id = state.poly_yes_to_id.read().get(&token_hash).copied();
     if let Some(market_id) = yes_market_id {
         let market = &state.markets[market_id as usize];
-        let (current_yes, current_no, current_yes_size, _) = market.poly.load();
+
+        // Read current state to get top-of-book for comparison
+        let (current_yes, current_no, _current_yes_size, _) = market.poly.read().top_of_book();
         let ticker = market.pair()
             .map(|p| p.kalshi_market_ticker.to_string())
             .unwrap_or_else(|| format!("market_{}", market_id));
@@ -768,8 +793,13 @@ async fn process_price_change(
             .unwrap_or_default()
             .as_millis() as u64;
 
-        // Always update cached price to reflect current market state
-        market.poly.update_yes(price, current_yes_size);
+        // Update top-of-book YES price (price changes don't give us full depth)
+        // Preserve the size from the existing top level
+        {
+            let mut guard = market.poly.write();
+            guard.yes_levels[0].price = price;
+            // Size is preserved from previous state since price_change doesn't include size
+        }
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
         if let Some(dbg) = debug {
@@ -786,10 +816,13 @@ async fn process_price_change(
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_yes || current_yes == 0 {
-            if let Some(req) = ArbOpportunity::detect(
+            // Clone depth data before the if-let to avoid holding RwLockReadGuard across await
+            let kalshi_depth = market.kalshi.read().clone();
+            let poly_depth = market.poly.read().clone();
+            if let Some(req) = detect_arb(
                 market_id,
-                market.kalshi.load(),
-                market.poly.load(),
+                &kalshi_depth,
+                &poly_depth,
                 state.arb_config(),
                 clock.now_ns(),
             ) {
@@ -802,7 +835,9 @@ async fn process_price_change(
     let no_market_id = state.poly_no_to_id.read().get(&token_hash).copied();
     if let Some(market_id) = no_market_id {
         let market = &state.markets[market_id as usize];
-        let (current_yes, current_no, _, current_no_size) = market.poly.load();
+
+        // Read current state to get top-of-book for comparison
+        let (current_yes, current_no, _, _current_no_size) = market.poly.read().top_of_book();
         let ticker = market.pair()
             .map(|p| p.kalshi_market_ticker.to_string())
             .unwrap_or_else(|| format!("market_{}", market_id));
@@ -812,8 +847,13 @@ async fn process_price_change(
             .unwrap_or_default()
             .as_millis() as u64;
 
-        // Always update cached price to reflect current market state
-        market.poly.update_no(price, current_no_size);
+        // Update top-of-book NO price (price changes don't give us full depth)
+        // Preserve the size from the existing top level
+        {
+            let mut guard = market.poly.write();
+            guard.no_levels[0].price = price;
+            // Size is preserved from previous state since price_change doesn't include size
+        }
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
         if let Some(dbg) = debug {
@@ -830,10 +870,13 @@ async fn process_price_change(
 
         // Only check arbs when price improves (lower = better for buying)
         if price < current_no || current_no == 0 {
-            if let Some(req) = ArbOpportunity::detect(
+            // Clone depth data before the if-let to avoid holding RwLockReadGuard across await
+            let kalshi_depth = market.kalshi.read().clone();
+            let poly_depth = market.poly.read().clone();
+            if let Some(req) = detect_arb(
                 market_id,
-                market.kalshi.load(),
-                market.poly.load(),
+                &kalshi_depth,
+                &poly_depth,
                 state.arb_config(),
                 clock.now_ns(),
             ) {
@@ -985,6 +1028,25 @@ mod tests {
         assert_eq!(thieves_no_market, Some(0), "Token_Thieves should be NO for market 0");
     }
 
+    // Helper to update YES levels in the poly orderbook
+    fn update_poly_yes(state: &GlobalState, market_id: usize, price: u16, size: u16) {
+        let mut guard = state.markets[market_id].poly.write();
+        guard.yes_levels[0].price = price;
+        guard.yes_levels[0].size = size;
+    }
+
+    // Helper to update NO levels in the poly orderbook
+    fn update_poly_no(state: &GlobalState, market_id: usize, price: u16, size: u16) {
+        let mut guard = state.markets[market_id].poly.write();
+        guard.no_levels[0].price = price;
+        guard.no_levels[0].size = size;
+    }
+
+    // Helper to load poly orderbook top-of-book
+    fn load_poly_top(state: &GlobalState, market_id: usize) -> (u16, u16, u16, u16) {
+        state.markets[market_id].poly.read().top_of_book()
+    }
+
     #[test]
     fn test_book_snapshot_updates_both_markets() {
         // When we receive a book snapshot for Token_OpTic, it should update:
@@ -1000,23 +1062,23 @@ mod tests {
         // Simulate what process_book does (without the async/exec_tx parts)
         // First check YES lookup
         if let Some(market_id) = state.poly_yes_to_id.read().get(&optic_hash).copied() {
-            state.markets[market_id as usize].poly.update_yes(optic_price, optic_size);
+            update_poly_yes(&state, market_id as usize, optic_price, optic_size);
             state.markets[market_id as usize].inc_poly_updates();
         }
 
         // Then check NO lookup (same token can be NO for different market)
         if let Some(market_id) = state.poly_no_to_id.read().get(&optic_hash).copied() {
-            state.markets[market_id as usize].poly.update_no(optic_price, optic_size);
+            update_poly_no(&state, market_id as usize, optic_price, optic_size);
             state.markets[market_id as usize].inc_poly_updates();
         }
 
         // Verify Market 0: Token_OpTic is YES, should have YES price updated
-        let (m0_yes, m0_no, _, _) = state.markets[0].poly.load();
+        let (m0_yes, m0_no, _, _) = load_poly_top(&state, 0);
         assert_eq!(m0_yes, 34, "Market 0 YES (OpTic wins) should be 34 cents");
         assert_eq!(m0_no, 0, "Market 0 NO should still be 0 (waiting for Token_Thieves)");
 
         // Verify Market 1: Token_OpTic is NO, should have NO price updated
-        let (m1_yes, m1_no, _, _) = state.markets[1].poly.load();
+        let (m1_yes, m1_no, _, _) = load_poly_top(&state, 1);
         assert_eq!(m1_yes, 0, "Market 1 YES should still be 0 (waiting for Token_Thieves)");
         assert_eq!(m1_no, 34, "Market 1 NO (Thieves loses) should be 34 cents");
 
@@ -1026,21 +1088,21 @@ mod tests {
         let thieves_size: u16 = 2675;
 
         if let Some(market_id) = state.poly_yes_to_id.read().get(&thieves_hash).copied() {
-            state.markets[market_id as usize].poly.update_yes(thieves_price, thieves_size);
+            update_poly_yes(&state, market_id as usize, thieves_price, thieves_size);
             state.markets[market_id as usize].inc_poly_updates();
         }
 
         if let Some(market_id) = state.poly_no_to_id.read().get(&thieves_hash).copied() {
-            state.markets[market_id as usize].poly.update_no(thieves_price, thieves_size);
+            update_poly_no(&state, market_id as usize, thieves_price, thieves_size);
             state.markets[market_id as usize].inc_poly_updates();
         }
 
         // Now both markets should have complete pricing
-        let (m0_yes, m0_no, _, _) = state.markets[0].poly.load();
+        let (m0_yes, m0_no, _, _) = load_poly_top(&state, 0);
         assert_eq!(m0_yes, 34, "Market 0 YES (OpTic wins) = 34 cents");
         assert_eq!(m0_no, 70, "Market 0 NO (OpTic loses) = 70 cents");
 
-        let (m1_yes, m1_no, _, _) = state.markets[1].poly.load();
+        let (m1_yes, m1_no, _, _) = load_poly_top(&state, 1);
         assert_eq!(m1_yes, 70, "Market 1 YES (Thieves wins) = 70 cents");
         assert_eq!(m1_no, 34, "Market 1 NO (Thieves loses) = 34 cents");
 
@@ -1074,28 +1136,28 @@ mod tests {
 
         // OLD BUGGY CODE (don't do this):
         // if let Some(market_id) = state.poly_yes_to_id.read().get(&optic_hash).copied() {
-        //     state.markets[market_id as usize].poly.update_yes(price, size);
+        //     update_poly_yes(&state, market_id as usize, price, size);
         //     return;  // <-- BUG: early return prevents NO lookup
         // }
         // if let Some(market_id) = state.poly_no_to_id.read().get(&optic_hash).copied() {
         //     // This never runs because of early return above!
-        //     state.markets[market_id as usize].poly.update_no(price, size);
+        //     update_poly_no(&state, market_id as usize, price, size);
         // }
 
         // FIXED CODE (what we do now):
         // Check YES lookup
         if let Some(market_id) = state.poly_yes_to_id.read().get(&optic_hash).copied() {
-            state.markets[market_id as usize].poly.update_yes(price, size);
+            update_poly_yes(&state, market_id as usize, price, size);
             // NO return here - continue to check NO lookup
         }
         // Check NO lookup (same token can be NO for different market)
         if let Some(market_id) = state.poly_no_to_id.read().get(&optic_hash).copied() {
-            state.markets[market_id as usize].poly.update_no(price, size);
+            update_poly_no(&state, market_id as usize, price, size);
         }
 
         // Both markets should be updated
-        let (m0_yes, _, _, _) = state.markets[0].poly.load();
-        let (_, m1_no, _, _) = state.markets[1].poly.load();
+        let (m0_yes, _, _, _) = load_poly_top(&state, 0);
+        let (_, m1_no, _, _) = load_poly_top(&state, 1);
 
         assert_eq!(m0_yes, 34, "Market 0 YES should be updated");
         assert_eq!(m1_no, 34, "Market 1 NO should ALSO be updated (regression test)");
@@ -1162,24 +1224,24 @@ mod tests {
         // Simulate processing book snapshot for token_a (price=34, size=462)
         let hash_a = fxhash_str(&token_a);
         if let Some(id) = state.poly_yes_to_id.read().get(&hash_a).copied() {
-            state.markets[id as usize].poly.update_yes(34, 462);
+            update_poly_yes(&state, id as usize, 34, 462);
         }
         if let Some(id) = state.poly_no_to_id.read().get(&hash_a).copied() {
-            state.markets[id as usize].poly.update_no(34, 462);
+            update_poly_no(&state, id as usize, 34, 462);
         }
 
         // Simulate processing book snapshot for token_b (price=70, size=2675)
         let hash_b = fxhash_str(&token_b);
         if let Some(id) = state.poly_yes_to_id.read().get(&hash_b).copied() {
-            state.markets[id as usize].poly.update_yes(70, 2675);
+            update_poly_yes(&state, id as usize, 70, 2675);
         }
         if let Some(id) = state.poly_no_to_id.read().get(&hash_b).copied() {
-            state.markets[id as usize].poly.update_no(70, 2675);
+            update_poly_no(&state, id as usize, 70, 2675);
         }
 
         // Verify both markets have complete pricing
-        let (m0_yes, m0_no, m0_yes_size, m0_no_size) = state.markets[0].poly.load();
-        let (m1_yes, m1_no, m1_yes_size, m1_no_size) = state.markets[1].poly.load();
+        let (m0_yes, m0_no, m0_yes_size, m0_no_size) = load_poly_top(&state, 0);
+        let (m1_yes, m1_no, m1_yes_size, m1_no_size) = load_poly_top(&state, 1);
 
         // Market 0: YES=token_a(34), NO=token_b(70)
         assert_eq!(m0_yes, 34);
@@ -1230,13 +1292,13 @@ mod tests {
 
         // Update prices
         if let Some(id) = state.poly_yes_to_id.read().get(&yes_hash).copied() {
-            state.markets[id as usize].poly.update_yes(45, 1000);
+            update_poly_yes(&state, id as usize, 45, 1000);
         }
         if let Some(id) = state.poly_no_to_id.read().get(&no_hash).copied() {
-            state.markets[id as usize].poly.update_no(58, 2000);
+            update_poly_no(&state, id as usize, 58, 2000);
         }
 
-        let (yes, no, yes_size, no_size) = state.markets[0].poly.load();
+        let (yes, no, yes_size, no_size) = load_poly_top(&state, 0);
         assert_eq!(yes, 45);
         assert_eq!(no, 58);
         assert_eq!(yes_size, 1000);
@@ -1259,8 +1321,8 @@ mod tests {
         let new_price: u16 = 40;
 
         // First, set initial sizes (process_price_change preserves sizes)
-        state.markets[0].poly.update_yes(34, 500);  // Initial YES for market 0
-        state.markets[1].poly.update_no(34, 500);   // Initial NO for market 1
+        update_poly_yes(&state, 0, 34, 500);  // Initial YES for market 0
+        update_poly_no(&state, 1, 34, 500);   // Initial NO for market 1
 
         // Now simulate process_price_change receiving a price update for token_optic
         // The function checks YES lookup first, then NO lookup (no early return)
@@ -1268,8 +1330,12 @@ mod tests {
         // Check YES token lookup
         if let Some(market_id) = state.poly_yes_to_id.read().get(&optic_hash).copied() {
             let market = &state.markets[market_id as usize];
-            let (_, _, current_yes_size, _) = market.poly.load();
-            market.poly.update_yes(new_price, current_yes_size);
+            let (_, _, current_yes_size, _) = market.poly.read().top_of_book();
+            // Update YES price, preserving size
+            {
+                let mut guard = market.poly.write();
+                guard.yes_levels[0].price = new_price;
+            }
             market.inc_poly_updates();
         }
 
@@ -1277,17 +1343,21 @@ mod tests {
         // OLD BUGGY CODE would have `return` above, never reaching here
         if let Some(market_id) = state.poly_no_to_id.read().get(&optic_hash).copied() {
             let market = &state.markets[market_id as usize];
-            let (_, _, _, current_no_size) = market.poly.load();
-            market.poly.update_no(new_price, current_no_size);
+            let (_, _, _, current_no_size) = market.poly.read().top_of_book();
+            // Update NO price, preserving size
+            {
+                let mut guard = market.poly.write();
+                guard.no_levels[0].price = new_price;
+            }
             market.inc_poly_updates();
         }
 
         // Verify Market 0: Token_OpTic is YES, should have YES price updated to 40
-        let (m0_yes, _, _, _) = state.markets[0].poly.load();
+        let (m0_yes, _, _, _) = load_poly_top(&state, 0);
         assert_eq!(m0_yes, 40, "Market 0 YES (OpTic wins) should be updated to 40 cents");
 
         // Verify Market 1: Token_OpTic is NO, should have NO price updated to 40
-        let (_, m1_no, _, _) = state.markets[1].poly.load();
+        let (_, m1_no, _, _) = load_poly_top(&state, 1);
         assert_eq!(m1_no, 40, "Market 1 NO (Thieves loses) should ALSO be updated to 40 cents");
 
         // Verify update counts reflect both markets were updated

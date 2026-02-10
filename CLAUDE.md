@@ -39,9 +39,9 @@ This is a Rust arbitrage bot that monitors price discrepancies between Kalshi an
 ```
 WebSocket Price Updates (kalshi.rs, polymarket.rs)
     ↓
-Global State with Lock-Free Orderbook Cache (types.rs)
+Global State with OrderbookDepth Cache (types.rs) - 3 price levels per side
     ↓
-ArbOpportunity::detect() in WebSocket Handlers - validates prices, fees, sizes
+detect_arb() in WebSocket Handlers - routes to depth or top-of-book detection
     ↓
 Confirmation Queue (confirm_queue.rs) or Direct Execution
     ↓
@@ -51,14 +51,14 @@ Platform Orders (kalshi.rs, polymarket_clob.rs)
     ↓
 Position Tracking (position_tracker.rs)
 
-Parallel: Heartbeat Monitoring (main.rs, every 10s) - logs status, does NOT trigger execution
+Parallel: Heartbeat Monitoring (main.rs, every 10s) - logs status + lock contention stats
 ```
 
 ### Key Modules
 
 - **`main.rs`** - Entry point, WebSocket orchestration, startup sweep, heartbeat monitoring
-- **`arb.rs`** - Centralized arbitrage opportunity detection (ArbConfig, ArbOpportunity)
-- **`types.rs`** - Core data structures including `AtomicOrderbook` (lock-free using packed u64 with CAS loops)
+- **`arb.rs`** - Centralized arbitrage detection: `detect_arb()` routes to depth or top-of-book based on `USE_DEPTH` env var
+- **`types.rs`** - Core data structures including `OrderbookDepth` (3 levels per side) and `InstrumentedRwLock` (lock contention monitoring)
 - **`execution.rs`** - Concurrent order execution with in-flight deduplication (8-slot bitmask for 512 markets)
 - **`kalshi.rs`** - Kalshi REST/WebSocket client with RSA signature authentication
 - **`polymarket.rs`** - Polymarket WebSocket client and Gamma API integration
@@ -88,7 +88,7 @@ Common pattern: env vars often have corresponding CLI flags (e.g., `CONFIRM_MODE
 | Doc | Read when... |
 |-----|--------------|
 | `controller/docs/EXECUTION.md` | Touching `execution.rs`, in-flight dedup, auto-close logic, fill handling |
-| `controller/docs/ATOMIC_ORDERBOOK.md` | Touching `types.rs`, `AtomicOrderbook`, bit-packing, or lock-free updates |
+| `controller/docs/ORDERBOOK_DEPTH.md` | Touching `types.rs`, `OrderbookDepth`, `InstrumentedRwLock`, or arb detection |
 | `controller/docs/REMOTE_TRADING.md` | Touching `remote_*.rs`, hybrid executor, controller↔trader protocol |
 | `controller/docs/CONFIRMATION_TUI.md` | Touching TUI, logging, `confirm_*.rs`, or debugging log display issues |
 | `controller/docs/PAIRING_DEBUG_PLAYBOOK.md` | Debugging market pairing between Kalshi/Polymarket |
@@ -154,12 +154,23 @@ When Polymarket returns `status=delayed` (order accepted but not yet matched), t
 
 **Known Limitation:** PolyOnly arbs (both legs on Polymarket) with delayed orders have incomplete reconciliation handling. The system logs a warning but cannot fully reconcile since both sides may be in delayed state. This is a rare edge case.
 
-### Lock-Free Orderbook Design
+### Orderbook Depth Design
 
-`AtomicOrderbook` uses a packed u64 format for cache-line efficiency:
-- Bit layout: `[yes_ask:16][no_ask:16][yes_size:16][no_size:16]`
-- Updates via compare-and-swap loops
-- 64-byte aligned for SIMD compatibility
+The system stores 3 price levels per side for EV-maximizing arbitrage detection:
+
+**Data Structures** (`types.rs`):
+- `OrderbookDepth` - 3 `PriceLevel` structs for YES and NO sides, sorted by price ascending
+- `PriceLevel` - `price: PriceCents` + `size: SizeCents`
+- `InstrumentedRwLock<T>` - RwLock wrapper with contention monitoring (~10-15ns overhead)
+
+**Detection Modes** (controlled by `USE_DEPTH` env var):
+- **Default (top-of-book)**: Uses `ArbOpportunity::detect()` - only looks at best prices
+- **Depth-aware (`USE_DEPTH=1`)**: Uses `detect_best_ev()` - examines all 81 combinations (3^4) to maximize EV = |gap| × contracts
+
+**Lock Contention Monitoring**:
+- `InstrumentedRwLock` uses fast-path `try_write()`/`try_read()` before falling back to blocking
+- Reports to global `LOCK_STATS` aggregator
+- Heartbeat logs: `[LOCK] ops=X contention=Y (Z%) avg_wait=Wµs`
 
 ### Fee Calculation
 
@@ -217,6 +228,7 @@ dotenvx run -- cargo run --release
 **Arbitrage detection:**
 - `ARB_THRESHOLD_CENTS` (default: 99, valid: 1-100) - arb exists when total cost ≤ threshold. Invalid values logged and replaced with default.
 - `ARB_MIN_CONTRACTS` (default: 1.0, must be > 0) - minimum executable contracts for valid arb. Invalid values logged and replaced with default.
+- `USE_DEPTH` (default: unset) - set to `1` to enable depth-aware EV-maximizing detection across all 3 price levels. Unset uses top-of-book only.
 
 **Circuit breaker:** `CB_ENABLED`, `CB_MAX_POSITION_PER_MARKET`, `CB_MAX_TOTAL_POSITION`, `CB_MAX_DAILY_LOSS`, `CB_MAX_CONSECUTIVE_ERRORS`, `CB_COOLDOWN_SECS`, `CB_MIN_CONTRACTS` (minimum contracts to execute, trades are capped to remaining capacity)
 

@@ -481,10 +481,18 @@ mod infra_integration_tests {
 
         let market_id = state.add_pair(pair).unwrap();
 
-        // Set prices
+        // Set prices using new InstrumentedRwLock<OrderbookDepth> API
         let market = state.get_by_id(market_id).unwrap();
-        market.kalshi.store(kalshi_yes, kalshi_no, 1000, 1000);
-        market.poly.store(poly_yes, poly_no, 1000, 1000);
+        {
+            let mut guard = market.kalshi.write();
+            guard.yes_levels[0] = PriceLevel { price: kalshi_yes, size: 1000 };
+            guard.no_levels[0] = PriceLevel { price: kalshi_no, size: 1000 };
+        }
+        {
+            let mut guard = market.poly.write();
+            guard.yes_levels[0] = PriceLevel { price: poly_yes, size: 1000 };
+            guard.no_levels[0] = PriceLevel { price: poly_no, size: 1000 };
+        }
 
         (state, market_id)
     }
@@ -504,8 +512,8 @@ mod infra_integration_tests {
         let market = state.get_by_id(market_id).unwrap();
         let arb = ArbOpportunity::detect(
             market_id,
-            market.kalshi.load(),
-            market.poly.load(),
+            market.kalshi.read().top_of_book(),
+            market.poly.read().top_of_book(),
             state.arb_config(),
             0,
         );
@@ -551,8 +559,8 @@ mod infra_integration_tests {
         let market = state.get_by_id(market_id).unwrap();
         let arb = ArbOpportunity::detect(
             market_id,
-            market.kalshi.load(),
-            market.poly.load(),
+            market.kalshi.read().top_of_book(),
+            market.poly.read().top_of_book(),
             state.arb_config(),
             0,
         );
@@ -570,8 +578,8 @@ mod infra_integration_tests {
         let market = state.get_by_id(market_id).unwrap();
         let arb = ArbOpportunity::detect(
             market_id,
-            market.kalshi.load(),
-            market.poly.load(),
+            market.kalshi.read().top_of_book(),
+            market.poly.read().top_of_book(),
             state.arb_config(),
             0,
         );
@@ -591,8 +599,8 @@ mod infra_integration_tests {
         let market = state.get_by_id(market_id).unwrap();
         let arb = ArbOpportunity::detect(
             market_id,
-            market.kalshi.load(),
-            market.poly.load(),
+            market.kalshi.read().top_of_book(),
+            market.poly.read().top_of_book(),
             state.arb_config(),
             0,
         );
@@ -612,8 +620,8 @@ mod infra_integration_tests {
         let market = state.get_by_id(market_id).unwrap();
         let arb = ArbOpportunity::detect(
             market_id,
-            market.kalshi.load(),
-            market.poly.load(),
+            market.kalshi.read().top_of_book(),
+            market.poly.read().top_of_book(),
             state.arb_config(),
             0,
         );
@@ -635,8 +643,8 @@ mod infra_integration_tests {
         let market = state.get_by_id(market_id).unwrap();
         let arb = ArbOpportunity::detect(
             market_id,
-            market.kalshi.load(),
-            market.poly.load(),
+            market.kalshi.read().top_of_book(),
+            market.poly.read().top_of_book(),
             state.arb_config(),
             0,
         );
@@ -652,8 +660,8 @@ mod infra_integration_tests {
         let market = state.get_by_id(market_id).unwrap();
         let arb = ArbOpportunity::detect(
             market_id,
-            market.kalshi.load(),
-            market.poly.load(),
+            market.kalshi.read().top_of_book(),
+            market.poly.read().top_of_book(),
             state.arb_config(),
             0,
         );
@@ -825,8 +833,8 @@ mod infra_integration_tests {
         let market = state.get_by_id(market_id).unwrap();
         let req = ArbOpportunity::detect(
             market_id,
-            market.kalshi.load(),
-            market.poly.load(),
+            market.kalshi.read().top_of_book(),
+            market.poly.read().top_of_book(),
             state.arb_config(),
             0,
         );
@@ -2160,6 +2168,20 @@ mod startup_sweep_tests {
     // Mutex to serialize tests that modify env vars
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+    /// Helper: Set prices on a market using the new OrderbookDepth API
+    fn set_prices(market: &AtomicMarketState, kalshi_yes: u16, kalshi_no: u16, poly_yes: u16, poly_no: u16) {
+        {
+            let mut guard = market.kalshi.write();
+            guard.yes_levels[0] = PriceLevel { price: kalshi_yes, size: 1000 };
+            guard.no_levels[0] = PriceLevel { price: kalshi_no, size: 1000 };
+        }
+        {
+            let mut guard = market.poly.write();
+            guard.yes_levels[0] = PriceLevel { price: poly_yes, size: 1000 };
+            guard.no_levels[0] = PriceLevel { price: poly_no, size: 1000 };
+        }
+    }
+
     /// Helper: Create a test MarketPair
     fn make_pair(id: &str) -> MarketPair {
         MarketPair {
@@ -2186,26 +2208,22 @@ mod startup_sweep_tests {
         // Market 0: Has arb (Poly YES 40 + Kalshi NO 50 + fee 2 = 92)
         let id0 = state.add_pair(make_pair("0")).unwrap();
         let market0 = state.get_by_id(id0).unwrap();
-        market0.kalshi.store(55, 50, 1000, 1000);  // Kalshi YES=55, NO=50
-        market0.poly.store(40, 65, 1000, 1000);    // Poly YES=40, NO=65
+        set_prices(market0, 55, 50, 40, 65);  // Kalshi YES=55, NO=50, Poly YES=40, NO=65
 
         // Market 1: No arb (prices too high)
         let id1 = state.add_pair(make_pair("1")).unwrap();
         let market1 = state.get_by_id(id1).unwrap();
-        market1.kalshi.store(55, 55, 1000, 1000);  // No arb
-        market1.poly.store(55, 55, 1000, 1000);
+        set_prices(market1, 55, 55, 55, 55);  // No arb
 
         // Market 2: Incomplete prices (Poly not loaded)
         let id2 = state.add_pair(make_pair("2")).unwrap();
         let market2 = state.get_by_id(id2).unwrap();
-        market2.kalshi.store(40, 50, 1000, 1000);  // Kalshi loaded
-        market2.poly.store(0, 0, 0, 0);            // Poly NOT loaded
+        set_prices(market2, 40, 50, 0, 0);  // Kalshi loaded, Poly NOT loaded
 
         // Market 3: Another arb (KalshiYesPolyNo)
         let id3 = state.add_pair(make_pair("3")).unwrap();
         let market3 = state.get_by_id(id3).unwrap();
-        market3.kalshi.store(40, 65, 1000, 1000);  // Kalshi YES=40
-        market3.poly.store(55, 50, 1000, 1000);    // Poly NO=50
+        set_prices(market3, 40, 65, 55, 50);  // Kalshi YES=40, Poly NO=50
 
         Arc::new(state)
     }
@@ -2222,8 +2240,8 @@ mod startup_sweep_tests {
         let mut markets_scanned = 0;
 
         for market in state.markets.iter().take(market_count) {
-            let kalshi_data = market.kalshi.load();
-            let poly_data = market.poly.load();
+            let kalshi_data = market.kalshi.read().top_of_book();
+            let poly_data = market.poly.read().top_of_book();
             let (k_yes, k_no, _, _) = kalshi_data;
             let (p_yes, p_no, _, _) = poly_data;
 
@@ -2272,11 +2290,10 @@ mod startup_sweep_tests {
         let market = state.get_by_id(id).unwrap();
 
         // Only Kalshi prices set (simulates Kalshi loaded before Poly)
-        market.kalshi.store(40, 50, 1000, 1000);
-        market.poly.store(0, 0, 0, 0);  // Poly not loaded
+        set_prices(market, 40, 50, 0, 0);  // Poly not loaded
 
-        let (k_yes, k_no, _, _) = market.kalshi.load();
-        let (p_yes, p_no, _, _) = market.poly.load();
+        let (k_yes, k_no, _, _) = market.kalshi.read().top_of_book();
+        let (p_yes, p_no, _, _) = market.poly.read().top_of_book();
 
         // Should be skipped due to incomplete prices
         let should_skip = k_yes == 0 || k_no == 0 || p_yes == 0 || p_no == 0;
@@ -2291,8 +2308,7 @@ mod startup_sweep_tests {
         // Market with no arb (prices too high)
         let id = state.add_pair(make_pair("no-arb")).unwrap();
         let market = state.get_by_id(id).unwrap();
-        market.kalshi.store(55, 55, 1000, 1000);
-        market.poly.store(55, 55, 1000, 1000);
+        set_prices(market, 55, 55, 55, 55);
 
         let (_tx, mut rx) = mpsc::channel::<ArbOpportunity>(16);
 
@@ -2300,8 +2316,8 @@ mod startup_sweep_tests {
         let mut arbs_found = 0;
 
         for market in state.markets.iter().take(market_count) {
-            let kalshi_data = market.kalshi.load();
-            let poly_data = market.poly.load();
+            let kalshi_data = market.kalshi.read().top_of_book();
+            let poly_data = market.poly.read().top_of_book();
             let (k_yes, k_no, _, _) = kalshi_data;
             let (p_yes, p_no, _, _) = poly_data;
 
@@ -2336,13 +2352,12 @@ mod startup_sweep_tests {
         // Set up prices where both PolyYesKalshiNo AND PolyOnly are arbs
         // Poly YES=40, Poly NO=50 = 90 (Poly only arb)
         // Poly YES=40, Kalshi NO=50 + fee 2 = 92 (Cross platform arb)
-        market.kalshi.store(55, 50, 1000, 1000);
-        market.poly.store(40, 50, 1000, 1000);
+        set_prices(market, 55, 50, 40, 50);
 
         let arb = ArbOpportunity::detect(
             id,
-            market.kalshi.load(),
-            market.poly.load(),
+            market.kalshi.read().top_of_book(),
+            market.poly.read().top_of_book(),
             state.arb_config(),
             0,
         );
@@ -2390,14 +2405,12 @@ mod startup_sweep_tests {
         // Market 0: NBA league (skips confirmation) - has arb
         let id0 = state.add_pair(make_league_pair("nba-game", "nba")).unwrap();
         let market0 = state.get_by_id(id0).unwrap();
-        market0.kalshi.store(55, 50, 1000, 1000);
-        market0.poly.store(40, 65, 1000, 1000);
+        set_prices(market0, 55, 50, 40, 65);
 
         // Market 1: EPL league (requires confirmation) - has arb
         let id1 = state.add_pair(make_league_pair("epl-game", "epl")).unwrap();
         let market1 = state.get_by_id(id1).unwrap();
-        market1.kalshi.store(55, 50, 1000, 1000);
-        market1.poly.store(40, 65, 1000, 1000);
+        set_prices(market1, 55, 50, 40, 65);
 
         // Two channels: exec for auto-execute, confirm for confirmation required
         let (exec_tx, mut exec_rx) = mpsc::channel::<ArbOpportunity>(16);
