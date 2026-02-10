@@ -114,6 +114,7 @@ pub mod mock {
     /// Also tracks all calls for verification in tests.
     pub struct MockPolyClient {
         responses: RwLock<HashMap<String, MockResponse>>,
+        response_sequences: RwLock<HashMap<String, Vec<MockResponse>>>,
         delayed_responses: RwLock<HashMap<String, MockDelayedResponse>>,
         calls: RwLock<Vec<MockCall>>,
     }
@@ -123,6 +124,7 @@ pub mod mock {
         pub fn new() -> Self {
             Self {
                 responses: RwLock::new(HashMap::new()),
+                response_sequences: RwLock::new(HashMap::new()),
                 delayed_responses: RwLock::new(HashMap::new()),
                 calls: RwLock::new(Vec::new()),
             }
@@ -179,8 +181,28 @@ pub mod mock {
             responses.insert(token.to_string(), MockResponse::Delayed { order_id: order_id.to_string() });
         }
 
+        /// Configure a sequence of responses for a token (consumed in order).
+        /// After the sequence is exhausted, falls back to the static response.
+        pub fn set_response_sequence(&self, token: &str, sequence: Vec<MockResponse>) {
+            let mut seqs = self.response_sequences.write().unwrap();
+            // Store reversed so we can pop from the end efficiently
+            let mut seq = sequence;
+            seq.reverse();
+            seqs.insert(token.to_string(), seq);
+        }
+
         /// Get the configured response for a token.
+        /// Checks sequence first (consuming one entry), then falls back to static.
         fn get_response(&self, token_id: &str) -> Option<MockResponse> {
+            // Try sequence first
+            {
+                let mut seqs = self.response_sequences.write().unwrap();
+                if let Some(seq) = seqs.get_mut(token_id) {
+                    if let Some(resp) = seq.pop() {
+                        return Some(resp);
+                    }
+                }
+            }
             let responses = self.responses.read().unwrap();
             responses.get(token_id).cloned()
         }
