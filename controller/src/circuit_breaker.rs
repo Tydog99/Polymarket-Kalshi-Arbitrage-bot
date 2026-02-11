@@ -137,27 +137,50 @@ impl MarketPosition {
     }
 }
 
+/// Per-market failure tracking for blacklisting markets with repeated failures
+#[derive(Debug)]
+struct MarketFailureState {
+    /// Number of consecutive mismatch failures on this market
+    consecutive_mismatches: u32,
+    /// When this market was blacklisted (None = not blacklisted)
+    blacklisted_at: Option<Instant>,
+}
+
+/// Default: 3 consecutive mismatches before blacklisting a market
+const DEFAULT_MARKET_BLACKLIST_THRESHOLD: u32 = 3;
+/// Default: 5 minutes blacklist duration per market
+const DEFAULT_MARKET_BLACKLIST_SECS: u64 = 300;
+
 /// Circuit breaker state
 pub struct CircuitBreaker {
     config: CircuitBreakerConfig,
-    
+
     /// Whether trading is currently halted
     halted: AtomicBool,
-    
+
     /// When the circuit breaker was tripped
     tripped_at: RwLock<Option<Instant>>,
-    
+
     /// Reason for trip
     trip_reason: RwLock<Option<TripReason>>,
-    
+
     /// Consecutive error count
     consecutive_errors: AtomicI64,
-    
+
     /// Daily P&L tracking (in cents)
     daily_pnl_cents: AtomicI64,
-    
+
     /// Positions per market
     positions: RwLock<std::collections::HashMap<String, MarketPosition>>,
+
+    /// Per-market failure tracking for blacklisting
+    market_failures: RwLock<std::collections::HashMap<String, MarketFailureState>>,
+
+    /// Threshold for blacklisting a market (consecutive mismatches)
+    market_blacklist_threshold: u32,
+
+    /// How long a market stays blacklisted (seconds)
+    market_blacklist_secs: u64,
 }
 
 impl CircuitBreaker {
@@ -171,6 +194,17 @@ impl CircuitBreaker {
         info!("[CB]   Cooldown: {}s", config.cooldown_secs);
         info!("[CB]   Min contracts: {}", config.min_contracts);
         
+        let market_blacklist_threshold: u32 = std::env::var("CB_MARKET_BLACKLIST_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MARKET_BLACKLIST_THRESHOLD);
+        let market_blacklist_secs: u64 = std::env::var("CB_MARKET_BLACKLIST_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MARKET_BLACKLIST_SECS);
+        info!("[CB]   Market blacklist threshold: {} mismatches", market_blacklist_threshold);
+        info!("[CB]   Market blacklist duration: {}s", market_blacklist_secs);
+
         Self {
             config,
             halted: AtomicBool::new(false),
@@ -179,6 +213,9 @@ impl CircuitBreaker {
             consecutive_errors: AtomicI64::new(0),
             daily_pnl_cents: AtomicI64::new(0),
             positions: RwLock::new(std::collections::HashMap::new()),
+            market_failures: RwLock::new(std::collections::HashMap::new()),
+            market_blacklist_threshold,
+            market_blacklist_secs,
         }
     }
     
@@ -305,8 +342,74 @@ impl CircuitBreaker {
         }
     }
     
+    /// Record a fill mismatch on a specific market.
+    /// Increments the market's consecutive mismatch count and blacklists it
+    /// if it exceeds the threshold. Also counts as a consecutive error.
+    pub async fn record_mismatch(&self, market_id: &str) {
+        // Count as a consecutive error (can trip global halt)
+        self.record_error().await;
+
+        if !self.config.enabled {
+            return;
+        }
+
+        let mut failures = self.market_failures.write().await;
+        let state = failures.entry(market_id.to_string()).or_insert(MarketFailureState {
+            consecutive_mismatches: 0,
+            blacklisted_at: None,
+        });
+
+        state.consecutive_mismatches += 1;
+        let count = state.consecutive_mismatches;
+
+        if count >= self.market_blacklist_threshold && state.blacklisted_at.is_none() {
+            state.blacklisted_at = Some(Instant::now());
+            error!(
+                "[CB] 🚫 MARKET BLACKLISTED: {} ({} consecutive mismatches, blacklisted for {}s)",
+                market_id, count, self.market_blacklist_secs
+            );
+        } else if state.blacklisted_at.is_none() {
+            warn!(
+                "[CB] ⚠️ Mismatch #{} on {} (blacklist at {})",
+                count, market_id, self.market_blacklist_threshold
+            );
+        }
+    }
+
+    /// Check if a market is currently blacklisted.
+    /// Automatically clears expired blacklists.
+    pub async fn is_market_blacklisted(&self, market_id: &str) -> bool {
+        if !self.config.enabled {
+            return false;
+        }
+
+        let mut failures = self.market_failures.write().await;
+        if let Some(state) = failures.get_mut(market_id) {
+            if let Some(blacklisted_at) = state.blacklisted_at {
+                if blacklisted_at.elapsed() > Duration::from_secs(self.market_blacklist_secs) {
+                    // Blacklist expired - reset
+                    info!("[CB] Market {} blacklist expired, re-enabling", market_id);
+                    state.consecutive_mismatches = 0;
+                    state.blacklisted_at = None;
+                    return false;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Clear mismatch count for a market after a successful matched execution
+    pub async fn clear_market_mismatches(&self, market_id: &str) {
+        let mut failures = self.market_failures.write().await;
+        if let Some(state) = failures.get_mut(market_id) {
+            if state.blacklisted_at.is_none() {
+                state.consecutive_mismatches = 0;
+            }
+        }
+    }
+
     /// Record P&L update (for tracking without execution)
-    #[allow(dead_code)]
     pub fn record_pnl(&self, pnl: f64) {
         let pnl_cents = (pnl * 100.0) as i64;
         self.daily_pnl_cents.fetch_add(pnl_cents, Ordering::SeqCst);
@@ -350,7 +453,6 @@ impl CircuitBreaker {
     }
 
     /// Check if cooldown has elapsed and auto-reset if so
-    #[allow(dead_code)]
     pub async fn check_cooldown(&self) -> bool {
         if !self.halted.load(Ordering::SeqCst) {
             return true;
@@ -578,5 +680,104 @@ mod tests {
 
         let cb = CircuitBreaker::new(config);
         assert_eq!(cb.min_contracts(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_market_blacklist_after_repeated_mismatches() {
+        let config = CircuitBreakerConfig {
+            max_position_per_market: 100,
+            max_total_position: 500,
+            max_daily_loss: 100.0,
+            max_consecutive_errors: 10, // High so global halt doesn't interfere
+            cooldown_secs: 60,
+            enabled: true,
+            min_contracts: 1,
+        };
+
+        let cb = CircuitBreaker::new(config);
+        // threshold defaults to 3
+
+        assert!(!cb.is_market_blacklisted("market1").await);
+
+        // 2 mismatches — not yet blacklisted
+        cb.record_mismatch("market1").await;
+        cb.record_mismatch("market1").await;
+        assert!(!cb.is_market_blacklisted("market1").await);
+
+        // 3rd mismatch — blacklisted
+        cb.record_mismatch("market1").await;
+        assert!(cb.is_market_blacklisted("market1").await);
+
+        // Different market should not be blacklisted
+        assert!(!cb.is_market_blacklisted("market2").await);
+    }
+
+    #[tokio::test]
+    async fn test_market_blacklist_clears_on_success() {
+        let config = CircuitBreakerConfig {
+            max_position_per_market: 100,
+            max_total_position: 500,
+            max_daily_loss: 100.0,
+            max_consecutive_errors: 10,
+            cooldown_secs: 60,
+            enabled: true,
+            min_contracts: 1,
+        };
+
+        let cb = CircuitBreaker::new(config);
+
+        // 2 mismatches, then success clears counter
+        cb.record_mismatch("market1").await;
+        cb.record_mismatch("market1").await;
+        cb.clear_market_mismatches("market1").await;
+
+        // Next mismatch should be #1 again, not #3
+        cb.record_mismatch("market1").await;
+        assert!(!cb.is_market_blacklisted("market1").await);
+    }
+
+    #[tokio::test]
+    async fn test_mismatch_counts_as_consecutive_error() {
+        let config = CircuitBreakerConfig {
+            max_position_per_market: 100,
+            max_total_position: 500,
+            max_daily_loss: 100.0,
+            max_consecutive_errors: 3,
+            cooldown_secs: 60,
+            enabled: true,
+            min_contracts: 1,
+        };
+
+        let cb = CircuitBreaker::new(config);
+
+        // 3 mismatches should trip global halt via consecutive errors
+        cb.record_mismatch("market1").await;
+        cb.record_mismatch("market2").await;
+        assert!(cb.is_trading_allowed());
+
+        cb.record_mismatch("market3").await;
+        assert!(!cb.is_trading_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_record_pnl_updates_daily_loss() {
+        let config = CircuitBreakerConfig {
+            max_position_per_market: 100,
+            max_total_position: 500,
+            max_daily_loss: 1.0, // $1 limit
+            max_consecutive_errors: 10,
+            cooldown_secs: 60,
+            enabled: true,
+            min_contracts: 1,
+        };
+
+        let cb = CircuitBreaker::new(config);
+
+        // Record -$1.50 loss (from auto-close)
+        cb.record_pnl(-1.50);
+
+        // Should now be blocked by daily loss
+        let result = cb.can_execute("market1", 1).await;
+        assert!(matches!(result, Err(TripReason::MaxDailyLoss { .. })));
     }
 }
