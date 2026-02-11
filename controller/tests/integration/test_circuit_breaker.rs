@@ -769,3 +769,169 @@ async fn test_circuit_breaker_manual_halt() {
         other => panic!("Expected ManualHalt error, got {:?}", other),
     }
 }
+
+// ============================================================================
+// TEST: PER-MARKET BLACKLISTING
+// ============================================================================
+
+/// Create a circuit breaker with low blacklist threshold for testing.
+fn create_circuit_breaker_with_blacklist_threshold(threshold: u32) -> CircuitBreaker {
+    // Set env var before construction (CircuitBreaker reads it in new())
+    std::env::set_var("CB_MARKET_BLACKLIST_THRESHOLD", threshold.to_string());
+    std::env::set_var("CB_MARKET_BLACKLIST_SECS", "1"); // 1s for fast tests
+    let config = CircuitBreakerConfig {
+        max_position_per_market: 100,
+        max_total_position: 500,
+        max_daily_loss: 100.0,
+        max_consecutive_errors: 20, // High so global halt doesn't interfere
+        cooldown_secs: 60,
+        enabled: true,
+        min_contracts: 1,
+    };
+    let cb = CircuitBreaker::new(config);
+    // Clean up env vars
+    std::env::remove_var("CB_MARKET_BLACKLIST_THRESHOLD");
+    std::env::remove_var("CB_MARKET_BLACKLIST_SECS");
+    cb
+}
+
+/// Test that a market is blacklisted after N consecutive mismatches.
+#[tokio::test]
+async fn test_market_blacklisted_after_threshold() {
+    let cb = create_circuit_breaker_with_blacklist_threshold(3);
+
+    // Not blacklisted initially
+    assert!(!cb.is_market_blacklisted("market1").await);
+
+    // First two mismatches — still allowed
+    cb.record_mismatch("market1").await;
+    cb.record_mismatch("market1").await;
+    assert!(!cb.is_market_blacklisted("market1").await);
+
+    // Third mismatch — blacklisted
+    cb.record_mismatch("market1").await;
+    assert!(cb.is_market_blacklisted("market1").await);
+}
+
+/// Test that blacklisting is per-market (other markets unaffected).
+#[tokio::test]
+async fn test_blacklist_is_per_market() {
+    let cb = create_circuit_breaker_with_blacklist_threshold(2);
+
+    cb.record_mismatch("market1").await;
+    cb.record_mismatch("market1").await;
+
+    assert!(cb.is_market_blacklisted("market1").await, "market1 should be blacklisted");
+    assert!(!cb.is_market_blacklisted("market2").await, "market2 should NOT be blacklisted");
+}
+
+/// Test that a successful matched fill resets the mismatch counter.
+#[tokio::test]
+async fn test_success_clears_mismatch_counter() {
+    let cb = create_circuit_breaker_with_blacklist_threshold(3);
+
+    // 2 mismatches, then a success
+    cb.record_mismatch("market1").await;
+    cb.record_mismatch("market1").await;
+    cb.clear_market_mismatches("market1").await;
+
+    // After clear, next mismatch is #1 again — not blacklisted
+    cb.record_mismatch("market1").await;
+    assert!(!cb.is_market_blacklisted("market1").await);
+
+    // Need 2 more to hit threshold again
+    cb.record_mismatch("market1").await;
+    assert!(!cb.is_market_blacklisted("market1").await);
+    cb.record_mismatch("market1").await;
+    assert!(cb.is_market_blacklisted("market1").await);
+}
+
+/// Test that blacklist auto-expires after the configured duration.
+#[tokio::test]
+async fn test_blacklist_expires() {
+    let cb = create_circuit_breaker_with_blacklist_threshold(2);
+
+    // Blacklist market1
+    cb.record_mismatch("market1").await;
+    cb.record_mismatch("market1").await;
+    assert!(cb.is_market_blacklisted("market1").await);
+
+    // Wait for expiry (1s configured + buffer)
+    tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
+
+    // Should be unblacklisted now
+    assert!(!cb.is_market_blacklisted("market1").await);
+}
+
+/// Test that mismatches count toward global consecutive errors.
+#[tokio::test]
+async fn test_mismatch_escalates_to_global_halt() {
+    let config = CircuitBreakerConfig {
+        max_position_per_market: 100,
+        max_total_position: 500,
+        max_daily_loss: 100.0,
+        max_consecutive_errors: 3,
+        cooldown_secs: 60,
+        enabled: true,
+        min_contracts: 1,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    assert!(cb.is_trading_allowed());
+
+    // 3 mismatches (even across different markets) should trip global halt
+    cb.record_mismatch("market1").await;
+    cb.record_mismatch("market2").await;
+    assert!(cb.is_trading_allowed(), "Should still be allowed after 2 mismatches");
+
+    cb.record_mismatch("market3").await;
+    assert!(!cb.is_trading_allowed(), "Should be halted after 3 mismatches (consecutive error limit)");
+}
+
+/// Test that auto-close P&L feeds back into daily loss tracking.
+#[tokio::test]
+async fn test_auto_close_pnl_feeds_daily_loss() {
+    let cb = create_circuit_breaker_with_limits(100, 500, 10.0); // $10 daily loss limit
+
+    // Simulate auto-close losses via record_pnl
+    cb.record_pnl(-5.0);  // $5 loss
+    assert!(cb.can_execute("market1", 1).await.is_ok(), "Should still be allowed");
+
+    cb.record_pnl(-6.0);  // $6 more loss = $11 total > $10 limit
+
+    let result = cb.can_execute("market1", 1).await;
+    assert!(
+        matches!(result, Err(TripReason::MaxDailyLoss { .. })),
+        "Should be blocked by daily loss from auto-close P&L"
+    );
+}
+
+/// Test that blacklisting is skipped when circuit breaker is disabled.
+#[tokio::test]
+async fn test_blacklist_disabled_when_cb_disabled() {
+    let cb = create_disabled_circuit_breaker();
+
+    // Record many mismatches
+    for _ in 0..10 {
+        cb.record_mismatch("market1").await;
+    }
+
+    // Should never be blacklisted when CB is disabled
+    assert!(!cb.is_market_blacklisted("market1").await);
+}
+
+/// Test that clear_market_mismatches does not unblacklist an already-blacklisted market.
+/// (Only expiry should clear a blacklist, not a success during the blacklist period.)
+#[tokio::test]
+async fn test_clear_mismatches_does_not_unblacklist() {
+    let cb = create_circuit_breaker_with_blacklist_threshold(2);
+
+    // Blacklist market1
+    cb.record_mismatch("market1").await;
+    cb.record_mismatch("market1").await;
+    assert!(cb.is_market_blacklisted("market1").await);
+
+    // clear_market_mismatches should NOT unblacklist (only expiry does)
+    cb.clear_market_mismatches("market1").await;
+    assert!(cb.is_market_blacklisted("market1").await, "Should still be blacklisted");
+}

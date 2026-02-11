@@ -83,32 +83,42 @@ FastExecutionRequest received
         │
         ▼
 ┌─────────────────────────────────┐
-│ 3. Check profit threshold (≥1¢) │
+│ 3. Market blacklist check       │ ← Skip if repeated mismatches
 └─────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────┐
-│ 4. Check liquidity (≥1 contract)│
+│ 4. Cooldown check (auto-reset)  │ ← Unblocks if cooldown expired
 └─────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────┐
-│ 5. Circuit breaker capacity     │ ← May cap contract count
+│ 5. Check profit threshold (≥1¢) │
 └─────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────┐
-│ 6. Execute both legs (async)    │ ← Concurrent platform calls
+│ 6. Check liquidity (≥1 contract)│
 └─────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────┐
-│ 7. Handle fill mismatch         │ ← Auto-close if needed
+│ 7. Circuit breaker capacity     │ ← May cap contract count
 └─────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────┐
-│ 8. Record fills, release slot   │
+│ 8. Execute both legs (async)    │ ← Concurrent platform calls
+└─────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────┐
+│ 9. Handle fill mismatch         │ ← Auto-close + blacklist tracking
+└─────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────┐
+│10. Record fills, release slot   │
 └─────────────────────────────────┘
 ```
 
@@ -191,16 +201,64 @@ self.position_channel.record_fill(FillRecord::new(
 ));
 ```
 
+## Circuit Breaker Integration
+
+The circuit breaker (`circuit_breaker.rs`) provides multiple layers of protection:
+
+### Global Protections
+
+| Check | Trigger | Effect |
+|-------|---------|--------|
+| Consecutive errors | N errors without success (default: 5) | Global halt for cooldown period |
+| Daily loss limit | Cumulative P&L exceeds threshold | Blocks all execution |
+| Per-market position limit | Position size exceeds limit | Blocks that market |
+| Total position limit | Aggregate position exceeds limit | Blocks all execution |
+
+### Per-Market Blacklisting
+
+When a market has repeated fill mismatches (e.g., Kalshi fills but Poly consistently fails), the market gets temporarily blacklisted to prevent a loss loop:
+
+```
+Arb detected → Kalshi fills → Poly fails → auto-close at loss
+    ↑                                              │
+    └──── arb re-appears (prices unchanged) ───────┘
+```
+
+**Without blacklisting**, this loop repeats indefinitely, accumulating losses.
+
+**With blacklisting**, after N consecutive mismatches on the same market:
+1. Market is blacklisted for a configurable duration
+2. Further arbs on that market are skipped with `[EXEC] BLACKLISTED` log
+3. Blacklist auto-expires and logs when re-enabling
+4. Successful matched fills reset the mismatch counter
+
+| Config | Default | Description |
+|--------|---------|-------------|
+| `CB_MARKET_BLACKLIST_THRESHOLD` | 3 | Consecutive mismatches before blacklisting |
+| `CB_MARKET_BLACKLIST_SECS` | 300 | Blacklist duration (seconds) |
+
+### Auto-Close P&L Feedback
+
+Auto-close losses are fed back to the circuit breaker's daily P&L tracker via `record_pnl()`. This means repeated auto-close losses will eventually trigger the daily loss limit, halting all trading.
+
+### Mismatch → Error Escalation
+
+Each fill mismatch counts as a consecutive error. This means:
+- 3 mismatches across ANY markets (with default `CB_MAX_CONSECUTIVE_ERRORS=5`) contributes toward a global halt
+- A successful matched fill resets the consecutive error counter
+
 ## Error Handling
 
 | Error | Handling |
 |-------|----------|
 | Already in-flight | Immediate reject, no release (already held) |
+| Market blacklisted | Immediate release, skip execution |
+| Cooldown active | Immediate release, wait for expiry |
 | Profit < 1¢ | Immediate release |
 | Insufficient liquidity | Delayed release (10s) |
 | Circuit breaker | Immediate release |
 | Execution failure | Record error, immediate release |
-| Fill mismatch | Background auto-close task |
+| Fill mismatch | Background auto-close + record mismatch |
 
 ## Debugging
 
@@ -218,5 +276,8 @@ let is_in_flight = (state >> bit) & 1 == 1;
 - `[EXEC] 🏃` - Dry run
 - `[EXEC] ✅` - Success
 - `[EXEC] ⚠️` - Warning (mismatch, capped)
+- `[EXEC] 🚫` - Blacklisted market skipped
 - `[EXEC] ❌` - Error
 - `[EXEC] 🔄` - Auto-close in progress
+- `[CB] 🚫` - Market blacklisted (circuit breaker)
+- `[CB] ⚠️` - Mismatch recorded (pre-blacklist warning)
