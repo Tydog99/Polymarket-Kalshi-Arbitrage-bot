@@ -4,7 +4,9 @@
 //! position reconciliation, and automatic exposure management.
 
 use anyhow::{Result, anyhow};
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -100,6 +102,7 @@ pub struct ExecutionEngine {
     circuit_breaker: Arc<CircuitBreaker>,
     position_channel: PositionChannel,
     in_flight: Arc<[AtomicU64; 8]>,
+    in_flight_events: Arc<Mutex<HashSet<Arc<str>>>>,
     clock: Arc<NanoClock>,
     pub dry_run: bool,
     test_mode: bool,
@@ -126,6 +129,7 @@ impl ExecutionEngine {
             circuit_breaker,
             position_channel,
             in_flight: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            in_flight_events: Arc::new(Mutex::new(HashSet::new())),
             clock,
             dry_run,
             test_mode,
@@ -161,6 +165,27 @@ impl ExecutionEngine {
         let pair = market.pair()
             .ok_or_else(|| anyhow!("No pair for market_id {}", market_id))?;
 
+        // Event-level dedup: only one outcome per Kalshi event can be in-flight
+        let event_ticker = pair.kalshi_event_ticker.clone();
+        {
+            let mut events = self.in_flight_events.lock().unwrap();
+            if !events.insert(event_ticker.clone()) {
+                // Already in-flight for this event — release market bitmask and bail
+                warn!(
+                    "[EXEC] 🚫 Event dedup: {} already in-flight (event={}), skipping market_id={}",
+                    pair.description, event_ticker, market_id
+                );
+                self.release_in_flight(market_id);
+                return Ok(ExecutionResult {
+                    market_id,
+                    success: false,
+                    profit_cents: 0,
+                    latency_ns: self.clock.now_ns() - req.detected_ns,
+                    error: Some("Already in-flight (event)"),
+                });
+            }
+        }
+
         // Generate unique position_id for this arb execution
         // This ensures each arb is tracked separately even on the same market pair
         let arb_seq = ARB_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -183,6 +208,7 @@ impl ExecutionEngine {
                 profit_cents, req.yes_size, req.no_size, est_max_contracts, pair.league
             );
             self.release_in_flight(market_id);
+            self.release_event(&event_ticker);
             return Ok(ExecutionResult {
                 market_id,
                 success: false,
@@ -195,6 +221,7 @@ impl ExecutionEngine {
         // Check profit threshold
         if profit_cents < 1 {
             self.release_in_flight(market_id);
+            self.release_event(&event_ticker);
             return Ok(ExecutionResult {
                 market_id,
                 success: false,
@@ -227,6 +254,7 @@ impl ExecutionEngine {
             );
             // Use delayed release to avoid spam from low-liquidity markets
             self.release_in_flight_delayed(market_id);
+            self.release_event_delayed(event_ticker);
             return Ok(ExecutionResult {
                 market_id,
                 success: false,
@@ -247,6 +275,7 @@ impl ExecutionEngine {
                 pair.description, pair.pair_id, capacity.effective, min_contracts
             );
             self.release_in_flight(market_id);
+            self.release_event(&event_ticker);
             return Ok(ExecutionResult {
                 market_id,
                 success: false,
@@ -285,6 +314,7 @@ impl ExecutionEngine {
                 pair.description, req.arb_type, max_contracts, poly_order_value
             );
             self.release_in_flight_delayed(market_id);
+            self.release_event_delayed(event_ticker);
             return Ok(ExecutionResult {
                 market_id,
                 success: false,
@@ -301,6 +331,7 @@ impl ExecutionEngine {
                 reason, pair.description, max_contracts
             );
             self.release_in_flight(market_id);
+            self.release_event(&event_ticker);
             return Ok(ExecutionResult {
                 market_id,
                 success: false,
@@ -347,6 +378,7 @@ impl ExecutionEngine {
         if self.dry_run {
             info!("[EXEC] 🏃 DRY RUN - would execute {} contracts", max_contracts);
             self.release_in_flight_delayed(market_id);
+            self.release_event_delayed(event_ticker);
             return Ok(ExecutionResult {
                 market_id,
                 success: true,
@@ -361,6 +393,7 @@ impl ExecutionEngine {
 
         // Release in-flight after delay
         self.release_in_flight_delayed(market_id);
+        self.release_event_delayed(event_ticker);
 
         match result {
             // Note: For same-platform arbs (PolyOnly/KalshiOnly), these are YES/NO fills, not platform fills
@@ -1254,6 +1287,20 @@ impl ExecutionEngine {
                 in_flight[slot].fetch_and(mask, Ordering::Release);
             });
         }
+    }
+
+    fn release_event(&self, event_ticker: &Arc<str>) {
+        let mut events = self.in_flight_events.lock().unwrap();
+        events.remove(event_ticker);
+    }
+
+    fn release_event_delayed(&self, event_ticker: Arc<str>) {
+        let in_flight_events = self.in_flight_events.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let mut events = in_flight_events.lock().unwrap();
+            events.remove(&event_ticker);
+        });
     }
 }
 

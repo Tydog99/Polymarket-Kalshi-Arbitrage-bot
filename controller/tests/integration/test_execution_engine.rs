@@ -1055,3 +1055,145 @@ async fn test_auto_close_results_in_net_zero_position() {
         "Failed Poly attempt should have 0 contracts"
     );
 }
+
+// =============================================================================
+// EVENT-LEVEL DEDUP TESTS
+// =============================================================================
+
+/// Test: Two outcomes of the same Kalshi event cannot execute concurrently.
+///
+/// Scenario:
+/// - Two market pairs share the same kalshi_event_ticker (e.g., CHI-1 and BOS-2)
+/// - Both fire through engine.process() concurrently
+///
+/// Expected:
+/// - One succeeds (or at least gets past dedup)
+/// - The other returns "Already in-flight (event)"
+#[tokio::test]
+async fn test_event_level_dedup_blocks_second_outcome() {
+    let kalshi_server = MockServer::start().await;
+
+    // Mount Kalshi with a slow response to ensure both requests overlap
+    // Use full fill fixture but with a delay
+    let exchange = load_fixture(fixture_path("kalshi_full_fill_real.json"))
+        .expect("Failed to load fixture");
+
+    let mut response = ResponseTemplate::new(exchange.response.status)
+        .set_body_raw(exchange.response.body_raw.clone(), "application/json");
+
+    for (key, value) in &exchange.response.headers {
+        if key.to_lowercase() != "content-length" && key.to_lowercase() != "transfer-encoding" {
+            response = response.append_header(key.as_str(), value.as_str());
+        }
+    }
+
+    // Add delay so first request is still in-flight when second arrives
+    let response = response.set_delay(std::time::Duration::from_millis(200));
+
+    Mock::given(method("POST"))
+        .and(path_regex(".*portfolio/orders.*"))
+        .respond_with(response)
+        .mount(&kalshi_server)
+        .await;
+
+    // Create two market pairs with SAME event ticker but different market tickers
+    let pair1 = MarketPair {
+        pair_id: "KXNBA-26-CHI".into(),
+        league: "nba".into(),
+        market_type: MarketType::Moneyline,
+        description: "NBA CHI outcome".into(),
+        kalshi_event_ticker: "KXNBAGAME-26FEB11CHIBOS".into(), // Same event
+        kalshi_market_ticker: "KXNBA-26-CHI".into(),
+        kalshi_event_slug: "nba-chi-bos".into(),
+        poly_slug: "nba-chi-bos-2026-02-11".into(),
+        poly_yes_token: "poly-yes-chi-111".into(),
+        poly_no_token: "poly-no-chi-222".into(),
+        line_value: None,
+        team_suffix: Some("CHI".into()),
+        neg_risk: false,
+    };
+
+    let pair2 = MarketPair {
+        pair_id: "KXNBA-26-BOS".into(),
+        league: "nba".into(),
+        market_type: MarketType::Moneyline,
+        description: "NBA BOS outcome".into(),
+        kalshi_event_ticker: "KXNBAGAME-26FEB11CHIBOS".into(), // Same event!
+        kalshi_market_ticker: "KXNBA-26-BOS".into(),
+        kalshi_event_slug: "nba-chi-bos".into(),
+        poly_slug: "nba-chi-bos-2026-02-11-bos".into(),
+        poly_yes_token: "poly-yes-bos-333".into(),
+        poly_no_token: "poly-no-bos-444".into(),
+        line_value: None,
+        team_suffix: Some("BOS".into()),
+        neg_risk: false,
+    };
+
+    // Build engine with both pairs
+    let mock_poly = Arc::new(MockPolyClient::new());
+    mock_poly.set_full_fill("poly-yes-chi-111", 1.0, 0.53);
+    mock_poly.set_full_fill("poly-yes-bos-333", 1.0, 0.53);
+
+    let kalshi = Arc::new(create_test_kalshi_client(&kalshi_server));
+    let state = Arc::new(GlobalState::default());
+    let circuit_breaker = Arc::new(create_disabled_circuit_breaker());
+    let (position_channel, _fill_rx) = create_position_channel();
+    let clock = Arc::new(NanoClock::new());
+
+    let id1 = state.add_pair(pair1).expect("add_pair failed");
+    let id2 = state.add_pair(pair2).expect("add_pair failed");
+
+    let engine = Arc::new(ExecutionEngine::new(
+        kalshi,
+        mock_poly as Arc<dyn PolyExecutor>,
+        state,
+        circuit_breaker,
+        position_channel,
+        false,
+        clock,
+    ));
+
+    // Create requests for both outcomes
+    let req1 = ArbOpportunity {
+        market_id: id1,
+        yes_price: 9,
+        no_price: 85,
+        yes_size: 10000,
+        no_size: 10000,
+        arb_type: ArbType::PolyYesKalshiNo,
+        detected_ns: 0,
+        is_test: false,
+    };
+
+    let req2 = ArbOpportunity {
+        market_id: id2,
+        yes_price: 9,
+        no_price: 85,
+        yes_size: 10000,
+        no_size: 10000,
+        arb_type: ArbType::PolyYesKalshiNo,
+        detected_ns: 0,
+        is_test: false,
+    };
+
+    // Fire both concurrently
+    let engine1 = engine.clone();
+    let engine2 = engine.clone();
+    let (r1, r2) = tokio::join!(
+        async move { engine1.process(req1).await },
+        async move { engine2.process(req2).await },
+    );
+
+    let result1 = r1.expect("process should not error");
+    let result2 = r2.expect("process should not error");
+
+    // One should succeed (or at least proceed), the other should be blocked by event dedup
+    let errors: Vec<Option<&str>> = vec![result1.error, result2.error];
+    let event_blocked_count = errors.iter().filter(|e| **e == Some("Already in-flight (event)")).count();
+
+    assert_eq!(
+        event_blocked_count, 1,
+        "Exactly one outcome should be blocked by event-level dedup. Errors: {:?}",
+        errors
+    );
+}
