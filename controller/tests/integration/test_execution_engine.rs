@@ -35,12 +35,15 @@ use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use arb_bot::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use arb_bot::execution::{ExecutionEngine, NanoClock};
+use arb_bot::confirm_tui::{TUI_ACTIVE, TuiAwareWriter, init_tui_log_channel};
+use arb_bot::execution::{ExecutionEngine, NanoClock, run_execution_loop};
 use arb_bot::kalshi::{KalshiApiClient, KalshiConfig};
 use arb_bot::poly_executor::mock::MockPolyClient;
 use arb_bot::poly_executor::PolyExecutor;
 use arb_bot::position_tracker::{create_position_channel, FillRecord, PositionMessage};
 use arb_bot::types::{ArbType, ArbOpportunity, GlobalState, MarketPair, MarketType};
+
+use std::sync::atomic::Ordering;
 
 use super::replay_harness::load_fixture;
 
@@ -1195,5 +1198,104 @@ async fn test_event_level_dedup_blocks_second_outcome() {
         event_blocked_count, 1,
         "Exactly one outcome should be blocked by event-level dedup. Errors: {:?}",
         errors
+    );
+}
+
+// =============================================================================
+// TUI LOG ROUTING TESTS
+// =============================================================================
+
+/// Test: Execution logs arrive on TUI log channel when TUI is active.
+///
+/// This verifies that TuiAwareWriter routes execution logs to the global
+/// TUI_LOG_TX channel (not stdout) when TUI_ACTIVE is true. The dual
+/// log routing (manual log_tx + tui_state) has been removed — all logging
+/// now goes through tracing macros and TuiAwareWriter handles routing.
+#[tokio::test]
+async fn test_execution_logs_arrive_on_log_tx_when_tui_active() {
+    let kalshi_server = MockServer::start().await;
+
+    // Mount Kalshi full fill
+    let exchange = load_fixture(fixture_path("kalshi_full_fill_real.json"))
+        .expect("Failed to load fixture");
+
+    let mut response = ResponseTemplate::new(exchange.response.status)
+        .set_body_raw(exchange.response.body_raw.clone(), "application/json");
+
+    for (key, value) in &exchange.response.headers {
+        if key.to_lowercase() != "content-length" && key.to_lowercase() != "transfer-encoding" {
+            response = response.append_header(key.as_str(), value.as_str());
+        }
+    }
+
+    Mock::given(method("POST"))
+        .and(path_regex(".*portfolio/orders.*"))
+        .respond_with(response)
+        .mount(&kalshi_server)
+        .await;
+
+    // Set up mock poly
+    let mock_poly = Arc::new(MockPolyClient::new());
+    mock_poly.set_full_fill("poly-yes-token-12345", 1.0, 0.53);
+
+    // Build engine
+    let kalshi = Arc::new(create_test_kalshi_client(&kalshi_server));
+    let state = Arc::new(GlobalState::default());
+    let circuit_breaker = Arc::new(create_disabled_circuit_breaker());
+    let (position_channel, _fill_rx) = create_position_channel();
+    let clock = Arc::new(NanoClock::new());
+
+    let pair = create_test_market_pair();
+    state.add_pair(pair);
+
+    let engine = Arc::new(ExecutionEngine::new(
+        kalshi,
+        mock_poly as Arc<dyn PolyExecutor>,
+        state,
+        circuit_breaker,
+        position_channel,
+        false,
+        clock,
+    ));
+
+    // Set up global TUI log channel and tracing subscriber with TuiAwareWriter
+    let (log_tx, mut log_rx) = mpsc::channel::<String>(1024);
+    init_tui_log_channel(log_tx);
+    TUI_ACTIVE.store(true, Ordering::Relaxed);
+
+    // Install a global tracing subscriber with TuiAwareWriter so spawned tasks route logs
+    // (set_global_default fails silently if already set by another test — that's fine)
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(TuiAwareWriter)
+        .with_ansi(false)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
+
+    let (exec_tx, exec_rx) = mpsc::channel::<ArbOpportunity>(16);
+
+    // Start execution loop (no more tui_state/log_tx params)
+    tokio::spawn(run_execution_loop(exec_rx, engine));
+
+    // Send arb to execution (simulating confirm → forward)
+    let req = create_test_request(ArbType::PolyYesKalshiNo);
+    exec_tx.send(req).await.expect("send failed");
+
+    // Wait for execution to complete (TUI_ACTIVE stays true throughout)
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Now mark TUI inactive
+    TUI_ACTIVE.store(false, Ordering::Relaxed);
+
+    // Drain log_rx — we expect at least one [EXEC] log
+    let mut logs = Vec::new();
+    while let Ok(line) = log_rx.try_recv() {
+        logs.push(line);
+    }
+
+    let has_exec_log = logs.iter().any(|l| l.contains("[EXEC]"));
+    assert!(
+        has_exec_log,
+        "Execution logs should arrive on log_rx when TUI_ACTIVE is true. Got logs: {:?}",
+        logs
     );
 }

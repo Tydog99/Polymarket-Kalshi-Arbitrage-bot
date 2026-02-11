@@ -244,12 +244,25 @@ pub async fn run_tui(
         }
     }
 
-    // Cleanup terminal
-    state.write().await.active = false;
-    TUI_ACTIVE.store(false, Ordering::Relaxed);
+    // Cleanup terminal (TUI_ACTIVE stays true so execution logs still route here)
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+
+    // Brief pause to let in-flight execution logs arrive on the channel
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Drain any remaining logs that arrived after the TUI loop exited
+    {
+        let mut tui_state = state.write().await;
+        while let Ok(line) = log_rx.try_recv() {
+            tui_state.add_log(line);
+        }
+    }
+
+    // NOW mark TUI inactive — all pending logs have been captured
+    state.write().await.active = false;
+    TUI_ACTIVE.store(false, Ordering::Relaxed);
 
     // Dump captured logs to main terminal and clear buffer
     {
