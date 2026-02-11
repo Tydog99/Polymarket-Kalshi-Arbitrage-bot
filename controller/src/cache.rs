@@ -204,6 +204,10 @@ pub fn team_search_terms(league: &str, team_code: &str) -> Option<&'static [&'st
         ("laliga", "vil") => Some(&["villarreal"]),
         ("laliga", "rso") => Some(&["real sociedad", "sociedad"]),
         ("laliga", "bet") | ("laliga", "rbb") => Some(&["real betis", "betis"]),
+        ("laliga", "rcc") => Some(&["celta", "rc celta"]),
+        ("laliga", "rvc") => Some(&["rayo vallecano", "rayo"]),
+        ("laliga", "mlr") => Some(&["mallorca"]),
+        ("laliga", "rve") => Some(&["valladolid"]),
 
         // Bundesliga
         ("bundesliga", "bmu") | ("bundesliga", "bay") => Some(&["bayern", "munich", "münchen"]),
@@ -689,6 +693,20 @@ mod tests {
 
         assert_eq!(terms1, terms2);
         assert_eq!(terms2, terms3);
+    }
+
+    #[test]
+    fn test_team_search_terms_laliga_ambiguous_teams() {
+        // These teams caused AMBIGUOUS TOKEN ASSIGNMENT warnings
+        let rcc = team_search_terms("laliga", "rcc");
+        assert!(rcc.is_some(), "rcc (RC Celta) should have search terms");
+        assert!(rcc.unwrap().iter().any(|t| "rc celta de vigo".contains(t)));
+        assert!(!rcc.unwrap().iter().any(|t| "rcd espanyol de barcelona".contains(t)));
+
+        let rvc = team_search_terms("laliga", "rvc");
+        assert!(rvc.is_some(), "rvc (Rayo Vallecano) should have search terms");
+        assert!(rvc.unwrap().iter().any(|t| "rayo vallecano de madrid".contains(t)));
+        assert!(!rvc.unwrap().iter().any(|t| "real oviedo".contains(t)));
     }
 
     #[test]
