@@ -39,11 +39,11 @@ Last updated: 2026-01-20
   - [ ] Surface this information to operator (logs, alerts, TUI)
   - [ ] Optionally take action (close remaining leg, flag for manual review)
 
-- [ ] **Audit circuit breaker behavior for repeated Poly failures**
-  - [ ] Understand current flow: arb detected → Kalshi fills → Poly fails → Kalshi unwinds at loss → arb re-appears → repeat
-  - [ ] Determine if market-specific blacklisting exists (or should exist)
-  - [ ] Review cooldown logic: does consecutive error tracking prevent this loop?
-  - [ ] Document circuit_breaker.rs behavior for this scenario
+- [x] **Audit circuit breaker behavior for repeated Poly failures** (PR #50)
+  - [x] Understand current flow: arb detected → Kalshi fills → Poly fails → Kalshi unwinds at loss → arb re-appears → repeat
+  - [x] Determine if market-specific blacklisting exists (or should exist)
+  - [x] Review cooldown logic: does consecutive error tracking prevent this loop?
+  - [x] Document circuit_breaker.rs behavior for this scenario
 
 - [ ] **Document Polymarket order placement flow (3 API calls)**
   - [ ] Explain pre-signing API calls and why they're needed
