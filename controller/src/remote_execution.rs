@@ -2,7 +2,6 @@
 //! with optional local execution for authorized platforms.
 
 use anyhow::{anyhow, Result};
-use chrono::Local;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -32,8 +31,6 @@ pub struct HybridExecutor {
     in_flight: Arc<[AtomicU64; 8]>,
     leg_seq: AtomicU64,
     pub dry_run: bool,
-    /// Optional TUI log channel - when set, logs go here instead of tracing
-    log_tx: Option<mpsc::Sender<String>>,
 }
 
 /// Convert WsPlatform to TradingPlatform.
@@ -53,7 +50,6 @@ impl HybridExecutor {
         kalshi_api: Option<Arc<KalshiApiClient>>,
         poly_async: Option<Arc<SharedAsyncClient>>,
         dry_run: bool,
-        log_tx: Option<mpsc::Sender<String>>,
     ) -> Self {
         Self {
             state,
@@ -67,43 +63,6 @@ impl HybridExecutor {
             in_flight: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             leg_seq: AtomicU64::new(1),
             dry_run,
-            log_tx,
-        }
-    }
-
-    /// Log a message - sends to TUI channel if available, otherwise uses tracing.
-    /// Falls back to tracing if TUI channel is full or closed.
-    fn log_info(&self, msg: String) {
-        let formatted = format!("[{}]  INFO {}", Local::now().format("%H:%M:%S"), msg);
-        if let Some(tx) = &self.log_tx {
-            if tx.try_send(formatted).is_err() {
-                // Channel full or closed, fallback to tracing
-                info!("{}", msg);
-            }
-        } else {
-            info!("{}", msg);
-        }
-    }
-
-    fn log_warn(&self, msg: String) {
-        let formatted = format!("[{}]  WARN {}", Local::now().format("%H:%M:%S"), msg);
-        if let Some(tx) = &self.log_tx {
-            if tx.try_send(formatted).is_err() {
-                warn!("{}", msg);
-            }
-        } else {
-            warn!("{}", msg);
-        }
-    }
-
-    fn log_error(&self, msg: String) {
-        let formatted = format!("[{}] ERROR {}", Local::now().format("%H:%M:%S"), msg);
-        if let Some(tx) = &self.log_tx {
-            if tx.try_send(formatted).is_err() {
-                error!("{}", msg);
-            }
-        } else {
-            error!("{}", msg);
         }
     }
 
@@ -160,21 +119,21 @@ impl HybridExecutor {
 
         // Skip trade if insufficient capacity
         if capacity.effective < min_contracts {
-            self.log_warn(format!(
+            warn!(
                 "[HYBRID] ⛔ Insufficient capacity: {} | remaining={} | min={}",
                 pair.description, capacity.effective, min_contracts
-            ));
+            );
             self.release_in_flight_delayed(market_id);
             return Ok(());
         }
 
         // Cap contracts to remaining capacity if needed
         if max_contracts > capacity.effective {
-            self.log_info(format!(
+            info!(
                 "[HYBRID] 📉 Capped: {} -> {} contracts | market={} | per_market={} total={}",
                 max_contracts, capacity.effective, pair.description,
                 capacity.per_market, capacity.total
-            ));
+            );
             max_contracts = capacity.effective;
         }
 
@@ -197,18 +156,18 @@ impl HybridExecutor {
             pair.team_suffix.as_deref(),
         );
 
-        self.log_info(format!(
+        info!(
             "[HYBRID] arb detected: {} | {} | {:?} y={}c n={}c | profit={}c | {}x",
             pair.description, trade_description, req.arb_type, req.yes_price, req.no_price, profit_cents, max_contracts
-        ));
+        );
 
         // Check if league is disabled (monitor only, no execution)
         if crate::config::is_league_disabled(&pair.league) {
-            self.log_info(format!(
+            info!(
                 "[HYBRID] 🚫 DISABLED LEAGUE: {} | {:?} y={}¢ n={}¢ | est_profit={}¢ | league={}",
                 pair.description, req.arb_type, req.yes_price, req.no_price,
                 profit_cents, pair.league
-            ));
+            );
             self.release_in_flight_delayed(market_id);
             return Ok(());
         }
@@ -223,13 +182,13 @@ impl HybridExecutor {
         let poly_url = build_polymarket_url(&pair.league, &pair.poly_slug);
         let kalshi_url = format!("{}/{}/{}/{}", KALSHI_WEB_BASE, kalshi_series, pair.kalshi_event_slug, kalshi_event_ticker_lower);
         // OSC 8 hyperlinks for clickable links
-        self.log_info(format!(
+        info!(
             "[REMOTE_EXEC] 🔗 Kalshi: {} | Polymarket: {}",
             kalshi_url, poly_url
-        ));
+        );
 
         if self.dry_run {
-            self.log_info("[HYBRID] DRY RUN - executing legs (no real orders)".to_string());
+            info!("[HYBRID] DRY RUN - executing legs (no real orders)");
         }
 
         // Build legs for this arb
@@ -246,10 +205,10 @@ impl HybridExecutor {
             let has_local = self.local_platforms.contains(&trading_platform);
 
             if !has_remote && !has_local {
-                self.log_warn(format!(
+                warn!(
                     "[HYBRID] Cannot execute {:?} leg - no remote trader and not authorized locally; dropping arb market_id={}",
                     trading_platform, market_id
-                ));
+                );
                 self.release_in_flight_delayed(market_id);
                 return Ok(());
             }
@@ -259,13 +218,13 @@ impl HybridExecutor {
         for (ws_platform, msg) in legs {
             if self.router.is_connected(ws_platform).await {
                 if !self.router.try_send(ws_platform, msg).await {
-                    self.log_warn(format!(
+                    warn!(
                         "[HYBRID] Failed to send leg to remote {:?}; market_id={}",
                         ws_platform, market_id
-                    ));
+                    );
                 }
             } else if let Err(e) = self.execute_local_leg(ws_platform, msg).await {
-                self.log_warn(format!("[HYBRID] Local execution failed: {}", e));
+                warn!("[HYBRID] Local execution failed: {}", e);
             }
         }
 
@@ -316,17 +275,17 @@ impl HybridExecutor {
         let result = execute_leg(&req, &self.local_clients, self.dry_run).await;
 
         if result.success {
-            self.log_info(format!(
+            info!(
                 "[LOCAL] ✅ {:?} {:?} {:?} {}x @ {}¢ leg_id={} latency={}µs",
                 trading_platform, action, side, contracts, price, leg_id, result.latency_ns / 1000
-            ));
+            );
             Ok(())
         } else {
-            self.log_warn(format!(
+            warn!(
                 "[LOCAL] ❌ {:?} {:?} {:?} {}x @ {}¢ leg_id={} err={}",
                 trading_platform, action, side, contracts, price, leg_id,
                 result.error.as_deref().unwrap_or("unknown")
-            ));
+            );
             Err(anyhow!(result.error.unwrap_or_else(|| "unknown".into())))
         }
     }
@@ -498,16 +457,16 @@ pub async fn run_hybrid_execution_loop(
     mut rx: mpsc::Receiver<ArbOpportunity>,
     executor: Arc<HybridExecutor>,
 ) {
-    executor.log_info(format!(
+    info!(
         "[HYBRID] Hybrid execution loop started (dry_run={})",
         executor.dry_run
-    ));
+    );
 
     while let Some(req) = rx.recv().await {
         let exec = executor.clone();
         tokio::spawn(async move {
             if let Err(e) = exec.process(req).await {
-                exec.log_error(format!("[HYBRID] error: {}", e));
+                error!("[HYBRID] error: {}", e);
             }
         });
     }
@@ -570,7 +529,7 @@ mod tests {
         let mut kalshi_rx = router.test_register(WsPlatform::Kalshi).await;
         // No polymarket trader connected and no local authorization
 
-        let exec = HybridExecutor::new(state, cb, router, HashSet::new(), None, None, true, None);
+        let exec = HybridExecutor::new(state, cb, router, HashSet::new(), None, None, true);
         let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
@@ -598,7 +557,7 @@ mod tests {
         let mut kalshi_rx = router.test_register(WsPlatform::Kalshi).await;
         let mut poly_rx = router.test_register(WsPlatform::Polymarket).await;
 
-        let exec = HybridExecutor::new(state, cb, router, HashSet::new(), None, None, true, None);
+        let exec = HybridExecutor::new(state, cb, router, HashSet::new(), None, None, true);
         let req = ArbOpportunity {
             market_id: 0,
             yes_price: 40,
@@ -644,7 +603,7 @@ mod tests {
 
         let mut poly_rx = router.test_register(WsPlatform::Polymarket).await;
 
-        let exec = HybridExecutor::new(state, cb, router, HashSet::new(), None, None, true, None);
+        let exec = HybridExecutor::new(state, cb, router, HashSet::new(), None, None, true);
         let req = ArbOpportunity {
             market_id: 0,
             yes_price: 48,

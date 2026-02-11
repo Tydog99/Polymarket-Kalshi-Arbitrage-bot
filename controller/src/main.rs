@@ -1048,7 +1048,6 @@ async fn main() -> Result<()> {
             trading_kalshi,
             trading_poly,
             dry_run,
-            Some(tui_log_tx.clone()),
         ));
         tokio::spawn(run_hybrid_execution_loop(exec_rx, hybrid_exec))
     } else {
@@ -1061,9 +1060,7 @@ async fn main() -> Result<()> {
             dry_run,
             clock.clone(),
         ));
-        let exec_tui_state = tui_state.clone();
-        let exec_log_tx = tui_log_tx.clone();
-        tokio::spawn(run_execution_loop(exec_rx, engine, Some(exec_tui_state), Some(exec_log_tx)))
+        tokio::spawn(run_execution_loop(exec_rx, engine))
     };
 
     // Confirmation handler task: receives arbs needing confirmation, manages queue and TUI
