@@ -1171,7 +1171,14 @@ async fn main() -> Result<()> {
                                     // Validate arb is still profitable
                                     match confirm_queue_clone.validate_arb_detailed(&arb) {
                                         Some(result) if result.is_valid => {
-                                            match confirm_exec_tx.try_send(arb.request.clone()) {
+                                            // Update request with current prices so execution
+                                            // uses fresh orderbook data, not stale detection prices
+                                            let mut updated_req = arb.request;
+                                            updated_req.yes_price = result.current_yes_price;
+                                            updated_req.no_price = result.current_no_price;
+                                            updated_req.yes_size = result.current_yes_size;
+                                            updated_req.no_size = result.current_no_size;
+                                            match confirm_exec_tx.try_send(updated_req) {
                                                 Ok(()) => {
                                                     log_msg(format!("[{}]  INFO [CONFIRM] ✅ Approved: {} - forwarded to execution",
                                                         chrono::Local::now().format("%H:%M:%S"), arb.pair.description));
