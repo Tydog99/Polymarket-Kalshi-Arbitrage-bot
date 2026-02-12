@@ -4,11 +4,11 @@
 //! orderbook representation, and arbitrage opportunity detection.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use rustc_hash::FxHashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::arb::{ArbConfig, kalshi_fee};
 
@@ -161,12 +161,109 @@ impl Default for AtomicOrderbook {
     }
 }
 
+/// Full Kalshi orderbook for correct delta processing.
+///
+/// Stores all bid levels per side as BTreeMap (price -> quantity).
+/// Only the Kalshi WebSocket thread writes; arb detection reads
+/// from `AtomicOrderbook` instead (lock-free). This struct is the
+/// source of truth that feeds the atomic cache after each update.
+pub struct KalshiBook {
+    pub yes_bids: Mutex<BTreeMap<i64, i64>>,
+    pub no_bids: Mutex<BTreeMap<i64, i64>>,
+}
+
+impl KalshiBook {
+    pub fn new() -> Self {
+        Self {
+            yes_bids: Mutex::new(BTreeMap::new()),
+            no_bids: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Clear and populate YES bids from a snapshot array of [price, qty] pairs.
+    /// Entries with qty <= 0 are skipped.
+    pub fn set_yes_bids(&mut self, levels: &[Vec<i64>]) {
+        let mut bids = self.yes_bids.lock();
+        bids.clear();
+        for l in levels {
+            if l.len() >= 2 && l[1] > 0 {
+                bids.insert(l[0], l[1]);
+            }
+        }
+    }
+
+    /// Clear and populate NO bids from a snapshot array of [price, qty] pairs.
+    pub fn set_no_bids(&mut self, levels: &[Vec<i64>]) {
+        let mut bids = self.no_bids.lock();
+        bids.clear();
+        for l in levels {
+            if l.len() >= 2 && l[1] > 0 {
+                bids.insert(l[0], l[1]);
+            }
+        }
+    }
+
+    /// Apply a delta to the book. `side` is "yes" or "no".
+    /// Positive delta adds contracts, negative removes.
+    /// Levels with qty <= 0 after the delta are removed.
+    pub fn apply_delta(&mut self, side: &str, price: i64, delta: i64) {
+        let mut bids = match side {
+            "yes" => self.yes_bids.lock(),
+            "no" => self.no_bids.lock(),
+            _ => return,
+        };
+        let entry = bids.entry(price).or_insert(0);
+        *entry += delta;
+        if *entry <= 0 {
+            bids.remove(&price);
+        }
+    }
+
+    /// Returns the best (highest-price) YES bid as (price, qty), or None.
+    pub fn best_yes_bid(&self) -> Option<(i64, i64)> {
+        self.yes_bids.lock().iter().next_back().map(|(&p, &q)| (p, q))
+    }
+
+    /// Returns the best (highest-price) NO bid as (price, qty), or None.
+    pub fn best_no_bid(&self) -> Option<(i64, i64)> {
+        self.no_bids.lock().iter().next_back().map(|(&p, &q)| (p, q))
+    }
+
+    /// Derive NO ask price and size from the best YES bid.
+    /// Returns (0, 0) if the YES side is empty.
+    pub fn derive_no_side(&self) -> (PriceCents, SizeCents) {
+        match self.best_yes_bid() {
+            Some((price, qty)) => {
+                let ask = (100 - price) as PriceCents;
+                let size = (qty * price / 100) as SizeCents;
+                (ask, size)
+            }
+            None => (0, 0),
+        }
+    }
+
+    /// Derive YES ask price and size from the best NO bid.
+    /// Returns (0, 0) if the NO side is empty.
+    pub fn derive_yes_side(&self) -> (PriceCents, SizeCents) {
+        match self.best_no_bid() {
+            Some((price, qty)) => {
+                let ask = (100 - price) as PriceCents;
+                let size = (qty * price / 100) as SizeCents;
+                (ask, size)
+            }
+            None => (0, 0),
+        }
+    }
+}
+
 /// Complete market state tracking both platforms' orderbooks for a single market
 pub struct AtomicMarketState {
     /// Kalshi platform orderbook state
     pub kalshi: AtomicOrderbook,
     /// Polymarket platform orderbook state
     pub poly: AtomicOrderbook,
+    /// Shadow orderbook for Kalshi delta processing (source of truth for bids)
+    pub kalshi_book: Mutex<KalshiBook>,
     /// Last known Kalshi update time (unix ms). 0 = unknown / never updated.
     kalshi_last_update_unix_ms: AtomicU64,
     /// Last known Polymarket update time (unix ms). 0 = unknown / never updated.
@@ -186,6 +283,7 @@ impl AtomicMarketState {
         Self {
             kalshi: AtomicOrderbook::new(),
             poly: AtomicOrderbook::new(),
+            kalshi_book: Mutex::new(KalshiBook::new()),
             kalshi_last_update_unix_ms: AtomicU64::new(0),
             poly_last_update_unix_ms: AtomicU64::new(0),
             pair: RwLock::new(None),
@@ -1852,6 +1950,167 @@ mod tests {
 
         // Order value = 2 × 34 = 68¢ < $1.00 ✗
         assert!(result2.is_none(), "Should reject when order value is 68¢");
+    }
+
+    // =========================================================================
+    // KalshiBook Tests
+    // =========================================================================
+
+    #[test]
+    fn test_kalshi_book_new_is_empty() {
+        let book = KalshiBook::new();
+        assert!(book.yes_bids.lock().is_empty());
+        assert!(book.no_bids.lock().is_empty());
+        assert_eq!(book.best_yes_bid(), None);
+        assert_eq!(book.best_no_bid(), None);
+    }
+
+    #[test]
+    fn test_kalshi_book_set_yes_bids() {
+        let mut book = KalshiBook::new();
+        let levels = vec![vec![36, 23], vec![34, 10], vec![30, 5]];
+        book.set_yes_bids(&levels);
+
+        let bids = book.yes_bids.lock();
+        assert_eq!(bids.len(), 3);
+        assert_eq!(bids[&36], 23);
+        assert_eq!(bids[&34], 10);
+        assert_eq!(bids[&30], 5);
+        drop(bids);
+
+        // Best bid is highest price
+        assert_eq!(book.best_yes_bid(), Some((36, 23)));
+    }
+
+    #[test]
+    fn test_kalshi_book_set_bids_skips_zero_qty() {
+        let mut book = KalshiBook::new();
+        let levels = vec![vec![36, 23], vec![34, 0], vec![30, 5]];
+        book.set_yes_bids(&levels);
+
+        let bids = book.yes_bids.lock();
+        assert_eq!(bids.len(), 2);
+        assert!(!bids.contains_key(&34));
+    }
+
+    #[test]
+    fn test_kalshi_book_set_bids_clears_previous() {
+        let mut book = KalshiBook::new();
+        book.set_yes_bids(&[vec![50, 10]]);
+        assert_eq!(book.best_yes_bid(), Some((50, 10)));
+
+        // Set new bids — old ones should be gone
+        book.set_yes_bids(&[vec![40, 5]]);
+        assert_eq!(book.best_yes_bid(), Some((40, 5)));
+        assert_eq!(book.yes_bids.lock().len(), 1);
+    }
+
+    #[test]
+    fn test_kalshi_book_apply_delta_add() {
+        let mut book = KalshiBook::new();
+        book.set_yes_bids(&[vec![36, 23]]);
+
+        // Add 10 contracts at price 34
+        book.apply_delta("yes", 34, 10);
+
+        let bids = book.yes_bids.lock();
+        assert_eq!(bids[&34], 10);
+        assert_eq!(bids[&36], 23); // unchanged
+    }
+
+    #[test]
+    fn test_kalshi_book_apply_delta_increase() {
+        let mut book = KalshiBook::new();
+        book.set_yes_bids(&[vec![36, 23]]);
+
+        // Add 5 more contracts at existing level
+        book.apply_delta("yes", 36, 5);
+        assert_eq!(book.yes_bids.lock()[&36], 28);
+    }
+
+    #[test]
+    fn test_kalshi_book_apply_delta_remove() {
+        let mut book = KalshiBook::new();
+        book.set_yes_bids(&[vec![36, 23], vec![34, 10]]);
+
+        // Remove all 23 contracts at price 36
+        book.apply_delta("yes", 36, -23);
+
+        let bids = book.yes_bids.lock();
+        assert!(!bids.contains_key(&36), "Level should be removed when qty hits 0");
+        assert_eq!(bids.len(), 1);
+        drop(bids);
+
+        // Best bid should now be 34
+        assert_eq!(book.best_yes_bid(), Some((34, 10)));
+    }
+
+    #[test]
+    fn test_kalshi_book_apply_delta_partial_reduce() {
+        let mut book = KalshiBook::new();
+        book.set_yes_bids(&[vec![36, 23]]);
+
+        book.apply_delta("yes", 36, -10);
+        assert_eq!(book.yes_bids.lock()[&36], 13);
+    }
+
+    #[test]
+    fn test_kalshi_book_apply_delta_overshoot_removes() {
+        let mut book = KalshiBook::new();
+        book.set_yes_bids(&[vec![36, 5]]);
+
+        // Remove more than exists — should clean up the level
+        book.apply_delta("yes", 36, -10);
+        assert!(book.yes_bids.lock().is_empty());
+    }
+
+    #[test]
+    fn test_kalshi_book_apply_delta_at_absent_price() {
+        let mut book = KalshiBook::new();
+        book.set_yes_bids(&[vec![36, 23]]);
+
+        // Negative delta at price not in book — no-op
+        book.apply_delta("yes", 20, -5);
+        assert_eq!(book.yes_bids.lock().len(), 1); // unchanged
+    }
+
+    #[test]
+    fn test_kalshi_book_apply_delta_no_side() {
+        let mut book = KalshiBook::new();
+        book.set_no_bids(&[vec![60, 15]]);
+
+        book.apply_delta("no", 58, 8);
+        assert_eq!(book.no_bids.lock()[&58], 8);
+        assert_eq!(book.best_no_bid(), Some((60, 15)));
+    }
+
+    #[test]
+    fn test_kalshi_book_derive_no_side() {
+        let mut book = KalshiBook::new();
+        // YES bid at 36¢ with 23 contracts → NO ask = 64¢, size = 23*36/100 = 8
+        book.set_yes_bids(&[vec![36, 23], vec![34, 10]]);
+
+        let (no_ask, no_size) = book.derive_no_side();
+        assert_eq!(no_ask, 64); // 100 - 36
+        assert_eq!(no_size, 8); // 23 * 36 / 100 = 8 (integer division)
+    }
+
+    #[test]
+    fn test_kalshi_book_derive_yes_side() {
+        let mut book = KalshiBook::new();
+        // NO bid at 60¢ with 15 contracts → YES ask = 40¢, size = 15*60/100 = 9
+        book.set_no_bids(&[vec![60, 15], vec![58, 8]]);
+
+        let (yes_ask, yes_size) = book.derive_yes_side();
+        assert_eq!(yes_ask, 40); // 100 - 60
+        assert_eq!(yes_size, 9); // 15 * 60 / 100 = 9
+    }
+
+    #[test]
+    fn test_kalshi_book_derive_empty_book() {
+        let book = KalshiBook::new();
+        assert_eq!(book.derive_no_side(), (0, 0));
+        assert_eq!(book.derive_yes_side(), (0, 0));
     }
 }
 
