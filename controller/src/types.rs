@@ -76,6 +76,12 @@ pub type PriceCents = u16;
 /// Size representation in cents (dollar amount × 100), maximum ~$655k per side
 pub type SizeCents = u16;
 
+/// Price in milli-cents for Polymarket sub-cent precision (1 unit = $0.001). Range: 0–999.
+pub type PolyPriceMillis = u32;
+
+/// Size in milli-dollars for Polymarket (1 unit = $0.001). Handles large sizes like 260323.77.
+pub type PolySizeMillis = u32;
+
 /// Maximum number of concurrently tracked markets
 pub const MAX_MARKETS: usize = 1024;
 
@@ -514,6 +520,45 @@ pub fn parse_price(s: &str) -> PriceCents {
     s.parse::<f64>()
         .map(price_to_cents)
         .unwrap_or(0)
+}
+
+/// Parse Polymarket price string to milli-cents (1 unit = $0.001).
+/// "0.999" → 999, "0.99" → 990, "0.05" → 50, "0.5" → 500
+/// Returns 0 if parsing fails or price >= 1.0.
+#[inline(always)]
+pub fn parse_price_millis(s: &str) -> PolyPriceMillis {
+    let val: f64 = match s.parse() {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    if val <= 0.0 || val >= 1.0 {
+        return 0;
+    }
+    (val * 1000.0).round() as PolyPriceMillis
+}
+
+/// Parse Polymarket size string to milli-dollars (1 unit = $0.001).
+/// "260323.77" → 260_323_770, "100" → 100_000
+/// Returns 0 if parsing fails.
+#[inline(always)]
+pub fn parse_size_millis(s: &str) -> PolySizeMillis {
+    s.parse::<f64>()
+        .map(|size| (size * 1000.0).round() as PolySizeMillis)
+        .unwrap_or(0)
+}
+
+/// Convert milli-cent price to whole cents (floor division).
+/// 999 → 99, 990 → 99, 49 → 4, 0 → 0
+#[inline(always)]
+pub fn millis_to_cents(millis: PolyPriceMillis) -> PriceCents {
+    (millis / 10).min(99) as PriceCents
+}
+
+/// Convert milli-dollar size to cents, clamped to u16::MAX.
+/// 100_000 → 10_000, 700_000 → 65_535
+#[inline(always)]
+pub fn millis_size_to_cents(millis: PolySizeMillis) -> SizeCents {
+    (millis / 10).min(u16::MAX as u32) as SizeCents
 }
 
 /// Arbitrage opportunity type, determining the execution strategy
@@ -2389,6 +2434,79 @@ mod tests {
     }
 
     // =========================================================================
+    // =========================================================================
+    // Milli-cent Parse Tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_price_millis_two_decimals() {
+        assert_eq!(parse_price_millis("0.99"), 990);
+        assert_eq!(parse_price_millis("0.05"), 50);
+        assert_eq!(parse_price_millis("0.50"), 500);
+        assert_eq!(parse_price_millis("0.01"), 10);
+    }
+
+    #[test]
+    fn test_parse_price_millis_three_decimals() {
+        assert_eq!(parse_price_millis("0.999"), 999);
+        assert_eq!(parse_price_millis("0.998"), 998);
+        assert_eq!(parse_price_millis("0.001"), 1);
+        assert_eq!(parse_price_millis("0.049"), 49);
+        assert_eq!(parse_price_millis("0.988"), 988);
+    }
+
+    #[test]
+    fn test_parse_price_millis_one_decimal() {
+        assert_eq!(parse_price_millis("0.5"), 500);
+        assert_eq!(parse_price_millis("0.1"), 100);
+        assert_eq!(parse_price_millis("0.9"), 900);
+    }
+
+    #[test]
+    fn test_parse_price_millis_invalid() {
+        assert_eq!(parse_price_millis(""), 0);
+        assert_eq!(parse_price_millis("abc"), 0);
+        assert_eq!(parse_price_millis("1.5"), 0);
+    }
+
+    #[test]
+    fn test_parse_size_millis_integer() {
+        assert_eq!(parse_size_millis("100"), 100_000);
+        assert_eq!(parse_size_millis("1"), 1_000);
+    }
+
+    #[test]
+    fn test_parse_size_millis_fractional() {
+        assert_eq!(parse_size_millis("123.45"), 123_450);
+        assert_eq!(parse_size_millis("260323.77"), 260_323_770);
+        assert_eq!(parse_size_millis("0.5"), 500);
+    }
+
+    #[test]
+    fn test_parse_size_millis_invalid() {
+        assert_eq!(parse_size_millis(""), 0);
+        assert_eq!(parse_size_millis("abc"), 0);
+    }
+
+    #[test]
+    fn test_millis_to_cents() {
+        assert_eq!(millis_to_cents(990), 99);
+        assert_eq!(millis_to_cents(999), 99);
+        assert_eq!(millis_to_cents(50), 5);
+        assert_eq!(millis_to_cents(49), 4);
+        assert_eq!(millis_to_cents(0), 0);
+        assert_eq!(millis_to_cents(10), 1);
+        assert_eq!(millis_to_cents(1), 0);
+    }
+
+    #[test]
+    fn test_millis_size_to_cents() {
+        assert_eq!(millis_size_to_cents(100_000), 10_000);
+        assert_eq!(millis_size_to_cents(123_450), 12_345);
+        assert_eq!(millis_size_to_cents(700_000), 65_535);
+        assert_eq!(millis_size_to_cents(0), 0);
+    }
+
     // PolyBook Tests - Shadow orderbook for Polymarket
     // =========================================================================
 
