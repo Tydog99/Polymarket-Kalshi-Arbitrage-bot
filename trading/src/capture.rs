@@ -80,16 +80,25 @@ pub fn init_capture_session() -> Result<Option<CaptureSession>, std::io::Error> 
         _ => return Ok(None), // Capture disabled
     };
 
-    // Validate/create base directory
-    std::fs::create_dir_all(&base_dir)?;
-
-    // Generate timestamped session directory name
-    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-    let session_name = format!("session_{}", timestamp);
-    let session_dir = base_dir.join(&session_name);
-
-    // Create session directory
-    std::fs::create_dir_all(&session_dir)?;
+    // If CAPTURE_DIR already looks like a session-managed path (contains "captures" as final
+    // component inside a .sessions/ tree), write directly into it. Otherwise create a
+    // timestamped subdirectory for backward compatibility.
+    let session_dir = if base_dir
+        .components()
+        .any(|c| c.as_os_str() == ".sessions")
+    {
+        // Session-managed: write directly into the provided directory
+        std::fs::create_dir_all(&base_dir)?;
+        base_dir.clone()
+    } else {
+        // Legacy / standalone: create timestamped session subdirectory
+        std::fs::create_dir_all(&base_dir)?;
+        let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+        let session_name = format!("session_{}", timestamp);
+        let dir = base_dir.join(&session_name);
+        std::fs::create_dir_all(&dir)?;
+        dir
+    };
 
     // Verify directory is writable by creating a test file
     let test_file = session_dir.join(".write_test");
