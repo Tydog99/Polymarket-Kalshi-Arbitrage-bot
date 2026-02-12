@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use crate::arb::kalshi_fee;
 use crate::config::{build_polymarket_url, KALSHI_WEB_BASE};
-use crate::types::{ArbType, ArbOpportunity, GlobalState, MarketPair, PriceCents};
+use crate::types::{ArbType, ArbOpportunity, GlobalState, MarketPair, PriceCents, SizeCents};
 
 /// A pending arbitrage opportunity awaiting confirmation
 #[derive(Debug, Clone)]
@@ -95,6 +95,14 @@ pub struct ValidationResult {
     pub is_valid: bool,
     pub original_cost: u16,
     pub current_cost: u16,
+    /// Current yes price (for updating the request before execution)
+    pub current_yes_price: PriceCents,
+    /// Current no price (for updating the request before execution)
+    pub current_no_price: PriceCents,
+    /// Current yes size
+    pub current_yes_size: SizeCents,
+    /// Current no size
+    pub current_no_size: SizeCents,
 }
 
 /// Queue of pending arbitrage opportunities keyed by market_id
@@ -235,6 +243,10 @@ impl ConfirmationQueue {
                 is_valid: true,
                 original_cost: arb.request.yes_price + arb.request.no_price,
                 current_cost: arb.request.yes_price + arb.request.no_price,
+                current_yes_price: arb.request.yes_price,
+                current_no_price: arb.request.no_price,
+                current_yes_size: arb.request.yes_size,
+                current_no_size: arb.request.no_size,
             });
         }
 
@@ -251,8 +263,8 @@ impl ConfirmationQueue {
         };
 
         // Get current prices from orderbook
-        let (k_yes, k_no, _, _) = market.kalshi.load();
-        let (p_yes, p_no, _, _) = market.poly.load();
+        let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
+        let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.load();
 
         // Calculate original cost (from when arb was queued)
         let original_cost = arb.request.yes_price + arb.request.no_price + match arb.request.arb_type {
@@ -260,6 +272,14 @@ impl ConfirmationQueue {
             ArbType::KalshiYesPolyNo => kalshi_fee(arb.request.yes_price),
             ArbType::PolyOnly => 0,
             ArbType::KalshiOnly => kalshi_fee(arb.request.yes_price) + kalshi_fee(arb.request.no_price),
+        };
+
+        // Map current prices based on arb type (yes/no refer to which side we buy)
+        let (cur_yes, cur_no, cur_yes_size, cur_no_size) = match arb.request.arb_type {
+            ArbType::PolyYesKalshiNo => (p_yes, k_no, p_yes_size, k_no_size),
+            ArbType::KalshiYesPolyNo => (k_yes, p_no, k_yes_size, p_no_size),
+            ArbType::PolyOnly => (p_yes, p_no, p_yes_size, p_no_size),
+            ArbType::KalshiOnly => (k_yes, k_no, k_yes_size, k_no_size),
         };
 
         // Calculate current cost based on arb type
@@ -284,6 +304,10 @@ impl ConfirmationQueue {
             is_valid: current_cost < 100,
             original_cost,
             current_cost,
+            current_yes_price: cur_yes,
+            current_no_price: cur_no,
+            current_yes_size: cur_yes_size,
+            current_no_size: cur_no_size,
         })
     }
 
