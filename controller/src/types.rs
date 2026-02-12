@@ -313,12 +313,15 @@ impl KalshiBook {
 /// Maintains full ask-side depth for YES and NO tokens so the true best ask
 /// is always derivable — even after the current best is removed.
 ///
+/// Uses milli-cent precision (u32 keys, 1 unit = $0.001) to avoid collisions
+/// when Polymarket sends sub-cent prices like 0.999 and 0.998.
+///
 /// Polymarket sends asks directly (unlike Kalshi bids). Deltas use absolute
 /// replacement (`qty = new_size`), not incremental (`qty += delta`).
 /// `size = 0` means remove the level.
 pub struct PolyBook {
-    yes_asks: BTreeMap<u16, u16>,
-    no_asks: BTreeMap<u16, u16>,
+    yes_asks: BTreeMap<PolyPriceMillis, PolySizeMillis>,
+    no_asks: BTreeMap<PolyPriceMillis, PolySizeMillis>,
 }
 
 impl PolyBook {
@@ -331,7 +334,7 @@ impl PolyBook {
 
     /// Replace all YES ask levels from a book snapshot.
     /// Clears existing state first — snapshots are full replacements.
-    pub fn set_yes_asks(&mut self, levels: &[(u16, u16)]) {
+    pub fn set_yes_asks(&mut self, levels: &[(PolyPriceMillis, PolySizeMillis)]) {
         self.yes_asks.clear();
         for &(price, size) in levels {
             if price > 0 && size > 0 {
@@ -341,7 +344,7 @@ impl PolyBook {
     }
 
     /// Replace all NO ask levels from a book snapshot.
-    pub fn set_no_asks(&mut self, levels: &[(u16, u16)]) {
+    pub fn set_no_asks(&mut self, levels: &[(PolyPriceMillis, PolySizeMillis)]) {
         self.no_asks.clear();
         for &(price, size) in levels {
             if price > 0 && size > 0 {
@@ -352,7 +355,7 @@ impl PolyBook {
 
     /// Apply a YES ask level update (absolute replacement).
     /// size = 0 removes the level.
-    pub fn update_yes_level(&mut self, price: u16, size: u16) {
+    pub fn update_yes_level(&mut self, price: PolyPriceMillis, size: PolySizeMillis) {
         if size == 0 {
             self.yes_asks.remove(&price);
         } else {
@@ -361,7 +364,7 @@ impl PolyBook {
     }
 
     /// Apply a NO ask level update (absolute replacement).
-    pub fn update_no_level(&mut self, price: u16, size: u16) {
+    pub fn update_no_level(&mut self, price: PolyPriceMillis, size: PolySizeMillis) {
         if size == 0 {
             self.no_asks.remove(&price);
         } else {
@@ -369,14 +372,14 @@ impl PolyBook {
         }
     }
 
-    /// Best YES ask: lowest price in the book.
+    /// Best YES ask: lowest price in the book (milli-cent precision).
     /// BTreeMap is ascending, so `iter().next()` is the lowest key.
-    pub fn best_yes_ask(&self) -> Option<(u16, u16)> {
+    pub fn best_yes_ask(&self) -> Option<(PolyPriceMillis, PolySizeMillis)> {
         self.yes_asks.iter().next().map(|(&p, &s)| (p, s))
     }
 
-    /// Best NO ask: lowest price in the book.
-    pub fn best_no_ask(&self) -> Option<(u16, u16)> {
+    /// Best NO ask: lowest price in the book (milli-cent precision).
+    pub fn best_no_ask(&self) -> Option<(PolyPriceMillis, PolySizeMillis)> {
         self.no_asks.iter().next().map(|(&p, &s)| (p, s))
     }
 
@@ -2507,7 +2510,8 @@ mod tests {
         assert_eq!(millis_size_to_cents(0), 0);
     }
 
-    // PolyBook Tests - Shadow orderbook for Polymarket
+    // =========================================================================
+    // PolyBook Tests - Shadow orderbook for Polymarket (milli-cent precision)
     // =========================================================================
 
     #[test]
@@ -2520,76 +2524,101 @@ mod tests {
     #[test]
     fn test_poly_book_set_and_best_ask() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(47, 2000), (45, 1500), (50, 3000)]);
-        assert_eq!(book.best_yes_ask(), Some((45, 1500)));
+        book.set_yes_asks(&[(470, 20000), (450, 15000), (500, 30000)]);
+        assert_eq!(book.best_yes_ask(), Some((450, 15000)));
     }
 
     #[test]
     fn test_poly_book_update_level_insert() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(50, 1000)]);
-        book.update_yes_level(48, 500);
-        assert_eq!(book.best_yes_ask(), Some((48, 500)));
+        book.set_yes_asks(&[(500, 10000)]);
+        book.update_yes_level(480, 5000);
+        assert_eq!(book.best_yes_ask(), Some((480, 5000)));
     }
 
     #[test]
     fn test_poly_book_update_level_replace() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(45, 1000)]);
-        book.update_yes_level(45, 2000);
-        assert_eq!(book.best_yes_ask(), Some((45, 2000)));
+        book.set_yes_asks(&[(450, 10000)]);
+        book.update_yes_level(450, 20000);
+        assert_eq!(book.best_yes_ask(), Some((450, 20000)));
     }
 
     #[test]
     fn test_poly_book_update_level_remove() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(45, 1000), (50, 2000)]);
-        book.update_yes_level(45, 0);
-        assert_eq!(book.best_yes_ask(), Some((50, 2000)));
+        book.set_yes_asks(&[(450, 10000), (500, 20000)]);
+        book.update_yes_level(450, 0);
+        assert_eq!(book.best_yes_ask(), Some((500, 20000)));
     }
 
     #[test]
     fn test_poly_book_remove_best_reveals_next() {
         let mut book = PolyBook::new();
-        book.set_no_asks(&[(42, 500), (45, 1000), (48, 1500)]);
-        assert_eq!(book.best_no_ask(), Some((42, 500)));
-        book.update_no_level(42, 0);
-        assert_eq!(book.best_no_ask(), Some((45, 1000)));
+        book.set_no_asks(&[(420, 5000), (450, 10000), (480, 15000)]);
+        assert_eq!(book.best_no_ask(), Some((420, 5000)));
+        book.update_no_level(420, 0);
+        assert_eq!(book.best_no_ask(), Some((450, 10000)));
     }
 
     #[test]
     fn test_poly_book_remove_last_level() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(50, 1000)]);
-        book.update_yes_level(50, 0);
+        book.set_yes_asks(&[(500, 10000)]);
+        book.update_yes_level(500, 0);
         assert_eq!(book.best_yes_ask(), None);
     }
 
     #[test]
     fn test_poly_book_snapshot_replaces_all() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(45, 1000), (50, 2000)]);
-        book.set_yes_asks(&[(60, 500), (65, 800)]);
-        assert_eq!(book.best_yes_ask(), Some((60, 500)));
-        book.update_yes_level(45, 0);
-        assert_eq!(book.best_yes_ask(), Some((60, 500)));
+        book.set_yes_asks(&[(450, 10000), (500, 20000)]);
+        book.set_yes_asks(&[(600, 5000), (650, 8000)]);
+        assert_eq!(book.best_yes_ask(), Some((600, 5000)));
+        book.update_yes_level(450, 0);
+        assert_eq!(book.best_yes_ask(), Some((600, 5000)));
     }
 
     #[test]
     fn test_poly_book_skips_zero_price_and_size() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(0, 1000), (45, 0), (50, 2000)]);
-        assert_eq!(book.best_yes_ask(), Some((50, 2000)));
+        book.set_yes_asks(&[(0, 10000), (450, 0), (500, 20000)]);
+        assert_eq!(book.best_yes_ask(), Some((500, 20000)));
     }
 
     #[test]
     fn test_poly_book_clear() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(45, 1000)]);
-        book.set_no_asks(&[(55, 2000)]);
+        book.set_yes_asks(&[(450, 10000)]);
+        book.set_no_asks(&[(550, 20000)]);
         book.clear();
         assert_eq!(book.best_yes_ask(), None);
         assert_eq!(book.best_no_ask(), None);
+    }
+
+    #[test]
+    fn test_poly_book_subcent_prices_are_unique() {
+        let mut book = PolyBook::new();
+        book.set_yes_asks(&[(999, 100000), (998, 55000), (990, 92075)]);
+        assert_eq!(book.best_yes_ask(), Some((990, 92075)));
+    }
+
+    #[test]
+    fn test_poly_book_remove_subcent_preserves_others() {
+        let mut book = PolyBook::new();
+        book.set_no_asks(&[(970, 10000), (978, 5000), (979, 12900)]);
+        assert_eq!(book.best_no_ask(), Some((970, 10000)));
+        book.update_no_level(970, 0);
+        assert_eq!(book.best_no_ask(), Some((978, 5000)));
+    }
+
+    #[test]
+    fn test_poly_book_subcent_delta_does_not_affect_neighbors() {
+        let mut book = PolyBook::new();
+        book.set_yes_asks(&[(50, 8500), (49, 2000)]);
+        assert_eq!(book.best_yes_ask(), Some((49, 2000)));
+        book.update_yes_level(49, 0);
+        assert_eq!(book.best_yes_ask(), Some((50, 8500)));
     }
 }
 
