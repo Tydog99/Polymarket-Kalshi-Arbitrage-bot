@@ -2570,7 +2570,7 @@ mod kalshi_delta_correctness {
         assert_eq!(yes_ask, 45); // 100 - 55
 
         let book = market.kalshi_book.lock();
-        assert_eq!(book.yes_bids.lock().len(), 1);
-        assert!(!book.yes_bids.lock().contains_key(&38));
+        assert_eq!(book.yes_bid_count(), 1);
+        assert!(!book.has_yes_bid(38));
     }
 }

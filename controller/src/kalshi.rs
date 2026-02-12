@@ -761,6 +761,15 @@ fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiW
         }
     };
 
+    // Validate price range (Kalshi prediction market prices are 1-99 cents)
+    if price < 1 || price > 99 {
+        tracing::warn!(
+            "[KALSHI-DELTA] {} | Out-of-range price: {} (expected 1-99), dropping delta",
+            ticker, price
+        );
+        return;
+    }
+
     tracing::debug!(
         "[KALSHI-DELTA] {} | side={} price={} delta={}",
         ticker, side, price, delta
@@ -771,26 +780,27 @@ fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiW
 
     match side {
         "yes" => {
-            // YES bid changed -> recompute NO ask
+            // YES bid changed → recompute NO ask
             let (no_ask, no_size) = book.derive_no_side();
             drop(book);
             market.kalshi.update_no(no_ask, no_size);
+            market.inc_kalshi_updates();
         }
         "no" => {
-            // NO bid changed -> recompute YES ask
+            // NO bid changed → recompute YES ask
             let (yes_ask, yes_size) = book.derive_yes_side();
             drop(book);
             market.kalshi.update_yes(yes_ask, yes_size);
+            market.inc_kalshi_updates();
         }
         _ => {
+            drop(book);
             tracing::warn!(
                 "[KALSHI-DELTA] {} | Unknown side: {}",
                 ticker, side
             );
         }
     }
-
-    market.inc_kalshi_updates();
 }
 
 /// Route a detected arbitrage opportunity to the appropriate channel.
