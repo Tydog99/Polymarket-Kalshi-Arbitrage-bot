@@ -2581,6 +2581,7 @@ mod kalshi_delta_bug_proof {
 
 mod poly_shadow_book_tests {
     use arb_bot::types::*;
+    use arb_bot::arb::ArbConfig;
 
     /// Helper: create a GlobalState with one market pair registered.
     /// Returns (state, market_id).
@@ -2663,5 +2664,167 @@ mod poly_shadow_book_tests {
         let (yes_ask, _, yes_size, _) = market.poly.load();
         assert_eq!(yes_ask, 60, "Snapshot should fully replace: best=60¢");
         assert_eq!(yes_size, 800, "Size from new snapshot's best level");
+    }
+
+    /// price_change with size updates both PolyBook and AtomicOrderbook.
+    #[test]
+    fn test_poly_price_change_updates_book() {
+        let (state, id) = setup_state();
+        let market = &state.markets[id as usize];
+
+        // Initial snapshot: YES ask at 50¢
+        {
+            let mut book = market.poly_book.lock();
+            book.set_yes_asks(&[(50, 1000)]);
+            let (p, s) = book.best_yes_ask().unwrap();
+            drop(book);
+            market.poly.update_yes(p, s);
+        }
+
+        // price_change: new SELL level at 48¢ with size 500
+        {
+            let mut book = market.poly_book.lock();
+            book.update_yes_level(48, 500);
+            let (p, s) = book.best_yes_ask().unwrap();
+            drop(book);
+            market.poly.update_yes(p, s);
+        }
+
+        let (yes_ask, _, yes_size, _) = market.poly.load();
+        assert_eq!(yes_ask, 48, "New lower ask should become best");
+        assert_eq!(yes_size, 500, "Size should be from new level");
+    }
+
+    /// Size from price_change is used, not stale snapshot size.
+    #[test]
+    fn test_poly_size_updates_from_price_change() {
+        let (state, id) = setup_state();
+        let market = &state.markets[id as usize];
+
+        // Snapshot: YES ask at 45¢ with size 1000
+        {
+            let mut book = market.poly_book.lock();
+            book.set_yes_asks(&[(45, 1000)]);
+            let (p, s) = book.best_yes_ask().unwrap();
+            drop(book);
+            market.poly.update_yes(p, s);
+        }
+        assert_eq!(market.poly.load().2, 1000);
+
+        // price_change: same price 45¢ but size updated to 2500
+        {
+            let mut book = market.poly_book.lock();
+            book.update_yes_level(45, 2500);
+            let (p, s) = book.best_yes_ask().unwrap();
+            drop(book);
+            market.poly.update_yes(p, s);
+        }
+
+        let (yes_ask, _, yes_size, _) = market.poly.load();
+        assert_eq!(yes_ask, 45, "Price unchanged");
+        assert_eq!(yes_size, 2500, "Size should be updated from price_change, not stale");
+    }
+
+    /// Removing best ask via size=0 reveals next-best level.
+    #[test]
+    fn test_poly_best_ask_removed_reveals_next() {
+        let (state, id) = setup_state();
+        let market = &state.markets[id as usize];
+
+        // Snapshot: asks at 45¢ and 50¢
+        {
+            let mut book = market.poly_book.lock();
+            book.set_yes_asks(&[(45, 1000), (50, 2000)]);
+            let (p, s) = book.best_yes_ask().unwrap();
+            drop(book);
+            market.poly.update_yes(p, s);
+        }
+        assert_eq!(market.poly.load().0, 45);
+
+        // price_change: remove 45¢ level (size=0)
+        {
+            let mut book = market.poly_book.lock();
+            book.update_yes_level(45, 0);
+            let best = book.best_yes_ask().unwrap_or((0, 0));
+            drop(book);
+            market.poly.update_yes(best.0, best.1);
+        }
+
+        let (yes_ask, _, yes_size, _) = market.poly.load();
+        assert_eq!(yes_ask, 50, "Next-best level (50¢) should be promoted");
+        assert_eq!(yes_size, 2000, "Size from 50¢ level");
+    }
+
+    /// End-to-end: arb exists, then best ask is removed, arb disappears.
+    #[test]
+    fn test_poly_no_phantom_arb_after_removal() {
+        let (state, id) = setup_state();
+        let market = &state.markets[id as usize];
+        let config = ArbConfig::new(99, 1.0);
+
+        // Kalshi: YES ask = 50¢, NO ask = 50¢
+        market.kalshi.store(50, 50, 1000, 1000);
+
+        // Poly: YES ask = 45¢, NO ask = 55¢ (need non-zero for detect())
+        // PolyYesKalshiNo cost = 45 + 50 + kalshi_fee(50) = 45 + 50 + 2 = 97 < 99 → arb exists
+        {
+            let mut book = market.poly_book.lock();
+            book.set_yes_asks(&[(45, 1000)]);
+            book.set_no_asks(&[(55, 1000)]);
+            let (p, s) = book.best_yes_ask().unwrap();
+            let (np, ns) = book.best_no_ask().unwrap();
+            drop(book);
+            market.poly.update_yes(p, s);
+            market.poly.update_no(np, ns);
+        }
+
+        let arb = ArbOpportunity::detect(
+            id, market.kalshi.load(), market.poly.load(), &config, 0,
+        );
+        assert!(arb.is_some(), "Arb should exist: 45 + 50 + fee(2) = 97 < 99");
+
+        // Now remove the 45¢ level — no other levels exist
+        {
+            let mut book = market.poly_book.lock();
+            book.update_yes_level(45, 0);
+            let best = book.best_yes_ask().unwrap_or((0, 0));
+            drop(book);
+            market.poly.update_yes(best.0, best.1);
+        }
+
+        let arb = ArbOpportunity::detect(
+            id, market.kalshi.load(), market.poly.load(), &config, 0,
+        );
+        assert!(arb.is_none(), "Arb should NOT exist: price=0 means no liquidity");
+    }
+
+    /// All levels removed → cache shows (0, 0) → arb detection skips.
+    #[test]
+    fn test_poly_empty_book_clears_cache() {
+        let (state, id) = setup_state();
+        let market = &state.markets[id as usize];
+
+        // Snapshot with two levels
+        {
+            let mut book = market.poly_book.lock();
+            book.set_yes_asks(&[(45, 1000), (50, 2000)]);
+            let (p, s) = book.best_yes_ask().unwrap();
+            drop(book);
+            market.poly.update_yes(p, s);
+        }
+
+        // Remove both levels
+        {
+            let mut book = market.poly_book.lock();
+            book.update_yes_level(45, 0);
+            book.update_yes_level(50, 0);
+            let best = book.best_yes_ask().unwrap_or((0, 0));
+            drop(book);
+            market.poly.update_yes(best.0, best.1);
+        }
+
+        let (yes_ask, _, yes_size, _) = market.poly.load();
+        assert_eq!(yes_ask, 0, "Empty book → price 0");
+        assert_eq!(yes_size, 0, "Empty book → size 0");
     }
 }
