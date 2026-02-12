@@ -447,4 +447,110 @@ mod tests {
         // Polymarket URL should be built from league and slug
         assert!(pending.poly_url.contains("nba"));
     }
+
+    // =========================================================================
+    // validate_arb_detailed fresh price propagation tests
+    // =========================================================================
+
+    fn make_queue_and_arb(arb_type: ArbType, detection_prices: (u16, u16, u16, u16))
+        -> (ConfirmationQueue, PendingArb)
+    {
+        use crate::arb::ArbConfig;
+
+        let state = Arc::new(GlobalState::new(ArbConfig::default()));
+        let (tx, _rx) = mpsc::channel(1);
+        let queue = ConfirmationQueue::new(state, tx);
+
+        let (yes_price, no_price, yes_size, no_size) = detection_prices;
+        let request = ArbOpportunity {
+            market_id: 1,
+            yes_price,
+            no_price,
+            yes_size,
+            no_size,
+            arb_type,
+            detected_ns: 0,
+            is_test: false,
+        };
+        let pending = PendingArb::new(request, test_market_pair());
+
+        (queue, pending)
+    }
+
+    #[test]
+    fn test_validate_returns_fresh_prices_poly_yes_kalshi_no() {
+        let (queue, arb) = make_queue_and_arb(
+            ArbType::PolyYesKalshiNo,
+            (30, 60, 300, 600), // stale detection prices
+        );
+
+        // Set fresh orderbook prices: Kalshi=(55,45,500,450) Poly=(28,72,280,720)
+        let market = queue.state.get_by_id(1).unwrap();
+        market.kalshi.store(55, 45, 500, 450);
+        market.poly.store(28, 72, 280, 720);
+
+        let result = queue.validate_arb_detailed(&arb).unwrap();
+        // PolyYesKalshiNo: yes=poly_yes, no=kalshi_no
+        assert_eq!(result.current_yes_price, 28, "YES should be Poly YES");
+        assert_eq!(result.current_no_price, 45, "NO should be Kalshi NO");
+        assert_eq!(result.current_yes_size, 280, "YES size should be Poly YES size");
+        assert_eq!(result.current_no_size, 450, "NO size should be Kalshi NO size");
+    }
+
+    #[test]
+    fn test_validate_returns_fresh_prices_kalshi_yes_poly_no() {
+        let (queue, arb) = make_queue_and_arb(
+            ArbType::KalshiYesPolyNo,
+            (30, 60, 300, 600),
+        );
+
+        let market = queue.state.get_by_id(1).unwrap();
+        market.kalshi.store(55, 45, 500, 450);
+        market.poly.store(28, 72, 280, 720);
+
+        let result = queue.validate_arb_detailed(&arb).unwrap();
+        // KalshiYesPolyNo: yes=kalshi_yes, no=poly_no
+        assert_eq!(result.current_yes_price, 55, "YES should be Kalshi YES");
+        assert_eq!(result.current_no_price, 72, "NO should be Poly NO");
+        assert_eq!(result.current_yes_size, 500, "YES size should be Kalshi YES size");
+        assert_eq!(result.current_no_size, 720, "NO size should be Poly NO size");
+    }
+
+    #[test]
+    fn test_validate_returns_fresh_prices_poly_only() {
+        let (queue, arb) = make_queue_and_arb(
+            ArbType::PolyOnly,
+            (30, 60, 300, 600),
+        );
+
+        let market = queue.state.get_by_id(1).unwrap();
+        market.kalshi.store(55, 45, 500, 450);
+        market.poly.store(28, 72, 280, 720);
+
+        let result = queue.validate_arb_detailed(&arb).unwrap();
+        // PolyOnly: yes=poly_yes, no=poly_no
+        assert_eq!(result.current_yes_price, 28);
+        assert_eq!(result.current_no_price, 72);
+        assert_eq!(result.current_yes_size, 280);
+        assert_eq!(result.current_no_size, 720);
+    }
+
+    #[test]
+    fn test_validate_returns_fresh_prices_kalshi_only() {
+        let (queue, arb) = make_queue_and_arb(
+            ArbType::KalshiOnly,
+            (30, 60, 300, 600),
+        );
+
+        let market = queue.state.get_by_id(1).unwrap();
+        market.kalshi.store(55, 45, 500, 450);
+        market.poly.store(28, 72, 280, 720);
+
+        let result = queue.validate_arb_detailed(&arb).unwrap();
+        // KalshiOnly: yes=kalshi_yes, no=kalshi_no
+        assert_eq!(result.current_yes_price, 55);
+        assert_eq!(result.current_no_price, 45);
+        assert_eq!(result.current_yes_size, 500);
+        assert_eq!(result.current_no_size, 450);
+    }
 }
