@@ -2112,6 +2112,150 @@ mod tests {
         assert_eq!(book.derive_no_side(), (0, 0));
         assert_eq!(book.derive_yes_side(), (0, 0));
     }
+
+    // =========================================================================
+    // KalshiBook Property/Fuzz Tests
+    // =========================================================================
+
+    #[test]
+    fn fuzz_kalshi_book_delta_invariants() {
+        use rand::Rng;
+
+        let mut rng = rand::thread_rng();
+
+        for iteration in 0..1000 {
+            let market = AtomicMarketState::new(0);
+
+            // Generate random snapshot: 3-10 YES levels, 3-10 NO levels
+            let num_yes = rng.gen_range(3..=10);
+            let num_no = rng.gen_range(3..=10);
+
+            let mut yes_levels: Vec<Vec<i64>> = Vec::new();
+            let mut used_prices = std::collections::HashSet::new();
+            for _ in 0..num_yes {
+                let price: i64 = loop {
+                    let p = rng.gen_range(1..=99);
+                    if used_prices.insert(p) { break p; }
+                };
+                let qty: i64 = rng.gen_range(1..=200);
+                yes_levels.push(vec![price, qty]);
+            }
+
+            let mut no_levels: Vec<Vec<i64>> = Vec::new();
+            used_prices.clear();
+            for _ in 0..num_no {
+                let price: i64 = loop {
+                    let p = rng.gen_range(1..=99);
+                    if used_prices.insert(p) { break p; }
+                };
+                let qty: i64 = rng.gen_range(1..=200);
+                no_levels.push(vec![price, qty]);
+            }
+
+            // Apply snapshot
+            {
+                let mut book = market.kalshi_book.lock();
+                book.set_yes_bids(&yes_levels);
+                book.set_no_bids(&no_levels);
+                let (no_ask, no_size) = book.derive_no_side();
+                let (yes_ask, yes_size) = book.derive_yes_side();
+                drop(book);
+                market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
+            }
+
+            // Verify invariant 1: AtomicOrderbook matches book
+            verify_invariants(&market, iteration, "post-snapshot");
+
+            // Apply 5-20 random deltas
+            let num_deltas = rng.gen_range(5..=20);
+            for d in 0..num_deltas {
+                let side = if rng.gen_bool(0.5) { "yes" } else { "no" };
+                let price: i64 = rng.gen_range(1..=99);
+                let delta: i64 = rng.gen_range(-50..=50);
+                if delta == 0 { continue; }
+
+                {
+                    let mut book = market.kalshi_book.lock();
+                    book.apply_delta(side, price, delta);
+                    match side {
+                        "yes" => {
+                            let (no_ask, no_size) = book.derive_no_side();
+                            drop(book);
+                            market.kalshi.update_no(no_ask, no_size);
+                        }
+                        "no" => {
+                            let (yes_ask, yes_size) = book.derive_yes_side();
+                            drop(book);
+                            market.kalshi.update_yes(yes_ask, yes_size);
+                        }
+                        _ => {}
+                    }
+                }
+
+                verify_invariants(&market, iteration, &format!("delta-{}", d));
+            }
+        }
+    }
+
+    /// Verify all invariants hold for the current market state
+    fn verify_invariants(market: &AtomicMarketState, iteration: usize, phase: &str) {
+        let book = market.kalshi_book.lock();
+        let (yes_ask, no_ask, yes_size, no_size) = market.kalshi.load();
+
+        // Invariant 1: AtomicOrderbook matches KalshiBook best bid
+        let (expected_no_ask, expected_no_size) = book.derive_no_side();
+        let (expected_yes_ask, expected_yes_size) = book.derive_yes_side();
+        assert_eq!(
+            no_ask, expected_no_ask,
+            "iter={} phase={}: NO ask mismatch: atomic={} book={}",
+            iteration, phase, no_ask, expected_no_ask
+        );
+        assert_eq!(
+            no_size, expected_no_size,
+            "iter={} phase={}: NO size mismatch", iteration, phase
+        );
+        assert_eq!(
+            yes_ask, expected_yes_ask,
+            "iter={} phase={}: YES ask mismatch: atomic={} book={}",
+            iteration, phase, yes_ask, expected_yes_ask
+        );
+        assert_eq!(
+            yes_size, expected_yes_size,
+            "iter={} phase={}: YES size mismatch", iteration, phase
+        );
+
+        // Invariant 2: No BTreeMap entry has qty <= 0
+        for (&price, &qty) in book.yes_bids.lock().iter() {
+            assert!(
+                qty > 0,
+                "iter={} phase={}: YES bid at {}¢ has qty {} <= 0",
+                iteration, phase, price, qty
+            );
+        }
+        for (&price, &qty) in book.no_bids.lock().iter() {
+            assert!(
+                qty > 0,
+                "iter={} phase={}: NO bid at {}¢ has qty {} <= 0",
+                iteration, phase, price, qty
+            );
+        }
+
+        // Invariant 3: Empty book → zero prices
+        if book.yes_bids.lock().is_empty() {
+            assert_eq!(
+                no_ask, 0,
+                "iter={} phase={}: NO ask should be 0 when YES book empty",
+                iteration, phase
+            );
+        }
+        if book.no_bids.lock().is_empty() {
+            assert_eq!(
+                yes_ask, 0,
+                "iter={} phase={}: YES ask should be 0 when NO book empty",
+                iteration, phase
+            );
+        }
+    }
 }
 
 // === Kalshi API Types ===
