@@ -763,15 +763,41 @@ async fn process_price_change(
             let api_best_ask = parse_price(api_best_ask_str);
             if api_best_ask > 0 {
                 let token_hash = fxhash_str(&change.asset_id);
+
+                // Check YES token
                 if let Some(market_id) = state.poly_yes_to_id.read().get(&token_hash).copied() {
                     let (our_best, _, _, _) = state.markets[market_id as usize].poly.load();
+                    let ticker = state.markets[market_id as usize].pair()
+                        .map(|p| p.kalshi_market_ticker.to_string())
+                        .unwrap_or_else(|| format!("market_{}", market_id));
                     if our_best > 0 && our_best != api_best_ask {
-                        let ticker = state.markets[market_id as usize].pair()
-                            .map(|p| p.kalshi_market_ticker.to_string())
-                            .unwrap_or_else(|| format!("market_{}", market_id));
                         tracing::warn!(
                             "[POLY] book drift: computed best_yes_ask={}¢ but API says best_ask={}¢ for {}",
                             our_best, api_best_ask, ticker
+                        );
+                    } else {
+                        tracing::debug!(
+                            "[POLY-BUY] {} | YES sanity OK: our={}¢ api={}¢",
+                            ticker, our_best, api_best_ask
+                        );
+                    }
+                }
+
+                // Check NO token
+                if let Some(market_id) = state.poly_no_to_id.read().get(&token_hash).copied() {
+                    let (_, our_best, _, _) = state.markets[market_id as usize].poly.load();
+                    let ticker = state.markets[market_id as usize].pair()
+                        .map(|p| p.kalshi_market_ticker.to_string())
+                        .unwrap_or_else(|| format!("market_{}", market_id));
+                    if our_best > 0 && our_best != api_best_ask {
+                        tracing::warn!(
+                            "[POLY] book drift: computed best_no_ask={}¢ but API says best_ask={}¢ for {}",
+                            our_best, api_best_ask, ticker
+                        );
+                    } else {
+                        tracing::debug!(
+                            "[POLY-BUY] {} | NO sanity OK: our={}¢ api={}¢",
+                            ticker, our_best, api_best_ask
                         );
                     }
                 }
