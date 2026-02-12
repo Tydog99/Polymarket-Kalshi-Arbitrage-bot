@@ -2430,3 +2430,145 @@ mod startup_sweep_tests {
         std::env::remove_var("CONFIRM_MODE_SKIP");
     }
 }
+
+// ============================================================================
+// KALSHI DELTA BUG PROOF - Demonstrates that order cancellation at the best
+// bid level causes frozen (phantom) prices and sizes in the orderbook cache.
+//
+// This reproduces the root cause of the 2026-02-12 incident where MIL-ORL
+// Total 220.5 was executed 5 times against phantom liquidity.
+// See: https://github.com/Tydog99/Polymarket-Kalshi-Arbitrage-bot/issues/52
+// ============================================================================
+
+mod kalshi_delta_bug_proof {
+    use arb_bot::types::*;
+    use arb_bot::arb::ArbConfig;
+
+    /// The exact logic from `process_kalshi_delta` in kalshi.rs:799-815,
+    /// extracted here since the function is private.
+    ///
+    /// Given a delta's YES bid levels, compute the NO ask price and size.
+    /// Falls back to (current_no, current_no_size) if no qualifying levels.
+    fn compute_no_ask_from_yes_delta(
+        levels: &[Vec<i64>],
+        current_no: PriceCents,
+        current_no_size: SizeCents,
+    ) -> (PriceCents, SizeCents) {
+        levels.iter()
+            .filter_map(|l| {
+                if l.len() >= 2 && l[1] > 0 {
+                    Some((l[0], l[1]))
+                } else {
+                    None
+                }
+            })
+            .max_by_key(|(p, _)| *p)
+            .map(|(price, qty)| {
+                let ask = (100 - price) as PriceCents;
+                let size = (qty * price / 100) as SizeCents;
+                (ask, size)
+            })
+            .unwrap_or((current_no, current_no_size))
+    }
+
+    /// PROOF: A delta cancelling the only bid level (qty=0) is silently ignored,
+    /// preserving stale price and size.
+    ///
+    /// This is exactly what happened in the incident:
+    /// 1. Snapshot sets NO ask = 64¢, size = 828¢ (from YES bid at 36¢)
+    /// 2. Someone cancels their YES bid → delta: [36, 0]
+    /// 3. Filter drops [36, 0] because qty=0
+    /// 4. max_by_key returns None → unwrap_or preserves (64, 828)
+    /// 5. Bot sees 828¢ of liquidity at 64¢ that no longer exists
+    #[test]
+    fn test_cancel_at_best_bid_preserves_stale_price_and_size() {
+        // Step 1: Initial state from snapshot — YES bid at 36¢ with 23 contracts
+        // NO ask = 100 - 36 = 64¢, size = 23 * 36 / 100 = 8 (828¢ with real values)
+        let initial_no_ask: PriceCents = 64;
+        let initial_no_size: SizeCents = 828;
+
+        // Step 2: Delta arrives cancelling the bid: [36, 0]
+        let cancel_delta = vec![vec![36_i64, 0_i64]];
+
+        let (no_ask, no_size) = compute_no_ask_from_yes_delta(
+            &cancel_delta,
+            initial_no_ask,
+            initial_no_size,
+        );
+
+        // BUG: Price and size are UNCHANGED despite the order being cancelled.
+        // The bot will continue to see 828¢ of liquidity at 64¢.
+        assert_eq!(no_ask, 64, "BUG: NO ask should be 0 (no bids), but delta handler preserved stale value");
+        assert_eq!(no_size, 828, "BUG: NO size should be 0 (no liquidity), but delta handler preserved stale value");
+    }
+
+    /// PROOF: End-to-end through AtomicOrderbook — shows the stale cache persists
+    /// and ArbOpportunity::detect() will find phantom arbs.
+    #[test]
+    fn test_phantom_arb_from_cancelled_kalshi_bid() {
+        let kalshi_book = AtomicOrderbook::new();
+        let poly_book = AtomicOrderbook::new();
+
+        // Step 1: Kalshi has both sides priced (realistic: YES bid at 36¢, NO bid at 60¢)
+        // YES ask = 100 - 60 = 40¢, NO ask = 100 - 36 = 64¢
+        kalshi_book.store(40, 64, 600, 828);
+
+        // Step 2: Poly has YES ask at 32¢ with size
+        poly_book.store(32, 70, 2720, 500);
+
+        // Step 3: Arb detection sees: Poly YES 32¢ + Kalshi NO 64¢ + fee ≈ 97¢ < 99¢
+        let kalshi = kalshi_book.load();
+        let poly = poly_book.load();
+        let config = ArbConfig::default();
+        let arb = ArbOpportunity::detect(0, kalshi, poly, &config, 0);
+        assert!(arb.is_some(), "Arb should be detected with live liquidity");
+
+        // Step 4: The YES bid at 36¢ gets cancelled → delta [36, 0].
+        // Because of the bug, the delta handler falls back to (current_no, current_no_size).
+        // Simulate: NO ask and NO size remain unchanged.
+        let (current_yes, current_no, current_yes_size, current_no_size) = kalshi_book.load();
+        assert_eq!(current_no, 64, "NO ask should still be 64¢");
+        assert_eq!(current_no_size, 828, "NO size should still be 828¢");
+
+        // The delta handler does exactly this: preserves stale values.
+        kalshi_book.store(current_yes, current_no, current_yes_size, current_no_size);
+
+        // Step 5: Arb detection STILL sees the phantom arb
+        let kalshi_after = kalshi_book.load();
+        let arb_after = ArbOpportunity::detect(0, kalshi_after, poly, &config, 0);
+        assert!(arb_after.is_some(),
+            "BUG: Arb is STILL detected after liquidity was cancelled — this is phantom liquidity");
+
+        // What SHOULD happen: after the [36, 0] cancel delta, no_ask should become 0
+        // (or the next-best bid level), and no_size should be 0. Then detect() returns None
+        // because the arb no longer exists.
+    }
+
+    /// PROOF: Multiple deltas that only modify non-best levels leave the
+    /// best-level size frozen indefinitely.
+    #[test]
+    fn test_non_best_level_deltas_leave_size_frozen() {
+        // Initial: best YES bid at 36¢ x23, also a bid at 30¢ x5
+        let initial_no_ask: PriceCents = 64;  // from 100 - 36
+        let initial_no_size: SizeCents = 828; // from 23 * 36
+
+        // Delta updates only the 30¢ level: [30, 10] (non-best bid)
+        let delta = vec![vec![30_i64, 10_i64]];
+        let (no_ask, no_size) = compute_no_ask_from_yes_delta(
+            &delta,
+            initial_no_ask,
+            initial_no_size,
+        );
+
+        // The delta sees 30¢ as the best (only) bid in this message.
+        // NO ask becomes 100 - 30 = 70¢, size = 10 * 30 / 100 = 3
+        // This is wrong too — it overwrites the real best level (36¢)
+        // with the delta's level (30¢), not knowing the 36¢ bid still exists.
+        assert_eq!(no_ask, 70);
+        assert_eq!(no_size, 3);
+        // BUG: The delta handler has no memory of the full book — it can only
+        // see levels in the current delta message, so a delta touching a
+        // non-best level either gets ignored (if best is in the message)
+        // or incorrectly replaces the best (if best is NOT in the message).
+    }
+}
