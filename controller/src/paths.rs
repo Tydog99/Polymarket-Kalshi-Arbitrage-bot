@@ -6,6 +6,7 @@
 //! live in the workspace root (one level above the controller directory).
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Absolute path to the `controller/` crate directory (compile-time).
 pub fn controller_dir() -> PathBuf {
@@ -116,5 +117,82 @@ pub fn resolve_user_path<P: AsRef<Path>>(p: P) -> PathBuf {
 
     // Best-effort fallback
     p.to_path_buf()
+}
+
+// ============================================================================
+// SESSION DIRECTORY
+// ============================================================================
+
+/// Maximum number of session directories to retain.
+const MAX_SESSIONS: usize = 10;
+
+/// Global session directory path, set once at startup.
+static SESSION_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Initialize the session directory for this run.
+///
+/// Creates `.sessions/{YYYY-MM-DD_HHMMSS}/` (or `$SESSION_DIR/{timestamp}/` if overridden)
+/// and symlinks `positions.json` into it. Must be called once at startup before logging init.
+///
+/// Returns the absolute session directory path.
+pub fn init_session() -> PathBuf {
+    use chrono::Local;
+
+    let base = std::env::var("SESSION_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".sessions"));
+
+    let timestamp = Local::now().format("%Y-%m-%d_%H%M%S");
+    let session_dir = base.join(timestamp.to_string());
+    std::fs::create_dir_all(&session_dir).expect("Failed to create session directory");
+
+    // Get absolute path
+    let session_dir = session_dir.canonicalize().unwrap_or(session_dir);
+
+    // Symlink positions.json into session dir
+    let positions_src = resolve_workspace_file("positions.json");
+    let positions_link = session_dir.join("positions.json");
+    // Best-effort symlink - won't fail if positions.json doesn't exist yet
+    #[cfg(unix)]
+    {
+        let _ = std::os::unix::fs::symlink(&positions_src, &positions_link);
+    }
+
+    // Clean up old sessions
+    cleanup_old_dirs(&base, MAX_SESSIONS);
+
+    SESSION_DIR.set(session_dir.clone()).ok();
+    session_dir
+}
+
+/// Get the current session directory, if initialized.
+pub fn session_dir() -> Option<&'static PathBuf> {
+    SESSION_DIR.get()
+}
+
+/// Remove old directories, keeping only the most recent `keep_count`.
+fn cleanup_old_dirs(base: &Path, keep_count: usize) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+
+    let mut dirs: Vec<(PathBuf, std::time::SystemTime)> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            e.metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|t| (e.path(), t))
+        })
+        .collect();
+
+    dirs.sort_by(|a, b| b.1.cmp(&a.1));
+
+    for (path, _) in dirs.into_iter().skip(keep_count) {
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }
 

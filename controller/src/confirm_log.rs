@@ -56,14 +56,18 @@ pub struct ConfirmationLogger {
 }
 
 impl ConfirmationLogger {
-    /// Create a new logger with a timestamped filename in .confirmations/
+    /// Create a new logger that writes `confirmations.json` into the session directory.
+    ///
+    /// Falls back to `.confirmations/confirmations_{timestamp}.json` if no session dir exists.
     pub fn new() -> Result<Self> {
-        let dir = PathBuf::from(".confirmations");
-        std::fs::create_dir_all(&dir)?;
-
-        let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-        let filename = format!("confirmations_{}.json", timestamp);
-        let file_path = dir.join(&filename);
+        let file_path = if let Some(session) = crate::paths::session_dir() {
+            session.join("confirmations.json")
+        } else {
+            let dir = PathBuf::from(".confirmations");
+            std::fs::create_dir_all(&dir)?;
+            let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+            dir.join(format!("confirmations_{}.json", timestamp))
+        };
 
         let file = OpenOptions::new()
             .create(true)

@@ -373,42 +373,19 @@ fn parse_ws_platforms() -> Vec<WsPlatform> {
         .collect()
 }
 
-/// Maximum number of log files to retain in the logs directory
-const MAX_LOG_FILES: usize = 10;
-
 /// Initialize logging with both console and file output.
 ///
-/// Returns the log file path and a [`WorkerGuard`] that **must be kept alive** for the
-/// entire duration of the program. The guard ensures buffered logs are flushed on shutdown.
-/// Dropping the guard early will cause log loss.
+/// Writes `controller.log` into the session directory. Must be called after
+/// [`paths::init_session`].
 ///
-/// # Usage
-/// ```ignore
-/// let (log_path, _log_guard) = init_logging();
-/// // _log_guard lives until main() exits, ensuring all logs are flushed
-/// ```
-fn init_logging() -> (PathBuf, WorkerGuard) {
-    use chrono::Local;
-
-    // Create logs directory in project root (same level as Cargo.toml)
-    let logs_dir = PathBuf::from(".logs");
-    std::fs::create_dir_all(&logs_dir).expect("Failed to create logs directory");
-
-    // Generate timestamped filename: controller-2026-01-17-143052.log
-    let timestamp = Local::now().format("%Y-%m-%d-%H%M%S");
-    let log_filename = format!("controller-{}.log", timestamp);
-    let log_path = logs_dir.join(&log_filename);
-
-    // Get absolute path for logging (canonicalize requires file to exist, so we build it manually)
-    let absolute_log_path = std::env::current_dir()
-        .map(|cwd| cwd.join(&log_path))
-        .unwrap_or_else(|_| log_path.clone());
-
-    // Clean up old log files, keeping only the most recent MAX_LOG_FILES
-    cleanup_old_logs(&logs_dir, MAX_LOG_FILES);
+/// Returns the log file path and a [`WorkerGuard`] that **must be kept alive** for the
+/// entire duration of the program.
+fn init_logging(session_dir: &PathBuf) -> (PathBuf, WorkerGuard) {
+    let log_filename = "controller.log";
+    let absolute_log_path = session_dir.join(log_filename);
 
     // Create non-blocking file appender
-    let file_appender = tracing_appender::rolling::never(&logs_dir, &log_filename);
+    let file_appender = tracing_appender::rolling::never(session_dir, log_filename);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     // Build env filter
@@ -444,47 +421,28 @@ fn init_logging() -> (PathBuf, WorkerGuard) {
     (absolute_log_path, guard)
 }
 
-/// Remove old log files, keeping only the most recent `keep_count` files.
-fn cleanup_old_logs(logs_dir: &PathBuf, keep_count: usize) {
-    let Ok(entries) = std::fs::read_dir(logs_dir) else {
-        return;
-    };
-
-    // Collect log files with their modification times
-    let mut log_files: Vec<(PathBuf, std::time::SystemTime)> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "log")
-                .unwrap_or(false)
-        })
-        .filter_map(|e| {
-            e.metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .map(|t| (e.path(), t))
-        })
-        .collect();
-
-    // Sort by modification time (newest first)
-    log_files.sort_by(|a, b| b.1.cmp(&a.1));
-
-    // Remove files beyond keep_count
-    for (path, _) in log_files.into_iter().skip(keep_count) {
-        let _ = std::fs::remove_file(&path);
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize session directory (must happen before logging)
+    let session_dir = paths::init_session();
+
     // Initialize logging with both console and file output
     // The guard must be kept alive for the duration of the program to ensure logs are flushed
-    let (log_file_path, _log_guard) = init_logging();
+    let (log_file_path, _log_guard) = init_logging(&session_dir);
+    info!("📂 Session: {}", session_dir.display());
     info!("📝 Logging to: {}", log_file_path.display());
 
     // Load environment variables from `.env` (supports workspace-root `.env`)
     paths::load_dotenv();
+
+    // When CAPTURE_DIR is set, redirect captures into the session directory.
+    // This removes the need for capture.rs to create its own timestamped subdirectory.
+    if let Ok(capture_dir) = std::env::var("CAPTURE_DIR") {
+        if !capture_dir.is_empty() {
+            let captures_dir = session_dir.join("captures");
+            std::env::set_var("CAPTURE_DIR", &captures_dir);
+        }
+    }
 
     // Initialize HTTP capture session if CAPTURE_DIR is set
     // Must be done early, before any HTTP clients are created
