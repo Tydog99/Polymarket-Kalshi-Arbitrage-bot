@@ -51,6 +51,9 @@ pub struct PriceChangeItem {
     pub asset_id: String,
     pub price: Option<String>,
     pub side: Option<String>,
+    pub size: Option<String>,
+    pub best_bid: Option<String>,
+    pub best_ask: Option<String>,
 }
 
 #[derive(Serialize)]
