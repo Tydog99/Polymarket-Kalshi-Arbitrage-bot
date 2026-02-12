@@ -64,7 +64,7 @@ Parallel: Heartbeat Monitoring (main.rs, every 10s) - logs status, does NOT trig
 - **`polymarket.rs`** - Polymarket WebSocket client and Gamma API integration
 - **`polymarket_clob.rs`** - Polymarket CLOB execution with EIP-712 and HMAC-SHA256 signing
 - **`discovery.rs`** - Cross-platform market matching with persistent caching (2-hour TTL)
-- **`circuit_breaker.rs`** - Risk management: position limits, daily loss limits, error tracking, cooldown
+- **`circuit_breaker.rs`** - Risk management: position limits, daily loss limits, error tracking, cooldown, per-market blacklisting
 - **`position_tracker.rs`** - Fill recording, P&L calculation, state persistence to `positions.json`
 - **`cache.rs`** - Team code bidirectional mapping between platforms
 - **`config.rs`** - League definitions, API endpoints, platform configuration
@@ -218,7 +218,7 @@ dotenvx run -- cargo run --release
 - `ARB_THRESHOLD_CENTS` (default: 99, valid: 1-100) - arb exists when total cost ≤ threshold. Invalid values logged and replaced with default.
 - `ARB_MIN_CONTRACTS` (default: 1.0, must be > 0) - minimum executable contracts for valid arb. Invalid values logged and replaced with default.
 
-**Circuit breaker:** `CB_ENABLED`, `CB_MAX_POSITION_PER_MARKET`, `CB_MAX_TOTAL_POSITION`, `CB_MAX_DAILY_LOSS`, `CB_MAX_CONSECUTIVE_ERRORS`, `CB_COOLDOWN_SECS`, `CB_MIN_CONTRACTS` (minimum contracts to execute, trades are capped to remaining capacity)
+**Circuit breaker:** `CB_ENABLED`, `CB_MAX_POSITION_PER_MARKET`, `CB_MAX_TOTAL_POSITION`, `CB_MAX_DAILY_LOSS`, `CB_MAX_CONSECUTIVE_ERRORS`, `CB_COOLDOWN_SECS`, `CB_MIN_CONTRACTS` (minimum contracts to execute, trades are capped to remaining capacity), `CB_MARKET_BLACKLIST_THRESHOLD` (default: 3, consecutive mismatches before blacklisting a market), `CB_MARKET_BLACKLIST_SECS` (default: 300, blacklist duration)
 
 **HTTP Capture (for debugging/replay):**
 - `CAPTURE_DIR` - Base directory for HTTP capture (unset = disabled)

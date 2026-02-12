@@ -262,7 +262,7 @@ impl ConfirmationQueue {
             }
         };
 
-        // Get current prices from orderbook
+        // Get current prices and sizes from orderbook
         let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
         let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.load();
 
@@ -272,14 +272,6 @@ impl ConfirmationQueue {
             ArbType::KalshiYesPolyNo => kalshi_fee(arb.request.yes_price),
             ArbType::PolyOnly => 0,
             ArbType::KalshiOnly => kalshi_fee(arb.request.yes_price) + kalshi_fee(arb.request.no_price),
-        };
-
-        // Map current prices based on arb type (yes/no refer to which side we buy)
-        let (cur_yes, cur_no, cur_yes_size, cur_no_size) = match arb.request.arb_type {
-            ArbType::PolyYesKalshiNo => (p_yes, k_no, p_yes_size, k_no_size),
-            ArbType::KalshiYesPolyNo => (k_yes, p_no, k_yes_size, p_no_size),
-            ArbType::PolyOnly => (p_yes, p_no, p_yes_size, p_no_size),
-            ArbType::KalshiOnly => (k_yes, k_no, k_yes_size, k_no_size),
         };
 
         // Calculate current cost based on arb type
@@ -298,6 +290,14 @@ impl ConfirmationQueue {
                 let fee_no = kalshi_fee(k_no);
                 k_yes + fee_yes + k_no + fee_no
             }
+        };
+
+        // Map current prices/sizes based on arb type (yes/no = which side we buy)
+        let (cur_yes, cur_no, cur_yes_size, cur_no_size) = match arb.request.arb_type {
+            ArbType::PolyYesKalshiNo => (p_yes, k_no, p_yes_size, k_no_size),
+            ArbType::KalshiYesPolyNo => (k_yes, p_no, k_yes_size, p_no_size),
+            ArbType::PolyOnly => (p_yes, p_no, p_yes_size, p_no_size),
+            ArbType::KalshiOnly => (k_yes, k_no, k_yes_size, k_no_size),
         };
 
         Some(ValidationResult {
@@ -449,108 +449,152 @@ mod tests {
     }
 
     // =========================================================================
-    // validate_arb_detailed fresh price propagation tests
+    // ValidationResult current price tests
     // =========================================================================
 
-    fn make_queue_and_arb(arb_type: ArbType, detection_prices: (u16, u16, u16, u16))
-        -> (ConfirmationQueue, PendingArb)
-    {
-        use crate::arb::ArbConfig;
+    use crate::arb::ArbConfig;
 
-        let state = Arc::new(GlobalState::new(ArbConfig::default()));
+    /// Helper: create a GlobalState with one market, set orderbook prices, return ConfirmationQueue
+    fn setup_queue_with_prices(
+        k_yes: u16, k_no: u16, k_yes_size: u16, k_no_size: u16,
+        p_yes: u16, p_no: u16, p_yes_size: u16, p_no_size: u16,
+    ) -> (ConfirmationQueue, u16) {
+        let state = Arc::new(GlobalState::new(ArbConfig::new(99, 1.0)));
+        let pair = MarketPair {
+            pair_id: "test-pair".into(),
+            league: "nba".into(),
+            market_type: MarketType::Moneyline,
+            description: "Test Market".into(),
+            kalshi_event_ticker: "KXNBA-TEST".into(),
+            kalshi_market_ticker: "KXNBA-TEST-MKT".into(),
+            kalshi_event_slug: "test-event".into(),
+            poly_slug: "nba-test-2026-01-01".into(),
+            poly_yes_token: "0x1234".into(),
+            poly_no_token: "0x5678".into(),
+            line_value: None,
+            team_suffix: None,
+            neg_risk: false,
+        };
+        let market_id = state.add_pair(pair).unwrap();
+        let market = state.get_by_id(market_id).unwrap();
+        market.kalshi.store(k_yes, k_no, k_yes_size, k_no_size);
+        market.poly.store(p_yes, p_no, p_yes_size, p_no_size);
+
         let (tx, _rx) = mpsc::channel(1);
         let queue = ConfirmationQueue::new(state, tx);
+        (queue, market_id)
+    }
 
-        let (yes_price, no_price, yes_size, no_size) = detection_prices;
+    #[test]
+    fn test_validate_returns_current_prices_poly_yes_kalshi_no() {
+        // Detection: poly_yes=40, kalshi_no=50
+        // Current orderbook: poly_yes=42, kalshi_no=48
+        let (queue, market_id) = setup_queue_with_prices(
+            60, 48, 1000, 1000,  // kalshi: yes=60, no=48
+            42, 55, 800, 800,    // poly: yes=42, no=55
+        );
+
         let request = ArbOpportunity {
-            market_id: 1,
-            yes_price,
-            no_price,
-            yes_size,
-            no_size,
-            arb_type,
+            market_id,
+            yes_price: 40,  // stale poly_yes
+            no_price: 50,   // stale kalshi_no
+            yes_size: 500,
+            no_size: 500,
+            arb_type: ArbType::PolyYesKalshiNo,
             detected_ns: 0,
             is_test: false,
         };
-        let pending = PendingArb::new(request, test_market_pair());
-
-        (queue, pending)
-    }
-
-    #[test]
-    fn test_validate_returns_fresh_prices_poly_yes_kalshi_no() {
-        let (queue, arb) = make_queue_and_arb(
-            ArbType::PolyYesKalshiNo,
-            (30, 60, 300, 600), // stale detection prices
-        );
-
-        // Set fresh orderbook prices: Kalshi=(55,45,500,450) Poly=(28,72,280,720)
-        let market = queue.state.get_by_id(1).unwrap();
-        market.kalshi.store(55, 45, 500, 450);
-        market.poly.store(28, 72, 280, 720);
+        let arb = PendingArb::new(request, test_market_pair());
 
         let result = queue.validate_arb_detailed(&arb).unwrap();
+        assert!(result.is_valid);
         // PolyYesKalshiNo: yes=poly_yes, no=kalshi_no
-        assert_eq!(result.current_yes_price, 28, "YES should be Poly YES");
-        assert_eq!(result.current_no_price, 45, "NO should be Kalshi NO");
-        assert_eq!(result.current_yes_size, 280, "YES size should be Poly YES size");
-        assert_eq!(result.current_no_size, 450, "NO size should be Kalshi NO size");
+        assert_eq!(result.current_yes_price, 42);
+        assert_eq!(result.current_no_price, 48);
+        assert_eq!(result.current_yes_size, 800);
+        assert_eq!(result.current_no_size, 1000);
     }
 
     #[test]
-    fn test_validate_returns_fresh_prices_kalshi_yes_poly_no() {
-        let (queue, arb) = make_queue_and_arb(
-            ArbType::KalshiYesPolyNo,
-            (30, 60, 300, 600),
-        );
-
-        let market = queue.state.get_by_id(1).unwrap();
-        market.kalshi.store(55, 45, 500, 450);
-        market.poly.store(28, 72, 280, 720);
-
-        let result = queue.validate_arb_detailed(&arb).unwrap();
+    fn test_validate_returns_current_prices_kalshi_yes_poly_no() {
         // KalshiYesPolyNo: yes=kalshi_yes, no=poly_no
-        assert_eq!(result.current_yes_price, 55, "YES should be Kalshi YES");
-        assert_eq!(result.current_no_price, 72, "NO should be Poly NO");
-        assert_eq!(result.current_yes_size, 500, "YES size should be Kalshi YES size");
-        assert_eq!(result.current_no_size, 720, "NO size should be Poly NO size");
-    }
-
-    #[test]
-    fn test_validate_returns_fresh_prices_poly_only() {
-        let (queue, arb) = make_queue_and_arb(
-            ArbType::PolyOnly,
-            (30, 60, 300, 600),
+        let (queue, market_id) = setup_queue_with_prices(
+            46, 60, 900, 900,    // kalshi: yes=46
+            55, 45, 700, 1100,   // poly: no=45
         );
 
-        let market = queue.state.get_by_id(1).unwrap();
-        market.kalshi.store(55, 45, 500, 450);
-        market.poly.store(28, 72, 280, 720);
+        let request = ArbOpportunity {
+            market_id,
+            yes_price: 44,  // stale kalshi_yes
+            no_price: 43,   // stale poly_no
+            yes_size: 500,
+            no_size: 500,
+            arb_type: ArbType::KalshiYesPolyNo,
+            detected_ns: 0,
+            is_test: false,
+        };
+        let arb = PendingArb::new(request, test_market_pair());
 
         let result = queue.validate_arb_detailed(&arb).unwrap();
-        // PolyOnly: yes=poly_yes, no=poly_no
-        assert_eq!(result.current_yes_price, 28);
-        assert_eq!(result.current_no_price, 72);
-        assert_eq!(result.current_yes_size, 280);
-        assert_eq!(result.current_no_size, 720);
-    }
-
-    #[test]
-    fn test_validate_returns_fresh_prices_kalshi_only() {
-        let (queue, arb) = make_queue_and_arb(
-            ArbType::KalshiOnly,
-            (30, 60, 300, 600),
-        );
-
-        let market = queue.state.get_by_id(1).unwrap();
-        market.kalshi.store(55, 45, 500, 450);
-        market.poly.store(28, 72, 280, 720);
-
-        let result = queue.validate_arb_detailed(&arb).unwrap();
-        // KalshiOnly: yes=kalshi_yes, no=kalshi_no
-        assert_eq!(result.current_yes_price, 55);
+        assert!(result.is_valid);
+        // KalshiYesPolyNo: yes=kalshi_yes, no=poly_no
+        assert_eq!(result.current_yes_price, 46);
         assert_eq!(result.current_no_price, 45);
-        assert_eq!(result.current_yes_size, 500);
-        assert_eq!(result.current_no_size, 450);
+        assert_eq!(result.current_yes_size, 900);
+        assert_eq!(result.current_no_size, 1100);
+    }
+
+    #[test]
+    fn test_validate_invalid_when_prices_moved_too_much() {
+        // Prices moved so total cost >= 100
+        let (queue, market_id) = setup_queue_with_prices(
+            55, 60, 1000, 1000,  // kalshi
+            55, 60, 1000, 1000,  // poly
+        );
+
+        let request = ArbOpportunity {
+            market_id,
+            yes_price: 40,
+            no_price: 40,
+            yes_size: 500,
+            no_size: 500,
+            arb_type: ArbType::PolyYesKalshiNo, // yes=p_yes=55, no=k_no=60
+            detected_ns: 0,
+            is_test: false,
+        };
+        let arb = PendingArb::new(request, test_market_pair());
+
+        let result = queue.validate_arb_detailed(&arb).unwrap();
+        assert!(!result.is_valid);
+        // Prices should still be populated even when invalid
+        assert_eq!(result.current_yes_price, 55);
+        assert_eq!(result.current_no_price, 60);
+    }
+
+    #[test]
+    fn test_validate_test_arb_returns_original_prices() {
+        let (queue, market_id) = setup_queue_with_prices(
+            99, 99, 1000, 1000,
+            99, 99, 1000, 1000,
+        );
+
+        let request = ArbOpportunity {
+            market_id,
+            yes_price: 30,
+            no_price: 30,
+            yes_size: 400,
+            no_size: 600,
+            arb_type: ArbType::PolyYesKalshiNo,
+            detected_ns: 0,
+            is_test: true,
+        };
+        let arb = PendingArb::new(request, test_market_pair());
+
+        let result = queue.validate_arb_detailed(&arb).unwrap();
+        assert!(result.is_valid);
+        assert_eq!(result.current_yes_price, 30);
+        assert_eq!(result.current_no_price, 30);
+        assert_eq!(result.current_yes_size, 400);
+        assert_eq!(result.current_no_size, 600);
     }
 }

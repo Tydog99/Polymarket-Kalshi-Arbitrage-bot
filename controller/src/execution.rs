@@ -218,6 +218,36 @@ impl ExecutionEngine {
             });
         }
 
+        // Check if market is blacklisted due to repeated fill mismatches
+        if self.circuit_breaker.is_market_blacklisted(&pair.pair_id).await {
+            warn!(
+                "[EXEC] 🚫 BLACKLISTED: {} | repeated fill mismatches, skipping",
+                pair.description
+            );
+            self.release_in_flight(market_id);
+            self.release_event(&event_ticker);
+            return Ok(ExecutionResult {
+                market_id,
+                success: false,
+                profit_cents: 0,
+                latency_ns: self.clock.now_ns() - req.detected_ns,
+                error: Some("Market blacklisted"),
+            });
+        }
+
+        // Check if cooldown has elapsed (auto-resets global halt if expired)
+        if !self.circuit_breaker.check_cooldown().await {
+            self.release_in_flight(market_id);
+            self.release_event(&event_ticker);
+            return Ok(ExecutionResult {
+                market_id,
+                success: false,
+                profit_cents: 0,
+                latency_ns: self.clock.now_ns() - req.detected_ns,
+                error: Some("Circuit breaker cooldown"),
+            });
+        }
+
         // Check profit threshold
         if profit_cents < 1 {
             self.release_in_flight(market_id);
@@ -527,10 +557,14 @@ impl ExecutionEngine {
                     warn!("[EXEC] ⚠️ Fill mismatch: {}={} {}={} (excess={})",
                         leg1_name, yes_filled, leg2_name, no_filled, excess);
 
+                    // Record mismatch for market-specific blacklisting and consecutive error tracking
+                    self.circuit_breaker.record_mismatch(&pair.pair_id).await;
+
                     // Spawn auto-close in background (don't block hot path with 2s sleep)
                     let kalshi = self.kalshi.clone();
                     let poly_async = self.poly_async.clone();
                     let position_channel = self.position_channel.clone();
+                    let circuit_breaker = self.circuit_breaker.clone();
                     let position_id_clone = position_id.clone();
                     let description = pair.description.clone();
                     let arb_type = req.arb_type;
@@ -545,7 +579,8 @@ impl ExecutionEngine {
 
                     tokio::spawn(async move {
                         Self::auto_close_background(
-                            kalshi, poly_async, position_channel, position_id_clone, description,
+                            kalshi, poly_async, position_channel, circuit_breaker,
+                            position_id_clone, description,
                             arb_type, yes_filled, no_filled,
                             yes_price, no_price, poly_yes_token, poly_no_token,
                             kalshi_ticker, original_cost_per_contract
@@ -555,6 +590,8 @@ impl ExecutionEngine {
 
                 if success {
                     self.circuit_breaker.record_success(&pair.pair_id, matched, matched, actual_profit as f64 / 100.0).await;
+                    // Clear mismatch count on successful matched execution
+                    self.circuit_breaker.clear_market_mismatches(&pair.pair_id).await;
                 }
 
                 // Record fills for each leg individually (not just matched contracts)
@@ -884,6 +921,7 @@ impl ExecutionEngine {
         kalshi: Arc<KalshiApiClient>,
         poly_async: Arc<dyn PolyExecutor>,
         position_channel: PositionChannel,
+        circuit_breaker: Arc<CircuitBreaker>,
         position_id: Arc<str>,
         description: Arc<str>,
         arb_type: ArbType,
@@ -937,12 +975,15 @@ impl ExecutionEngine {
             ));
         };
 
-        // Helper to log final P&L after close attempts
-        let log_final_result = |platform: &str, total_closed: i64, total_proceeds: i64, remaining: i64| {
+        // Helper to log final P&L after close attempts and feed back to circuit breaker
+        let cb_for_pnl = circuit_breaker.clone();
+        let log_final_result = move |platform: &str, total_closed: i64, total_proceeds: i64, remaining: i64| {
             if total_closed > 0 {
                 let close_pnl = total_proceeds - (original_cost_per_contract * total_closed);
                 info!("[EXEC] ✅ Closed {} {} contracts for {}¢ (P&L: {}¢)",
                     total_closed, platform, total_proceeds, close_pnl);
+                // Feed auto-close P&L back to circuit breaker so daily loss limits work
+                cb_for_pnl.record_pnl(close_pnl as f64 / 100.0);
             }
             if remaining > 0 {
                 error!("[EXEC] ❌ Failed to close {} {} contracts - EXPOSURE REMAINS!", remaining, platform);
