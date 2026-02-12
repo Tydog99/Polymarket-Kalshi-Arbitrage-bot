@@ -2572,3 +2572,96 @@ mod kalshi_delta_bug_proof {
         // or incorrectly replaces the best (if best is NOT in the message).
     }
 }
+
+// ============================================================================
+// POLYMARKET SHADOW BOOK TESTS - Verifies PolyBook correctly tracks depth
+// and feeds the AtomicOrderbook cache, preventing phantom prices.
+// See: https://github.com/Tydog99/Polymarket-Kalshi-Arbitrage-bot/issues/57
+// ============================================================================
+
+mod poly_shadow_book_tests {
+    use arb_bot::types::*;
+
+    /// Helper: create a GlobalState with one market pair registered.
+    /// Returns (state, market_id).
+    fn setup_state() -> (GlobalState, u16) {
+        let state = GlobalState::default();
+        let pair = MarketPair {
+            pair_id: "test-poly-book".into(),
+            league: "nba".into(),
+            market_type: MarketType::Moneyline,
+            description: "Test Poly Shadow Book".into(),
+            kalshi_event_ticker: "KXNBAGAME-TEST".into(),
+            kalshi_market_ticker: "KXNBAGAME-TEST-YES".into(),
+            kalshi_event_slug: "test-event".into(),
+            poly_slug: "test-poly".into(),
+            poly_yes_token: "yes_token_poly_book".into(),
+            poly_no_token: "no_token_poly_book".into(),
+            line_value: None,
+            team_suffix: None,
+            neg_risk: false,
+        };
+        let id = state.add_pair(pair).expect("Should add pair");
+        // Set Kalshi side so arb detection has complete data
+        state.markets[id as usize].kalshi.store(50, 50, 1000, 1000);
+        (state, id)
+    }
+
+    /// Snapshot populates PolyBook and AtomicOrderbook with correct best ask.
+    #[test]
+    fn test_poly_snapshot_populates_book_and_cache() {
+        let (state, id) = setup_state();
+        let market = &state.markets[id as usize];
+
+        // Simulate snapshot: YES token asks at 45¢, 48¢, 52¢
+        {
+            let mut book = market.poly_book.lock();
+            book.set_yes_asks(&[(48, 2000), (45, 1500), (52, 3000)]);
+            let (price, size) = book.best_yes_ask().unwrap();
+            drop(book);
+            market.poly.update_yes(price, size);
+        }
+
+        let (yes_ask, _, yes_size, _) = market.poly.load();
+        assert_eq!(yes_ask, 45, "Best YES ask should be lowest: 45¢");
+        assert_eq!(yes_size, 1500, "Size should be from 45¢ level");
+    }
+
+    /// Snapshot resets book after price_change deltas were applied.
+    #[test]
+    fn test_poly_snapshot_resets_after_deltas() {
+        let (state, id) = setup_state();
+        let market = &state.markets[id as usize];
+
+        // Initial snapshot
+        {
+            let mut book = market.poly_book.lock();
+            book.set_yes_asks(&[(45, 1000)]);
+            let (p, s) = book.best_yes_ask().unwrap();
+            drop(book);
+            market.poly.update_yes(p, s);
+        }
+
+        // Delta: add level at 42¢
+        {
+            let mut book = market.poly_book.lock();
+            book.update_yes_level(42, 500);
+            let (p, s) = book.best_yes_ask().unwrap();
+            drop(book);
+            market.poly.update_yes(p, s);
+        }
+        assert_eq!(market.poly.load().0, 42, "Delta should have set best to 42¢");
+
+        // New snapshot with completely different levels — replaces everything
+        {
+            let mut book = market.poly_book.lock();
+            book.set_yes_asks(&[(60, 800), (65, 1200)]);
+            let (p, s) = book.best_yes_ask().unwrap();
+            drop(book);
+            market.poly.update_yes(p, s);
+        }
+        let (yes_ask, _, yes_size, _) = market.poly.load();
+        assert_eq!(yes_ask, 60, "Snapshot should fully replace: best=60¢");
+        assert_eq!(yes_size, 800, "Size from new snapshot's best level");
+    }
+}

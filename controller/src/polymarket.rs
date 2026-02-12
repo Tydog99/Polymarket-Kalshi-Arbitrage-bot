@@ -620,20 +620,14 @@ async fn process_book(
 ) {
     let token_hash = fxhash_str(&book.asset_id);
 
-    // Debug: log raw orderbook data
-    let asks_debug: Vec<(u16, u16)> = book.asks.iter()
+    // Parse all ask levels (keep full depth for PolyBook)
+    let ask_levels: Vec<(u16, u16)> = book.asks.iter()
         .filter_map(|l| {
             let price = parse_price(&l.price);
             let size = parse_size(&l.size);
             if price > 0 { Some((price, size)) } else { None }
         })
         .collect();
-
-    // Find best ask (lowest price)
-    let (best_ask, ask_size) = asks_debug.iter()
-        .min_by_key(|(p, _)| *p)
-        .copied()
-        .unwrap_or((0, 0));
 
     // A token can be YES for one market AND NO for another (e.g., esports where
     // Kalshi has separate markets for each team winning the same match).
@@ -649,10 +643,16 @@ async fn process_book(
             .map(|p| p.kalshi_market_ticker.to_string())
             .unwrap_or_else(|| format!("market_{}", market_id));
 
-        // Debug: log raw asks and computed best ask
+        // Populate PolyBook and derive best ask
+        let (best_ask, ask_size) = {
+            let mut pbook = market.poly_book.lock();
+            pbook.set_yes_asks(&ask_levels);
+            pbook.best_yes_ask().unwrap_or((0, 0))
+        };
+
         tracing::debug!(
             "[POLY-SNAP] {} | YES asks: {:?} | best_yes_ask: {}¢ size={}",
-            ticker, asks_debug, best_ask, ask_size
+            ticker, ask_levels, best_ask, ask_size
         );
 
         let now_ms = SystemTime::now()
@@ -689,10 +689,16 @@ async fn process_book(
             .map(|p| p.kalshi_market_ticker.to_string())
             .unwrap_or_else(|| format!("market_{}", market_id));
 
-        // Debug: log raw asks and computed best ask
+        // Populate PolyBook and derive best ask
+        let (best_ask, ask_size) = {
+            let mut pbook = market.poly_book.lock();
+            pbook.set_no_asks(&ask_levels);
+            pbook.best_no_ask().unwrap_or((0, 0))
+        };
+
         tracing::debug!(
             "[POLY-SNAP] {} | NO asks: {:?} | best_no_ask: {}¢ size={}",
-            ticker, asks_debug, best_ask, ask_size
+            ticker, ask_levels, best_ask, ask_size
         );
 
         let now_ms = SystemTime::now()
@@ -722,7 +728,6 @@ async fn process_book(
     }
 
     if !matched {
-        // Token not found in our lookup maps
         tracing::debug!(
             "[POLY] UNMATCHED token: asset={}...",
             &book.asset_id[..book.asset_id.len().min(20)]
