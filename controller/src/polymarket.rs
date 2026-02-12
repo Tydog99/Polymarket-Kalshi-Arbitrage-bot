@@ -51,6 +51,9 @@ pub struct PriceChangeItem {
     pub asset_id: String,
     pub price: Option<String>,
     pub side: Option<String>,
+    pub size: Option<String>,
+    pub best_bid: Option<String>,
+    pub best_ask: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -617,20 +620,14 @@ async fn process_book(
 ) {
     let token_hash = fxhash_str(&book.asset_id);
 
-    // Debug: log raw orderbook data
-    let asks_debug: Vec<(u16, u16)> = book.asks.iter()
+    // Parse all ask levels (keep full depth for PolyBook)
+    let ask_levels: Vec<(u16, u16)> = book.asks.iter()
         .filter_map(|l| {
             let price = parse_price(&l.price);
             let size = parse_size(&l.size);
             if price > 0 { Some((price, size)) } else { None }
         })
         .collect();
-
-    // Find best ask (lowest price)
-    let (best_ask, ask_size) = asks_debug.iter()
-        .min_by_key(|(p, _)| *p)
-        .copied()
-        .unwrap_or((0, 0));
 
     // A token can be YES for one market AND NO for another (e.g., esports where
     // Kalshi has separate markets for each team winning the same match).
@@ -646,10 +643,16 @@ async fn process_book(
             .map(|p| p.kalshi_market_ticker.to_string())
             .unwrap_or_else(|| format!("market_{}", market_id));
 
-        // Debug: log raw asks and computed best ask
+        // Populate PolyBook and derive best ask
+        let (best_ask, ask_size) = {
+            let mut pbook = market.poly_book.lock();
+            pbook.set_yes_asks(&ask_levels);
+            pbook.best_yes_ask().unwrap_or((0, 0))
+        };
+
         tracing::debug!(
             "[POLY-SNAP] {} | YES asks: {:?} | best_yes_ask: {}¢ size={}",
-            ticker, asks_debug, best_ask, ask_size
+            ticker, ask_levels, best_ask, ask_size
         );
 
         let now_ms = SystemTime::now()
@@ -686,10 +689,16 @@ async fn process_book(
             .map(|p| p.kalshi_market_ticker.to_string())
             .unwrap_or_else(|| format!("market_{}", market_id));
 
-        // Debug: log raw asks and computed best ask
+        // Populate PolyBook and derive best ask
+        let (best_ask, ask_size) = {
+            let mut pbook = market.poly_book.lock();
+            pbook.set_no_asks(&ask_levels);
+            pbook.best_no_ask().unwrap_or((0, 0))
+        };
+
         tracing::debug!(
             "[POLY-SNAP] {} | NO asks: {:?} | best_no_ask: {}¢ size={}",
-            ticker, asks_debug, best_ask, ask_size
+            ticker, ask_levels, best_ask, ask_size
         );
 
         let now_ms = SystemTime::now()
@@ -719,7 +728,6 @@ async fn process_book(
     }
 
     if !matched {
-        // Token not found in our lookup maps
         tracing::debug!(
             "[POLY] UNMATCHED token: asset={}...",
             &book.asset_id[..book.asset_id.len().min(20)]
@@ -738,38 +746,95 @@ async fn process_price_change(
     clock: &NanoClock,
     debug: Option<&DebugBroadcaster>,
 ) {
-    // Only process SELL (ask) side updates
-    // Polymarket uses "SELL" for asks and "BUY" for bids
-    if !matches!(change.side.as_deref(), Some("SELL" | "sell")) {
-        return;
-    }
-
     let Some(price_str) = &change.price else { return };
     let price = parse_price(price_str);
     if price == 0 { return; }
 
+    let is_sell = matches!(change.side.as_deref(), Some("SELL" | "sell"));
+
+    // Parse size (absolute replacement — 0 means remove level)
+    let size = change.size.as_deref()
+        .map(|s| parse_size(s))
+        .unwrap_or(0);
+
+    // For BUY side: only use best_ask for sanity checking, don't update book
+    if !is_sell {
+        if let Some(api_best_ask_str) = &change.best_ask {
+            let api_best_ask = parse_price(api_best_ask_str);
+            if api_best_ask > 0 {
+                let token_hash = fxhash_str(&change.asset_id);
+
+                // Check YES token
+                if let Some(market_id) = state.poly_yes_to_id.read().get(&token_hash).copied() {
+                    let (our_best, _, _, _) = state.markets[market_id as usize].poly.load();
+                    let ticker = state.markets[market_id as usize].pair()
+                        .map(|p| p.kalshi_market_ticker.to_string())
+                        .unwrap_or_else(|| format!("market_{}", market_id));
+                    if our_best > 0 && our_best != api_best_ask {
+                        tracing::warn!(
+                            "[POLY] book drift: computed best_yes_ask={}¢ but API says best_ask={}¢ for {}",
+                            our_best, api_best_ask, ticker
+                        );
+                    } else {
+                        tracing::debug!(
+                            "[POLY-BUY] {} | YES sanity OK: our={}¢ api={}¢",
+                            ticker, our_best, api_best_ask
+                        );
+                    }
+                }
+
+                // Check NO token
+                if let Some(market_id) = state.poly_no_to_id.read().get(&token_hash).copied() {
+                    let (_, our_best, _, _) = state.markets[market_id as usize].poly.load();
+                    let ticker = state.markets[market_id as usize].pair()
+                        .map(|p| p.kalshi_market_ticker.to_string())
+                        .unwrap_or_else(|| format!("market_{}", market_id));
+                    if our_best > 0 && our_best != api_best_ask {
+                        tracing::warn!(
+                            "[POLY] book drift: computed best_no_ask={}¢ but API says best_ask={}¢ for {}",
+                            our_best, api_best_ask, ticker
+                        );
+                    } else {
+                        tracing::debug!(
+                            "[POLY-BUY] {} | NO sanity OK: our={}¢ api={}¢",
+                            ticker, our_best, api_best_ask
+                        );
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // SELL side: apply to PolyBook and update AtomicOrderbook
     let token_hash = fxhash_str(&change.asset_id);
 
-    // A token can be YES for one market AND NO for another (e.g., esports where
-    // Kalshi has separate markets for each team winning the same match).
+    // A token can be YES for one market AND NO for another (e.g., esports).
     // We must check BOTH lookups, not return early.
 
     // Check YES token
     let yes_market_id = state.poly_yes_to_id.read().get(&token_hash).copied();
     if let Some(market_id) = yes_market_id {
         let market = &state.markets[market_id as usize];
-        let (current_yes, current_no, current_yes_size, _) = market.poly.load();
         let ticker = market.pair()
             .map(|p| p.kalshi_market_ticker.to_string())
             .unwrap_or_else(|| format!("market_{}", market_id));
+
+        let (prev_yes, _, _, _) = market.poly.load();
+
+        // Apply to PolyBook and derive best ask
+        let (best_ask, best_size) = {
+            let mut pbook = market.poly_book.lock();
+            pbook.update_yes_level(price, size);
+            pbook.best_yes_ask().unwrap_or((0, 0))
+        };
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
 
-        // Always update cached price to reflect current market state
-        market.poly.update_yes(price, current_yes_size);
+        market.poly.update_yes(best_ask, best_size);
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
         if let Some(dbg) = debug {
@@ -778,23 +843,31 @@ async fn process_price_change(
             }
         }
 
-        // Debug: log price change
         tracing::debug!(
-            "[POLY-DELTA] {} | YES: yes_ask={}¢ no_ask={}¢ (was yes={}¢ no={}¢)",
-            ticker, price, current_no, current_yes, current_no
+            "[POLY-DELTA] {} | YES: level {}¢ size={} → best_ask={}¢ (was {}¢)",
+            ticker, price, size, best_ask, prev_yes
         );
 
-        // Only check arbs when price improves (lower = better for buying)
-        if price < current_yes || current_yes == 0 {
-            if let Some(req) = ArbOpportunity::detect(
-                market_id,
-                market.kalshi.load(),
-                market.poly.load(),
-                state.arb_config(),
-                clock.now_ns(),
-            ) {
-                route_arb_to_channel(state, market_id, req, exec_tx, confirm_tx).await;
+        // Sanity check: compare our computed best_ask against API-reported best_ask
+        if let Some(api_best_str) = &change.best_ask {
+            let api_best = parse_price(api_best_str);
+            if api_best > 0 && best_ask > 0 && best_ask != api_best {
+                tracing::warn!(
+                    "[POLY] book drift: computed best_yes_ask={}¢ but API says best_ask={}¢ for {}",
+                    best_ask, api_best, ticker
+                );
             }
+        }
+
+        // Always check arbs (removed improvement-only filter)
+        if let Some(req) = ArbOpportunity::detect(
+            market_id,
+            market.kalshi.load(),
+            market.poly.load(),
+            state.arb_config(),
+            clock.now_ns(),
+        ) {
+            route_arb_to_channel(state, market_id, req, exec_tx, confirm_tx).await;
         }
     }
 
@@ -802,18 +875,25 @@ async fn process_price_change(
     let no_market_id = state.poly_no_to_id.read().get(&token_hash).copied();
     if let Some(market_id) = no_market_id {
         let market = &state.markets[market_id as usize];
-        let (current_yes, current_no, _, current_no_size) = market.poly.load();
         let ticker = market.pair()
             .map(|p| p.kalshi_market_ticker.to_string())
             .unwrap_or_else(|| format!("market_{}", market_id));
+
+        let (_, prev_no, _, _) = market.poly.load();
+
+        // Apply to PolyBook and derive best ask
+        let (best_ask, best_size) = {
+            let mut pbook = market.poly_book.lock();
+            pbook.update_no_level(price, size);
+            pbook.best_no_ask().unwrap_or((0, 0))
+        };
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
 
-        // Always update cached price to reflect current market state
-        market.poly.update_no(price, current_no_size);
+        market.poly.update_no(best_ask, best_size);
         market.mark_poly_update_unix_ms(now_ms);
         market.inc_poly_updates();
         if let Some(dbg) = debug {
@@ -822,23 +902,31 @@ async fn process_price_change(
             }
         }
 
-        // Debug: log price change
         tracing::debug!(
-            "[POLY-DELTA] {} | NO: yes_ask={}¢ no_ask={}¢ (was yes={}¢ no={}¢)",
-            ticker, current_yes, price, current_yes, current_no
+            "[POLY-DELTA] {} | NO: level {}¢ size={} → best_ask={}¢ (was {}¢)",
+            ticker, price, size, best_ask, prev_no
         );
 
-        // Only check arbs when price improves (lower = better for buying)
-        if price < current_no || current_no == 0 {
-            if let Some(req) = ArbOpportunity::detect(
-                market_id,
-                market.kalshi.load(),
-                market.poly.load(),
-                state.arb_config(),
-                clock.now_ns(),
-            ) {
-                route_arb_to_channel(state, market_id, req, exec_tx, confirm_tx).await;
+        // Sanity check
+        if let Some(api_best_str) = &change.best_ask {
+            let api_best = parse_price(api_best_str);
+            if api_best > 0 && best_ask > 0 && best_ask != api_best {
+                tracing::warn!(
+                    "[POLY] book drift: computed best_no_ask={}¢ but API says best_ask={}¢ for {}",
+                    best_ask, api_best, ticker
+                );
             }
+        }
+
+        // Always check arbs (removed improvement-only filter)
+        if let Some(req) = ArbOpportunity::detect(
+            market_id,
+            market.kalshi.load(),
+            market.poly.load(),
+            state.arb_config(),
+            clock.now_ns(),
+        ) {
+            route_arb_to_channel(state, market_id, req, exec_tx, confirm_tx).await;
         }
     }
 }
