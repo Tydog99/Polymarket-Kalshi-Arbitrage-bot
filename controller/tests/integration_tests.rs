@@ -2431,6 +2431,150 @@ mod startup_sweep_tests {
     }
 }
 
+// =============================================================================
+// Kalshi Delta Correctness Tests (Issue #54 fix verification)
+// =============================================================================
+
+mod kalshi_delta_correctness {
+    use arb_bot::types::{AtomicMarketState, ArbOpportunity};
+    use arb_bot::arb::ArbConfig;
+
+    /// Helper: simulate a snapshot by populating KalshiBook + AtomicOrderbook
+    fn apply_snapshot(market: &AtomicMarketState, yes_bids: &[Vec<i64>], no_bids: &[Vec<i64>]) {
+        let mut book = market.kalshi_book.lock();
+        book.set_yes_bids(yes_bids);
+        book.set_no_bids(no_bids);
+        let (no_ask, no_size) = book.derive_no_side();
+        let (yes_ask, yes_size) = book.derive_yes_side();
+        drop(book);
+        market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
+    }
+
+    /// Helper: simulate a delta by applying to KalshiBook + updating AtomicOrderbook
+    fn apply_delta(market: &AtomicMarketState, side: &str, price: i64, delta: i64) {
+        let mut book = market.kalshi_book.lock();
+        book.apply_delta(side, price, delta);
+        match side {
+            "yes" => {
+                let (no_ask, no_size) = book.derive_no_side();
+                drop(book);
+                market.kalshi.update_no(no_ask, no_size);
+            }
+            "no" => {
+                let (yes_ask, yes_size) = book.derive_yes_side();
+                drop(book);
+                market.kalshi.update_yes(yes_ask, yes_size);
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn test_cancel_at_best_bid_clears_price() {
+        let market = AtomicMarketState::new(0);
+        apply_snapshot(&market, &[vec![36, 23]], &[vec![60, 15]]);
+
+        let (_, no_ask, _, _) = market.kalshi.load();
+        assert_eq!(no_ask, 64);
+
+        apply_delta(&market, "yes", 36, -23);
+
+        let (_, no_ask, _, no_size) = market.kalshi.load();
+        assert_eq!(no_ask, 0, "NO ask should be 0 when all YES bids are gone");
+        assert_eq!(no_size, 0);
+    }
+
+    #[test]
+    fn test_cancel_best_reveals_next_best() {
+        let market = AtomicMarketState::new(0);
+        apply_snapshot(&market, &[vec![36, 23], vec![34, 10]], &[vec![60, 15]]);
+
+        let (_, no_ask, _, _) = market.kalshi.load();
+        assert_eq!(no_ask, 64);
+
+        apply_delta(&market, "yes", 36, -23);
+
+        let (_, no_ask, _, no_size) = market.kalshi.load();
+        assert_eq!(no_ask, 66, "NO ask should fall back to 100 - 34 = 66");
+        assert_eq!(no_size, 3); // 10 * 34 / 100 = 3
+    }
+
+    #[test]
+    fn test_no_phantom_arb_after_cancel() {
+        let market = AtomicMarketState::new(0);
+        let config = ArbConfig::default();
+
+        // YES bid at 36 with 2000 qty -> no_ask=64, no_size=720
+        // NO bid at 60 with 500 qty -> yes_ask=40, yes_size=300
+        apply_snapshot(&market, &[vec![36, 2000]], &[vec![60, 500]]);
+        // Poly YES at 30c -> PolyYesKalshiNo cost = 30 + 64 + fee(64)=2 = 96 <= 99
+        market.poly.store(30, 70, 500, 500);
+
+        let arb = ArbOpportunity::detect(0, market.kalshi.load(), market.poly.load(), &config, 0);
+        assert!(arb.is_some(), "Arb should exist before cancel");
+
+        // Cancel all YES bids at 36 -> no_ask drops to 0
+        apply_delta(&market, "yes", 36, -2000);
+
+        let arb = ArbOpportunity::detect(0, market.kalshi.load(), market.poly.load(), &config, 0);
+        assert!(arb.is_none(), "Phantom arb should NOT exist after bid cancellation");
+    }
+
+    #[test]
+    fn test_delta_adds_new_level() {
+        let market = AtomicMarketState::new(0);
+        apply_snapshot(&market, &[vec![36, 23]], &[vec![60, 15]]);
+
+        apply_delta(&market, "yes", 40, 10);
+
+        let (_, no_ask, _, _) = market.kalshi.load();
+        assert_eq!(no_ask, 60, "NO ask should update to 100 - 40 = 60");
+    }
+
+    #[test]
+    fn test_delta_partial_reduction() {
+        let market = AtomicMarketState::new(0);
+        apply_snapshot(&market, &[vec![36, 23]], &[vec![60, 15]]);
+
+        apply_delta(&market, "yes", 36, -10);
+
+        let (_, no_ask, _, no_size) = market.kalshi.load();
+        assert_eq!(no_ask, 64);
+        assert_eq!(no_size, 4); // 13 * 36 / 100 = 4
+    }
+
+    #[test]
+    fn test_non_best_level_delta_preserves_best() {
+        let market = AtomicMarketState::new(0);
+        apply_snapshot(&market, &[vec![36, 23], vec![34, 10]], &[vec![60, 15]]);
+
+        apply_delta(&market, "yes", 34, -5);
+
+        let (_, no_ask, _, no_size) = market.kalshi.load();
+        assert_eq!(no_ask, 64, "NO ask should still reflect best bid at 36");
+        assert_eq!(no_size, 8); // 23 * 36 / 100 = 8
+    }
+
+    #[test]
+    fn test_snapshot_resets_book() {
+        let market = AtomicMarketState::new(0);
+        apply_snapshot(&market, &[vec![36, 23], vec![34, 10]], &[vec![60, 15]]);
+
+        apply_delta(&market, "yes", 36, -23);
+        apply_delta(&market, "yes", 38, 50);
+
+        apply_snapshot(&market, &[vec![42, 30]], &[vec![55, 20]]);
+
+        let (yes_ask, no_ask, _, _) = market.kalshi.load();
+        assert_eq!(no_ask, 58); // 100 - 42
+        assert_eq!(yes_ask, 45); // 100 - 55
+
+        let book = market.kalshi_book.lock();
+        assert_eq!(book.yes_bid_count(), 1);
+        assert!(!book.has_yes_bid(38));
+    }
+}
+
 // ============================================================================
 // KALSHI DELTA BUG PROOF - Demonstrates that order cancellation at the best
 // bid level causes frozen (phantom) prices and sizes in the orderbook cache.

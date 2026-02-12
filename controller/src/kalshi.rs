@@ -25,7 +25,7 @@ use crate::config::{self, KALSHI_WS_URL, KALSHI_API_BASE, KALSHI_API_DELAY_MS};
 use crate::execution::NanoClock;
 use crate::types::{
     KalshiEventsResponse, KalshiMarketsResponse, KalshiEvent, KalshiMarket,
-    GlobalState, ArbOpportunity, PriceCents, SizeCents, fxhash_str,
+    GlobalState, ArbOpportunity, PriceCents, fxhash_str,
     MarketPair,
 };
 use crate::debug_socket::{DebugBroadcaster, build_market_update_json};
@@ -706,73 +706,39 @@ pub async fn run_ws(
 fn process_kalshi_snapshot(market: &crate::types::AtomicMarketState, body: &KalshiWsMsgBody) {
     let ticker = body.market_ticker.as_deref().unwrap_or("unknown");
 
-    // Debug: log raw orderbook data
-    if let Some(yes_bids) = &body.yes {
-        let best_yes_bid = yes_bids.iter()
-            .filter(|l| l.len() >= 2 && l[1] > 0)
-            .max_by_key(|l| l[0]);
+    // Populate KalshiBook from snapshot arrays
+    let mut book = market.kalshi_book.lock();
+
+    if let Some(levels) = &body.yes {
         tracing::debug!(
-            "[KALSHI-SNAP] {} | YES bids: {:?} | best_yes_bid: {:?}",
-            ticker, yes_bids, best_yes_bid
+            "[KALSHI-SNAP] {} | YES bids: {:?}",
+            ticker, levels
         );
-    }
-    if let Some(no_bids) = &body.no {
-        let best_no_bid = no_bids.iter()
-            .filter(|l| l.len() >= 2 && l[1] > 0)
-            .max_by_key(|l| l[0]);
-        tracing::debug!(
-            "[KALSHI-SNAP] {} | NO bids: {:?} | best_no_bid: {:?}",
-            ticker, no_bids, best_no_bid
-        );
+        book.set_yes_bids(levels);
+    } else {
+        book.set_yes_bids(&[]);
     }
 
-    // Find best YES bid (highest price) - this determines NO ask
-    let (no_ask, no_size) = body.yes.as_ref()
-        .and_then(|levels| {
-            levels.iter()
-                .filter_map(|l| {
-                    if l.len() >= 2 && l[1] > 0 {  // Has quantity
-                        Some((l[0], l[1]))  // (price, qty)
-                    } else {
-                        None
-                    }
-                })
-                .max_by_key(|(p, _)| *p)  // Highest bid
-                .map(|(price, qty)| {
-                    let ask = (100 - price) as PriceCents;  // To buy NO, pay 100 - YES_bid
-                    let size = (qty * price / 100) as SizeCents;
-                    (ask, size)
-                })
-        })
-        .unwrap_or((0, 0));
+    if let Some(levels) = &body.no {
+        tracing::debug!(
+            "[KALSHI-SNAP] {} | NO bids: {:?}",
+            ticker, levels
+        );
+        book.set_no_bids(levels);
+    } else {
+        book.set_no_bids(&[]);
+    }
 
-    // Find best NO bid (highest price) - this determines YES ask
-    let (yes_ask, yes_size) = body.no.as_ref()
-        .and_then(|levels| {
-            levels.iter()
-                .filter_map(|l| {
-                    if l.len() >= 2 && l[1] > 0 {
-                        Some((l[0], l[1]))
-                    } else {
-                        None
-                    }
-                })
-                .max_by_key(|(p, _)| *p)
-                .map(|(price, qty)| {
-                    let ask = (100 - price) as PriceCents;  // To buy YES, pay 100 - NO_bid
-                    let size = (qty * price / 100) as SizeCents;
-                    (ask, size)
-                })
-        })
-        .unwrap_or((0, 0));
+    // Derive AtomicOrderbook from book state
+    let (no_ask, no_size) = book.derive_no_side();
+    let (yes_ask, yes_size) = book.derive_yes_side();
+    drop(book);
 
-    // Debug: log computed prices
     tracing::debug!(
         "[KALSHI-SNAP] {} | COMPUTED: yes_ask={}¢ no_ask={}¢ yes_size={}¢ no_size={}¢",
         ticker, yes_ask, no_ask, yes_size, no_size
     );
 
-    // Store
     market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
     market.inc_kalshi_updates();
 }
@@ -783,69 +749,58 @@ fn process_kalshi_snapshot(market: &crate::types::AtomicMarketState, body: &Kals
 fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiWsMsgBody) {
     let ticker = body.market_ticker.as_deref().unwrap_or("unknown");
 
-    // For deltas, recompute from snapshot-like format
-    // Kalshi deltas have yes/no as arrays of [price, new_qty]
-    let (current_yes, current_no, current_yes_size, current_no_size) = market.kalshi.load();
+    // Delta messages use price/delta/side fields (NOT yes/no arrays)
+    let (price, delta, side) = match (&body.price, &body.delta, &body.side) {
+        (Some(p), Some(d), Some(s)) => (*p, *d, s.as_str()),
+        _ => {
+            tracing::warn!(
+                "[KALSHI-DELTA] {} | Malformed delta: missing price/delta/side fields",
+                ticker
+            );
+            return;
+        }
+    };
 
-    // Debug: log delta updates
-    if body.yes.is_some() || body.no.is_some() {
-        tracing::debug!(
-            "[KALSHI-DELTA] {} | YES delta: {:?} | NO delta: {:?} | current: yes={}¢ no={}¢",
-            ticker, body.yes, body.no, current_yes, current_no
+    // Validate price range (Kalshi prediction market prices are 1-99 cents)
+    if price < 1 || price > 99 {
+        tracing::warn!(
+            "[KALSHI-DELTA] {} | Out-of-range price: {} (expected 1-99), dropping delta",
+            ticker, price
         );
+        return;
     }
 
-    // Process YES bid updates (affects NO ask)
-    let (no_ask, no_size) = if let Some(levels) = &body.yes {
-        // Find best (highest) YES bid with non-zero quantity
-        levels.iter()
-            .filter_map(|l| {
-                if l.len() >= 2 && l[1] > 0 {
-                    Some((l[0], l[1]))
-                } else {
-                    None
-                }
-            })
-            .max_by_key(|(p, _)| *p)
-            .map(|(price, qty)| {
-                let ask = (100 - price) as PriceCents;
-                let size = (qty * price / 100) as SizeCents;
-                (ask, size)
-            })
-            .unwrap_or((current_no, current_no_size))
-    } else {
-        (current_no, current_no_size)
-    };
-
-    // Process NO bid updates (affects YES ask)
-    let (yes_ask, yes_size) = if let Some(levels) = &body.no {
-        levels.iter()
-            .filter_map(|l| {
-                if l.len() >= 2 && l[1] > 0 {
-                    Some((l[0], l[1]))
-                } else {
-                    None
-                }
-            })
-            .max_by_key(|(p, _)| *p)
-            .map(|(price, qty)| {
-                let ask = (100 - price) as PriceCents;
-                let size = (qty * price / 100) as SizeCents;
-                (ask, size)
-            })
-            .unwrap_or((current_yes, current_yes_size))
-    } else {
-        (current_yes, current_yes_size)
-    };
-
-    // Debug: log computed prices after delta
     tracing::debug!(
-        "[KALSHI-DELTA] {} | COMPUTED: yes_ask={}¢ no_ask={}¢ (was yes={}¢ no={}¢)",
-        ticker, yes_ask, no_ask, current_yes, current_no
+        "[KALSHI-DELTA] {} | side={} price={} delta={}",
+        ticker, side, price, delta
     );
 
-    market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
-    market.inc_kalshi_updates();
+    let mut book = market.kalshi_book.lock();
+    book.apply_delta(side, price, delta);
+
+    match side {
+        "yes" => {
+            // YES bid changed → recompute NO ask
+            let (no_ask, no_size) = book.derive_no_side();
+            drop(book);
+            market.kalshi.update_no(no_ask, no_size);
+            market.inc_kalshi_updates();
+        }
+        "no" => {
+            // NO bid changed → recompute YES ask
+            let (yes_ask, yes_size) = book.derive_yes_side();
+            drop(book);
+            market.kalshi.update_yes(yes_ask, yes_size);
+            market.inc_kalshi_updates();
+        }
+        _ => {
+            drop(book);
+            tracing::warn!(
+                "[KALSHI-DELTA] {} | Unknown side: {}",
+                ticker, side
+            );
+        }
+    }
 }
 
 /// Route a detected arbitrage opportunity to the appropriate channel.
