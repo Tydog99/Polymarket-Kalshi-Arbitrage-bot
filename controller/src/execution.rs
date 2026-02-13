@@ -300,38 +300,54 @@ impl ExecutionEngine {
 
         // Cost per contract in dollars = (yes_price + no_price) / 100
         let cost_per_contract = (req.yes_price as f64 + req.no_price as f64) / 100.0;
-        // Convert dollar capacity to contract capacity
-        let capacity_contracts = if cost_per_contract > 0.0 {
-            (capacity.effective / cost_per_contract).floor() as i64
-        } else {
-            i64::MAX
-        };
 
-        // Skip trade if insufficient capacity
-        if capacity_contracts < min_contracts {
-            warn!(
-                "[EXEC] ⛔ Insufficient capacity: {} | market={} | remaining=${:.2} (~{} contracts) | min={}",
-                pair.description, pair.pair_id, capacity.effective, capacity_contracts, min_contracts
-            );
-            self.release_in_flight(market_id);
-            self.release_event(&event_ticker);
-            return Ok(ExecutionResult {
-                market_id,
-                success: false,
-                profit_cents: 0,
-                latency_ns: self.clock.now_ns() - req.detected_ns,
-                error: Some("Insufficient capacity"),
-            });
-        }
+        // When CB is disabled, capacity.effective is f64::MAX — skip capping entirely
+        if capacity.effective < f64::MAX {
+            if cost_per_contract <= 0.0 {
+                error!(
+                    "[EXEC] Zero cost_per_contract (yes={}c, no={}c) - refusing trade for {}",
+                    req.yes_price, req.no_price, pair.description
+                );
+                self.release_in_flight(market_id);
+                self.release_event(&event_ticker);
+                return Ok(ExecutionResult {
+                    market_id,
+                    success: false,
+                    profit_cents: 0,
+                    latency_ns: self.clock.now_ns() - req.detected_ns,
+                    error: Some("Zero cost per contract"),
+                });
+            }
 
-        // Cap contracts to remaining dollar capacity if needed
-        if max_contracts > capacity_contracts {
-            info!(
-                "[EXEC] 📉 Capped: {} -> {} contracts | market={} | remaining=${:.2} (per_market=${:.2} total=${:.2})",
-                max_contracts, capacity_contracts, pair.description,
-                capacity.effective, capacity.per_market, capacity.total
-            );
-            max_contracts = capacity_contracts;
+            // Convert dollar capacity to contract capacity
+            let capacity_contracts = (capacity.effective / cost_per_contract).floor() as i64;
+
+            // Skip trade if insufficient capacity
+            if capacity_contracts < min_contracts {
+                warn!(
+                    "[EXEC] ⛔ Insufficient capacity: {} | market={} | remaining=${:.2} (~{} contracts) | min={}",
+                    pair.description, pair.pair_id, capacity.effective, capacity_contracts, min_contracts
+                );
+                self.release_in_flight(market_id);
+                self.release_event(&event_ticker);
+                return Ok(ExecutionResult {
+                    market_id,
+                    success: false,
+                    profit_cents: 0,
+                    latency_ns: self.clock.now_ns() - req.detected_ns,
+                    error: Some("Insufficient capacity"),
+                });
+            }
+
+            // Cap contracts to remaining dollar capacity if needed
+            if max_contracts > capacity_contracts {
+                info!(
+                    "[EXEC] 📉 Capped: {} -> {} contracts | market={} | remaining=${:.2} (per_market=${:.2} total=${:.2})",
+                    max_contracts, capacity_contracts, pair.description,
+                    capacity.effective, capacity.per_market, capacity.total
+                );
+                max_contracts = capacity_contracts;
+            }
         }
 
         // Re-check Polymarket $1 minimum after capacity capping

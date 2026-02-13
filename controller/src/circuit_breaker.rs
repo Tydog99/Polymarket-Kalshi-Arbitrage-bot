@@ -33,34 +33,41 @@ pub struct CircuitBreakerConfig {
     pub min_contracts: i64,
 }
 
+/// Parse a positive f64 from an env var, logging warnings for invalid values.
+fn parse_positive_f64_env(name: &str, default: f64) -> f64 {
+    match std::env::var(name) {
+        Ok(v) => match v.parse::<f64>() {
+            Ok(val) if val.is_finite() && val > 0.0 => val,
+            Ok(val) => {
+                warn!("[CB] {}={} is invalid (must be finite and > 0), using default ${:.2}", name, val, default);
+                default
+            }
+            Err(_) => {
+                warn!("[CB] {}='{}' is not a valid number, using default ${:.2}", name, v, default);
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
 impl CircuitBreakerConfig {
     pub fn from_env() -> Self {
         Self {
-            max_position_per_market: std::env::var("CB_MAX_POSITION_PER_MARKET")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(500.0),
+            max_position_per_market: parse_positive_f64_env("CB_MAX_POSITION_PER_MARKET", 500.0),
+            max_total_position: parse_positive_f64_env("CB_MAX_TOTAL_POSITION", 1000.0),
+            max_daily_loss: parse_positive_f64_env("CB_MAX_DAILY_LOSS", 500.0),
 
-            max_total_position: std::env::var("CB_MAX_TOTAL_POSITION")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1000.0),
-            
-            max_daily_loss: std::env::var("CB_MAX_DAILY_LOSS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(500.0),
-            
             max_consecutive_errors: std::env::var("CB_MAX_CONSECUTIVE_ERRORS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5),
-            
+
             cooldown_secs: std::env::var("CB_COOLDOWN_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300), // 5 minutes default
-            
+
             enabled: std::env::var("CB_ENABLED")
                 .map(|v| v == "1" || v == "true")
                 .unwrap_or(true), // Enabled by default for safety
@@ -118,19 +125,15 @@ pub struct RemainingCapacity {
 }
 
 /// Position tracking for a single market.
-/// All leg values are in dollars (cost basis = contracts × price).
+/// Tracks total dollar cost basis (contracts × price) across all legs.
 #[derive(Debug, Default)]
 pub struct MarketPosition {
-    pub kalshi_yes: f64,
-    pub kalshi_no: f64,
-    pub poly_yes: f64,
-    pub poly_no: f64,
+    pub total_cost: f64,
 }
 
-#[allow(dead_code)]
 impl MarketPosition {
     pub fn total_cost_basis(&self) -> f64 {
-        self.kalshi_yes + self.kalshi_no + self.poly_yes + self.poly_no
+        self.total_cost
     }
 }
 
@@ -329,7 +332,7 @@ impl CircuitBreaker {
         self.consecutive_errors.store(0, Ordering::SeqCst);
 
         // Update P&L
-        let pnl_cents = (pnl * 100.0) as i64;
+        let pnl_cents = (pnl * 100.0).round() as i64;
         self.daily_pnl_cents.fetch_add(pnl_cents, Ordering::SeqCst);
 
         // Update positions (store dollar cost basis)
@@ -337,8 +340,7 @@ impl CircuitBreaker {
         let poly_cost = poly_contracts as f64 * poly_price_cents as f64 / 100.0;
         let mut positions = self.positions.write().await;
         let pos = positions.entry(market_id.to_string()).or_default();
-        pos.kalshi_yes += kalshi_cost;
-        pos.poly_no += poly_cost;
+        pos.total_cost += kalshi_cost + poly_cost;
     }
     
     /// Record an error
@@ -422,7 +424,7 @@ impl CircuitBreaker {
 
     /// Record P&L update (for tracking without execution)
     pub fn record_pnl(&self, pnl: f64) {
-        let pnl_cents = (pnl * 100.0) as i64;
+        let pnl_cents = (pnl * 100.0).round() as i64;
         self.daily_pnl_cents.fetch_add(pnl_cents, Ordering::SeqCst);
     }
 
@@ -807,5 +809,133 @@ mod tests {
         cb.record_success("expensive_market", 10, 95, 10, 95, 0.0).await;
         let cap2 = cb.get_remaining_capacity("expensive_market").await;
         assert!(approx_eq(cap2.per_market, 31.0)); // 50 - 19
+    }
+
+    /// Test dollar-to-contract conversion logic (mirrors execution.rs capping)
+    #[tokio::test]
+    async fn test_dollar_to_contract_conversion() {
+        let config = CircuitBreakerConfig {
+            max_position_per_market: 15.0, // $15 limit
+            max_total_position: 100.0,
+            max_daily_loss: 100.0,
+            max_consecutive_errors: 3,
+            cooldown_secs: 60,
+            enabled: true,
+            min_contracts: 1,
+        };
+
+        let cb = CircuitBreaker::new(config);
+
+        // Simulate execution.rs capping logic:
+        // cost_per_contract = (yes_price + no_price) / 100.0
+        // capacity_contracts = (capacity.effective / cost_per_contract).floor() as i64
+
+        let capacity = cb.get_remaining_capacity("market1").await;
+        assert!(approx_eq(capacity.effective, 15.0));
+
+        // Case 1: yes=40c + no=60c → cost_per_contract = $1.00
+        // 15.0 / 1.0 = 15 contracts
+        let cost_per_contract = (40.0 + 60.0) / 100.0;
+        let capacity_contracts = (capacity.effective / cost_per_contract).floor() as i64;
+        assert_eq!(capacity_contracts, 15);
+
+        // Case 2: yes=3c + no=2c → cost_per_contract = $0.05
+        // 15.0 / 0.05 = 300 contracts
+        let cost_per_contract = (3.0 + 2.0) / 100.0;
+        let capacity_contracts = (capacity.effective / cost_per_contract).floor() as i64;
+        assert_eq!(capacity_contracts, 300);
+
+        // Case 3: yes=3c + no=4c → cost_per_contract = $0.07
+        // 15.0 / 0.07 = 214.28... → floor to 214
+        let cost_per_contract = (3.0 + 4.0) / 100.0;
+        let capacity_contracts = (capacity.effective / cost_per_contract).floor() as i64;
+        assert_eq!(capacity_contracts, 214);
+
+        // Case 4: After a trade, remaining capacity decreases
+        cb.record_success("market1", 10, 40, 10, 60, 0.0).await;
+        let capacity = cb.get_remaining_capacity("market1").await;
+        assert!(approx_eq(capacity.effective, 5.0)); // 15 - 10
+
+        let cost_per_contract = (40.0 + 60.0) / 100.0;
+        let capacity_contracts = (capacity.effective / cost_per_contract).floor() as i64;
+        assert_eq!(capacity_contracts, 5);
+    }
+
+    /// Test boundary prices: 1c (minimum) and 99c (maximum)
+    #[tokio::test]
+    async fn test_boundary_prices() {
+        let config = CircuitBreakerConfig {
+            max_position_per_market: 10.0,
+            max_total_position: 100.0,
+            max_daily_loss: 100.0,
+            max_consecutive_errors: 3,
+            cooldown_secs: 60,
+            enabled: true,
+            min_contracts: 1,
+        };
+
+        let cb = CircuitBreaker::new(config);
+
+        // 1c price: 100 contracts at 1c = $1.00 per leg
+        cb.record_success("cheap", 100, 1, 100, 1, 0.0).await;
+        let cap = cb.get_remaining_capacity("cheap").await;
+        assert!(approx_eq(cap.per_market, 8.0)); // 10 - 2
+
+        // 99c price: 1 contract at 99c = $0.99 per leg
+        cb.record_success("expensive", 1, 99, 1, 99, 0.0).await;
+        let cap = cb.get_remaining_capacity("expensive").await;
+        assert!(approx_eq(cap.per_market, 8.02)); // 10 - 1.98
+    }
+
+    /// Test that disabled CB skips capping (capacity.effective == f64::MAX)
+    #[tokio::test]
+    async fn test_disabled_cb_skips_capping() {
+        let config = CircuitBreakerConfig {
+            max_position_per_market: 100.0,
+            max_total_position: 500.0,
+            max_daily_loss: 100.0,
+            max_consecutive_errors: 3,
+            cooldown_secs: 60,
+            enabled: false,
+            min_contracts: 1,
+        };
+
+        let cb = CircuitBreaker::new(config);
+        let capacity = cb.get_remaining_capacity("market1").await;
+
+        // Verify that execution.rs should skip capping when capacity is f64::MAX
+        assert_eq!(capacity.effective, f64::MAX);
+
+        // This is the guard used in execution.rs:
+        // if capacity.effective < f64::MAX { ... do capping ... }
+        // When disabled, this block is skipped entirely, avoiding the
+        // f64::MAX / cost_per_contract → infinity → i64::MIN overflow.
+        assert!(!(capacity.effective < f64::MAX));
+    }
+
+    /// Test PnL rounding (not truncation)
+    #[tokio::test]
+    async fn test_pnl_rounding() {
+        let config = CircuitBreakerConfig {
+            max_position_per_market: 100.0,
+            max_total_position: 500.0,
+            max_daily_loss: 100.0,
+            max_consecutive_errors: 3,
+            cooldown_secs: 60,
+            enabled: true,
+            min_contracts: 1,
+        };
+
+        let cb = CircuitBreaker::new(config);
+
+        // -$0.009 should round to -1 cent, not truncate to 0
+        cb.record_pnl(-0.009);
+        let status = cb.status().await;
+        assert!(approx_eq(status.daily_pnl, -0.01));
+
+        // $0.005 should round to 1 cent (round half up)
+        cb.record_pnl(0.015);
+        let status = cb.status().await;
+        assert!(approx_eq(status.daily_pnl, 0.01)); // -0.01 + 0.02 = 0.01
     }
 }

@@ -119,39 +119,52 @@ impl HybridExecutor {
 
         // Cost per contract in dollars = (yes_price + no_price) / 100
         let cost_per_contract = (req.yes_price as f64 + req.no_price as f64) / 100.0;
-        let capacity_contracts = if cost_per_contract > 0.0 {
-            (capacity.effective / cost_per_contract).floor() as i64
-        } else {
-            i64::MAX
-        };
 
-        // Skip trade if insufficient capacity
-        if capacity_contracts < min_contracts {
-            warn!(
-                "[HYBRID] ⛔ Insufficient capacity: {} | remaining=${:.2} (~{} contracts) | min={}",
-                pair.description, capacity.effective, capacity_contracts, min_contracts
-            );
-            self.release_in_flight_delayed(market_id);
-            return Ok(());
-        }
+        // When CB is disabled, capacity.effective is f64::MAX — skip capping entirely
+        if capacity.effective < f64::MAX {
+            if cost_per_contract <= 0.0 {
+                error!(
+                    "[HYBRID] Zero cost_per_contract (yes={}c, no={}c) - refusing trade for {}",
+                    req.yes_price, req.no_price, pair.description
+                );
+                self.release_in_flight_delayed(market_id);
+                return Ok(());
+            }
 
-        // Cap contracts to remaining dollar capacity if needed
-        if max_contracts > capacity_contracts {
-            info!(
-                "[HYBRID] 📉 Capped: {} -> {} contracts | market={} | remaining=${:.2} (per_market=${:.2} total=${:.2})",
-                max_contracts, capacity_contracts, pair.description,
-                capacity.effective, capacity.per_market, capacity.total
-            );
-            max_contracts = capacity_contracts;
+            let capacity_contracts = (capacity.effective / cost_per_contract).floor() as i64;
+
+            // Skip trade if insufficient capacity
+            if capacity_contracts < min_contracts {
+                warn!(
+                    "[HYBRID] ⛔ Insufficient capacity: {} | remaining=${:.2} (~{} contracts) | min={}",
+                    pair.description, capacity.effective, capacity_contracts, min_contracts
+                );
+                self.release_in_flight_delayed(market_id);
+                return Ok(());
+            }
+
+            // Cap contracts to remaining dollar capacity if needed
+            if max_contracts > capacity_contracts {
+                info!(
+                    "[HYBRID] 📉 Capped: {} -> {} contracts | market={} | remaining=${:.2} (per_market=${:.2} total=${:.2})",
+                    max_contracts, capacity_contracts, pair.description,
+                    capacity.effective, capacity.per_market, capacity.total
+                );
+                max_contracts = capacity_contracts;
+            }
         }
 
         // Safety net: verify with can_execute (should always pass after capping)
         let trade_cost_basis = max_contracts as f64 * cost_per_contract;
-        if let Err(_reason) = self
+        if let Err(reason) = self
             .circuit_breaker
             .can_execute(&pair.pair_id, trade_cost_basis)
             .await
         {
+            warn!(
+                "[HYBRID] ⛔ Circuit breaker blocked (post-cap): {} | market={} | contracts={}",
+                reason, pair.description, max_contracts
+            );
             self.release_in_flight_delayed(market_id);
             return Ok(());
         }
@@ -224,6 +237,7 @@ impl HybridExecutor {
         }
 
         // Phase 2: Execute all legs (prefer remote, fallback to local)
+        let mut any_leg_failed = false;
         for (ws_platform, msg) in legs {
             if self.router.is_connected(ws_platform).await {
                 if !self.router.try_send(ws_platform, msg).await {
@@ -231,10 +245,24 @@ impl HybridExecutor {
                         "[HYBRID] Failed to send leg to remote {:?}; market_id={}",
                         ws_platform, market_id
                     );
+                    any_leg_failed = true;
                 }
             } else if let Err(e) = self.execute_local_leg(ws_platform, msg).await {
                 warn!("[HYBRID] Local execution failed: {}", e);
+                any_leg_failed = true;
             }
+        }
+
+        // Record estimated position so CB can track exposure from hybrid trades.
+        // This is optimistic (assumes fills match dispatch) since we don't get
+        // synchronous fill results back from the remote trader.
+        if !any_leg_failed {
+            self.circuit_breaker.record_success(
+                &pair.pair_id,
+                max_contracts, req.yes_price as i64,
+                max_contracts, req.no_price as i64,
+                0.0, // P&L unknown until fills are reconciled
+            ).await;
         }
 
         self.release_in_flight_delayed(market_id);
