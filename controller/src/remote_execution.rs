@@ -113,34 +113,43 @@ impl HybridExecutor {
             return Ok(());
         }
 
-        // Circuit breaker: get remaining capacity and cap if needed
+        // Circuit breaker: get remaining dollar capacity and cap if needed
         let capacity = self.circuit_breaker.get_remaining_capacity(&pair.pair_id).await;
         let min_contracts = self.circuit_breaker.min_contracts();
 
+        // Cost per contract in dollars = (yes_price + no_price) / 100
+        let cost_per_contract = (req.yes_price as f64 + req.no_price as f64) / 100.0;
+        let capacity_contracts = if cost_per_contract > 0.0 {
+            (capacity.effective / cost_per_contract).floor() as i64
+        } else {
+            i64::MAX
+        };
+
         // Skip trade if insufficient capacity
-        if capacity.effective < min_contracts {
+        if capacity_contracts < min_contracts {
             warn!(
-                "[HYBRID] ⛔ Insufficient capacity: {} | remaining={} | min={}",
-                pair.description, capacity.effective, min_contracts
+                "[HYBRID] ⛔ Insufficient capacity: {} | remaining=${:.2} (~{} contracts) | min={}",
+                pair.description, capacity.effective, capacity_contracts, min_contracts
             );
             self.release_in_flight_delayed(market_id);
             return Ok(());
         }
 
-        // Cap contracts to remaining capacity if needed
-        if max_contracts > capacity.effective {
+        // Cap contracts to remaining dollar capacity if needed
+        if max_contracts > capacity_contracts {
             info!(
-                "[HYBRID] 📉 Capped: {} -> {} contracts | market={} | per_market={} total={}",
-                max_contracts, capacity.effective, pair.description,
-                capacity.per_market, capacity.total
+                "[HYBRID] 📉 Capped: {} -> {} contracts | market={} | remaining=${:.2} (per_market=${:.2} total=${:.2})",
+                max_contracts, capacity_contracts, pair.description,
+                capacity.effective, capacity.per_market, capacity.total
             );
-            max_contracts = capacity.effective;
+            max_contracts = capacity_contracts;
         }
 
         // Safety net: verify with can_execute (should always pass after capping)
+        let trade_cost_basis = max_contracts as f64 * cost_per_contract;
         if let Err(_reason) = self
             .circuit_breaker
-            .can_execute(&pair.pair_id, max_contracts)
+            .can_execute(&pair.pair_id, trade_cost_basis)
             .await
         {
             self.release_in_flight_delayed(market_id);
@@ -500,8 +509,8 @@ mod tests {
 
     fn cb_disabled() -> Arc<CircuitBreaker> {
         Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
-            max_position_per_market: 1_000_000,
-            max_total_position: 1_000_000,
+            max_position_per_market: 1_000_000.0,
+            max_total_position: 1_000_000.0,
             max_daily_loss: 1_000_000.0,
             max_consecutive_errors: 999,
             cooldown_secs: 0,
