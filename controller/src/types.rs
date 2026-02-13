@@ -550,11 +550,11 @@ pub fn parse_size_millis(s: &str) -> PolySizeMillis {
         .unwrap_or(0)
 }
 
-/// Convert milli-cent price to whole cents (ceiling division).
-/// Ceil ensures ask prices aren't understated: 29m → 3¢, 979m → 98¢, 990m → 99¢.
+/// Convert milli-cent price to whole cents (rounded, matching API behavior).
+/// API does `(price * 100).round()`: 25m → 3¢, 24m → 2¢, 975m → 98¢, 990m → 99¢.
 #[inline(always)]
 pub fn millis_to_cents(millis: PolyPriceMillis) -> PriceCents {
-    ((millis + 9) / 10).min(99) as PriceCents
+    ((millis + 5) / 10).min(99) as PriceCents
 }
 
 /// Convert milli-dollar size to cents, clamped to u16::MAX.
@@ -2493,16 +2493,26 @@ mod tests {
 
     #[test]
     fn test_millis_to_cents() {
-        assert_eq!(millis_to_cents(990), 99); // exact cent
+        // Exact cents (multiples of 10) — unchanged by rounding
+        assert_eq!(millis_to_cents(990), 99);
+        assert_eq!(millis_to_cents(50), 5);
+        assert_eq!(millis_to_cents(10), 1);
+        assert_eq!(millis_to_cents(0), 0);
+        // Rounding: ≥5 remainder rounds up, <5 rounds down (matches API)
+        assert_eq!(millis_to_cents(25), 3); // 0.025 → 3¢ (rounds up at midpoint)
+        assert_eq!(millis_to_cents(24), 2); // 0.024 → 2¢ (rounds down)
+        assert_eq!(millis_to_cents(975), 98); // 0.975 → 98¢
+        assert_eq!(millis_to_cents(974), 97); // 0.974 → 97¢
         assert_eq!(millis_to_cents(999), 99); // 0.999 → 99¢ (capped)
-        assert_eq!(millis_to_cents(50), 5); // exact cent
-        assert_eq!(millis_to_cents(49), 5); // 0.049 → 5¢ (ceil)
-        assert_eq!(millis_to_cents(0), 0); // zero stays zero
-        assert_eq!(millis_to_cents(10), 1); // exact cent
-        assert_eq!(millis_to_cents(1), 1); // 0.001 → 1¢ (ceil)
-        // Regression: the drift bug cases
+        assert_eq!(millis_to_cents(1), 0); // 0.001 → 0¢ (rounds down)
+        assert_eq!(millis_to_cents(4), 0); // 0.004 → 0¢
+        assert_eq!(millis_to_cents(5), 1); // 0.005 → 1¢ (rounds up at midpoint)
+        // Regression: original drift bug (floor gave 2¢/97¢, API says 3¢/98¢)
         assert_eq!(millis_to_cents(29), 3); // 0.029 → 3¢
         assert_eq!(millis_to_cents(979), 98); // 0.979 → 98¢
+        // New drift case: ceil gave 3¢/99¢, API says 2¢/98¢
+        assert_eq!(millis_to_cents(21), 2); // 0.021 → 2¢
+        assert_eq!(millis_to_cents(984), 98); // 0.984 → 98¢
     }
 
     #[test]
