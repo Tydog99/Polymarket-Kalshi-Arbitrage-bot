@@ -2998,7 +2998,7 @@ mod poly_shadow_book_tests {
             drop(book);
             market.poly.update_no(millis_to_cents(best.0), millis_size_to_cents(best.1));
         }
-        // Before fix: NO ask would jump to 0 or 99 (lost depth). After fix: 97¢ from 0.978
-        assert_eq!(market.poly.load().1, 97, "Sub-cent level at 0.978 should still show as 97¢");
+        // Before fix: NO ask would jump to 0 or 99 (lost depth). After fix: 98¢ from 0.978 (ceil)
+        assert_eq!(market.poly.load().1, 98, "Sub-cent level at 0.978 should show as 98¢ (ceil)");
     }
 }

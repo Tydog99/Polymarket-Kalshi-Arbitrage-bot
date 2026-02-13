@@ -550,11 +550,11 @@ pub fn parse_size_millis(s: &str) -> PolySizeMillis {
         .unwrap_or(0)
 }
 
-/// Convert milli-cent price to whole cents (floor division).
-/// 999 → 99, 990 → 99, 49 → 4, 0 → 0
+/// Convert milli-cent price to whole cents (ceiling division).
+/// Ceil ensures ask prices aren't understated: 29m → 3¢, 979m → 98¢, 990m → 99¢.
 #[inline(always)]
 pub fn millis_to_cents(millis: PolyPriceMillis) -> PriceCents {
-    (millis / 10).min(99) as PriceCents
+    ((millis + 9) / 10).min(99) as PriceCents
 }
 
 /// Convert milli-dollar size to cents, clamped to u16::MAX.
@@ -2493,13 +2493,16 @@ mod tests {
 
     #[test]
     fn test_millis_to_cents() {
-        assert_eq!(millis_to_cents(990), 99);
-        assert_eq!(millis_to_cents(999), 99);
-        assert_eq!(millis_to_cents(50), 5);
-        assert_eq!(millis_to_cents(49), 4);
-        assert_eq!(millis_to_cents(0), 0);
-        assert_eq!(millis_to_cents(10), 1);
-        assert_eq!(millis_to_cents(1), 0);
+        assert_eq!(millis_to_cents(990), 99); // exact cent
+        assert_eq!(millis_to_cents(999), 99); // 0.999 → 99¢ (capped)
+        assert_eq!(millis_to_cents(50), 5); // exact cent
+        assert_eq!(millis_to_cents(49), 5); // 0.049 → 5¢ (ceil)
+        assert_eq!(millis_to_cents(0), 0); // zero stays zero
+        assert_eq!(millis_to_cents(10), 1); // exact cent
+        assert_eq!(millis_to_cents(1), 1); // 0.001 → 1¢ (ceil)
+        // Regression: the drift bug cases
+        assert_eq!(millis_to_cents(29), 3); // 0.029 → 3¢
+        assert_eq!(millis_to_cents(979), 98); // 0.979 → 98¢
     }
 
     #[test]
