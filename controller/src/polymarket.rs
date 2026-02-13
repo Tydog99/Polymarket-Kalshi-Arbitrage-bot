@@ -17,7 +17,8 @@ use crate::config::{self, POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS, GAMMA_API_
 use crate::execution::NanoClock;
 use crate::types::{
     GlobalState, ArbOpportunity, MarketPair, PriceCents, SizeCents,
-    parse_price, fxhash_str,
+    parse_price, parse_price_millis, parse_size_millis, millis_to_cents, millis_size_to_cents,
+    fxhash_str,
 };
 use crate::debug_socket::{DebugBroadcaster, build_market_update_json};
 
@@ -621,10 +622,10 @@ async fn process_book(
     let token_hash = fxhash_str(&book.asset_id);
 
     // Parse all ask levels (keep full depth for PolyBook)
-    let ask_levels: Vec<(u16, u16)> = book.asks.iter()
+    let ask_levels: Vec<(u32, u32)> = book.asks.iter()
         .filter_map(|l| {
-            let price = parse_price(&l.price);
-            let size = parse_size(&l.size);
+            let price = parse_price_millis(&l.price);
+            let size = parse_size_millis(&l.size);
             if price > 0 { Some((price, size)) } else { None }
         })
         .collect();
@@ -644,15 +645,17 @@ async fn process_book(
             .unwrap_or_else(|| format!("market_{}", market_id));
 
         // Populate PolyBook and derive best ask
-        let (best_ask, ask_size) = {
+        let (best_millis, size_millis) = {
             let mut pbook = market.poly_book.lock();
             pbook.set_yes_asks(&ask_levels);
             pbook.best_yes_ask().unwrap_or((0, 0))
         };
+        let best_ask = millis_to_cents(best_millis);
+        let ask_size = millis_size_to_cents(size_millis);
 
         tracing::debug!(
-            "[POLY-SNAP] {} | YES asks: {:?} | best_yes_ask: {}¢ size={}",
-            ticker, ask_levels, best_ask, ask_size
+            "[POLY-SNAP] {} | YES asks: {} levels | best_yes_ask: {}m ({}¢) size={}",
+            ticker, ask_levels.len(), best_millis, best_ask, ask_size
         );
 
         let now_ms = SystemTime::now()
@@ -690,15 +693,17 @@ async fn process_book(
             .unwrap_or_else(|| format!("market_{}", market_id));
 
         // Populate PolyBook and derive best ask
-        let (best_ask, ask_size) = {
+        let (best_millis, size_millis) = {
             let mut pbook = market.poly_book.lock();
             pbook.set_no_asks(&ask_levels);
             pbook.best_no_ask().unwrap_or((0, 0))
         };
+        let best_ask = millis_to_cents(best_millis);
+        let ask_size = millis_size_to_cents(size_millis);
 
         tracing::debug!(
-            "[POLY-SNAP] {} | NO asks: {:?} | best_no_ask: {}¢ size={}",
-            ticker, ask_levels, best_ask, ask_size
+            "[POLY-SNAP] {} | NO asks: {} levels | best_no_ask: {}m ({}¢) size={}",
+            ticker, ask_levels.len(), best_millis, best_ask, ask_size
         );
 
         let now_ms = SystemTime::now()
@@ -747,14 +752,14 @@ async fn process_price_change(
     debug: Option<&DebugBroadcaster>,
 ) {
     let Some(price_str) = &change.price else { return };
-    let price = parse_price(price_str);
-    if price == 0 { return; }
+    let price_millis = parse_price_millis(price_str);
+    if price_millis == 0 { return; }
 
     let is_sell = matches!(change.side.as_deref(), Some("SELL" | "sell"));
 
-    // Parse size (absolute replacement — 0 means remove level)
-    let size = change.size.as_deref()
-        .map(|s| parse_size(s))
+    // Parse size in millis (absolute replacement — 0 means remove level)
+    let size_millis = change.size.as_deref()
+        .map(|s| parse_size_millis(s))
         .unwrap_or(0);
 
     // For BUY side: only use best_ask for sanity checking, don't update book
@@ -823,11 +828,13 @@ async fn process_price_change(
         let (prev_yes, _, _, _) = market.poly.load();
 
         // Apply to PolyBook and derive best ask
-        let (best_ask, best_size) = {
+        let (best_millis, size_millis_best) = {
             let mut pbook = market.poly_book.lock();
-            pbook.update_yes_level(price, size);
+            pbook.update_yes_level(price_millis, size_millis);
             pbook.best_yes_ask().unwrap_or((0, 0))
         };
+        let best_ask = millis_to_cents(best_millis);
+        let best_size = millis_size_to_cents(size_millis_best);
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -844,8 +851,8 @@ async fn process_price_change(
         }
 
         tracing::debug!(
-            "[POLY-DELTA] {} | YES: level {}¢ size={} → best_ask={}¢ (was {}¢)",
-            ticker, price, size, best_ask, prev_yes
+            "[POLY-DELTA] {} | YES: level {}m size={} → best_ask={}m ({}¢) (was {}¢)",
+            ticker, price_millis, size_millis, best_millis, best_ask, prev_yes
         );
 
         // Sanity check: compare our computed best_ask against API-reported best_ask
@@ -882,11 +889,13 @@ async fn process_price_change(
         let (_, prev_no, _, _) = market.poly.load();
 
         // Apply to PolyBook and derive best ask
-        let (best_ask, best_size) = {
+        let (best_millis, size_millis_best) = {
             let mut pbook = market.poly_book.lock();
-            pbook.update_no_level(price, size);
+            pbook.update_no_level(price_millis, size_millis);
             pbook.best_no_ask().unwrap_or((0, 0))
         };
+        let best_ask = millis_to_cents(best_millis);
+        let best_size = millis_size_to_cents(size_millis_best);
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -903,8 +912,8 @@ async fn process_price_change(
         }
 
         tracing::debug!(
-            "[POLY-DELTA] {} | NO: level {}¢ size={} → best_ask={}¢ (was {}¢)",
-            ticker, price, size, best_ask, prev_no
+            "[POLY-DELTA] {} | NO: level {}m size={} → best_ask={}m ({}¢) (was {}¢)",
+            ticker, price_millis, size_millis, best_millis, best_ask, prev_no
         );
 
         // Sanity check
