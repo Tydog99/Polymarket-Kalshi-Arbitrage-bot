@@ -2725,7 +2725,6 @@ mod kalshi_delta_bug_proof {
 
 mod poly_shadow_book_tests {
     use arb_bot::types::*;
-    use arb_bot::types::{millis_to_cents, millis_size_to_cents};
     use arb_bot::arb::ArbConfig;
 
     /// Helper: create a GlobalState with one market pair registered.
@@ -2759,13 +2758,13 @@ mod poly_shadow_book_tests {
         let (state, id) = setup_state();
         let market = &state.markets[id as usize];
 
-        // Simulate snapshot: YES token asks at 45¢, 48¢, 52¢ (in milli-cents)
+        // Simulate snapshot: YES token asks at 45¢, 48¢, 52¢
         {
             let mut book = market.poly_book.lock();
-            book.set_yes_asks(&[(480, 20000), (450, 15000), (520, 30000)]);
-            let (p_millis, s_millis) = book.best_yes_ask().unwrap();
+            book.set_yes_asks(&[(48, 2000), (45, 1500), (52, 3000)]);
+            let (price, size) = book.best_yes_ask().unwrap();
             drop(book);
-            market.poly.update_yes(millis_to_cents(p_millis), millis_size_to_cents(s_millis));
+            market.poly.update_yes(price, size);
         }
 
         let (yes_ask, _, yes_size, _) = market.poly.load();
@@ -2782,29 +2781,29 @@ mod poly_shadow_book_tests {
         // Initial snapshot
         {
             let mut book = market.poly_book.lock();
-            book.set_yes_asks(&[(450, 10000)]);
-            let (p_millis, s_millis) = book.best_yes_ask().unwrap();
+            book.set_yes_asks(&[(45, 1000)]);
+            let (p, s) = book.best_yes_ask().unwrap();
             drop(book);
-            market.poly.update_yes(millis_to_cents(p_millis), millis_size_to_cents(s_millis));
+            market.poly.update_yes(p, s);
         }
 
         // Delta: add level at 42¢
         {
             let mut book = market.poly_book.lock();
-            book.update_yes_level(420, 5000);
-            let (p_millis, s_millis) = book.best_yes_ask().unwrap();
+            book.update_yes_level(42, 500);
+            let (p, s) = book.best_yes_ask().unwrap();
             drop(book);
-            market.poly.update_yes(millis_to_cents(p_millis), millis_size_to_cents(s_millis));
+            market.poly.update_yes(p, s);
         }
         assert_eq!(market.poly.load().0, 42, "Delta should have set best to 42¢");
 
         // New snapshot with completely different levels — replaces everything
         {
             let mut book = market.poly_book.lock();
-            book.set_yes_asks(&[(600, 8000), (650, 12000)]);
-            let (p_millis, s_millis) = book.best_yes_ask().unwrap();
+            book.set_yes_asks(&[(60, 800), (65, 1200)]);
+            let (p, s) = book.best_yes_ask().unwrap();
             drop(book);
-            market.poly.update_yes(millis_to_cents(p_millis), millis_size_to_cents(s_millis));
+            market.poly.update_yes(p, s);
         }
         let (yes_ask, _, yes_size, _) = market.poly.load();
         assert_eq!(yes_ask, 60, "Snapshot should fully replace: best=60¢");
@@ -2820,19 +2819,19 @@ mod poly_shadow_book_tests {
         // Initial snapshot: YES ask at 50¢
         {
             let mut book = market.poly_book.lock();
-            book.set_yes_asks(&[(500, 10000)]);
-            let (p_millis, s_millis) = book.best_yes_ask().unwrap();
+            book.set_yes_asks(&[(50, 1000)]);
+            let (p, s) = book.best_yes_ask().unwrap();
             drop(book);
-            market.poly.update_yes(millis_to_cents(p_millis), millis_size_to_cents(s_millis));
+            market.poly.update_yes(p, s);
         }
 
         // price_change: new SELL level at 48¢ with size 500
         {
             let mut book = market.poly_book.lock();
-            book.update_yes_level(480, 5000);
-            let (p_millis, s_millis) = book.best_yes_ask().unwrap();
+            book.update_yes_level(48, 500);
+            let (p, s) = book.best_yes_ask().unwrap();
             drop(book);
-            market.poly.update_yes(millis_to_cents(p_millis), millis_size_to_cents(s_millis));
+            market.poly.update_yes(p, s);
         }
 
         let (yes_ask, _, yes_size, _) = market.poly.load();
@@ -2849,20 +2848,20 @@ mod poly_shadow_book_tests {
         // Snapshot: YES ask at 45¢ with size 1000
         {
             let mut book = market.poly_book.lock();
-            book.set_yes_asks(&[(450, 10000)]);
-            let (p_millis, s_millis) = book.best_yes_ask().unwrap();
+            book.set_yes_asks(&[(45, 1000)]);
+            let (p, s) = book.best_yes_ask().unwrap();
             drop(book);
-            market.poly.update_yes(millis_to_cents(p_millis), millis_size_to_cents(s_millis));
+            market.poly.update_yes(p, s);
         }
         assert_eq!(market.poly.load().2, 1000);
 
         // price_change: same price 45¢ but size updated to 2500
         {
             let mut book = market.poly_book.lock();
-            book.update_yes_level(450, 25000);
-            let (p_millis, s_millis) = book.best_yes_ask().unwrap();
+            book.update_yes_level(45, 2500);
+            let (p, s) = book.best_yes_ask().unwrap();
             drop(book);
-            market.poly.update_yes(millis_to_cents(p_millis), millis_size_to_cents(s_millis));
+            market.poly.update_yes(p, s);
         }
 
         let (yes_ask, _, yes_size, _) = market.poly.load();
@@ -2879,20 +2878,20 @@ mod poly_shadow_book_tests {
         // Snapshot: asks at 45¢ and 50¢
         {
             let mut book = market.poly_book.lock();
-            book.set_yes_asks(&[(450, 10000), (500, 20000)]);
-            let (p_millis, s_millis) = book.best_yes_ask().unwrap();
+            book.set_yes_asks(&[(45, 1000), (50, 2000)]);
+            let (p, s) = book.best_yes_ask().unwrap();
             drop(book);
-            market.poly.update_yes(millis_to_cents(p_millis), millis_size_to_cents(s_millis));
+            market.poly.update_yes(p, s);
         }
         assert_eq!(market.poly.load().0, 45);
 
         // price_change: remove 45¢ level (size=0)
         {
             let mut book = market.poly_book.lock();
-            book.update_yes_level(450, 0);
+            book.update_yes_level(45, 0);
             let best = book.best_yes_ask().unwrap_or((0, 0));
             drop(book);
-            market.poly.update_yes(millis_to_cents(best.0), millis_size_to_cents(best.1));
+            market.poly.update_yes(best.0, best.1);
         }
 
         let (yes_ask, _, yes_size, _) = market.poly.load();
@@ -2914,13 +2913,13 @@ mod poly_shadow_book_tests {
         // PolyYesKalshiNo cost = 45 + 50 + kalshi_fee(50) = 45 + 50 + 2 = 97 < 99 → arb exists
         {
             let mut book = market.poly_book.lock();
-            book.set_yes_asks(&[(450, 10000)]);
-            book.set_no_asks(&[(550, 10000)]);
+            book.set_yes_asks(&[(45, 1000)]);
+            book.set_no_asks(&[(55, 1000)]);
             let (p, s) = book.best_yes_ask().unwrap();
             let (np, ns) = book.best_no_ask().unwrap();
             drop(book);
-            market.poly.update_yes(millis_to_cents(p), millis_size_to_cents(s));
-            market.poly.update_no(millis_to_cents(np), millis_size_to_cents(ns));
+            market.poly.update_yes(p, s);
+            market.poly.update_no(np, ns);
         }
 
         let arb = ArbOpportunity::detect(
@@ -2931,10 +2930,10 @@ mod poly_shadow_book_tests {
         // Now remove the 45¢ level — no other levels exist
         {
             let mut book = market.poly_book.lock();
-            book.update_yes_level(450, 0);
+            book.update_yes_level(45, 0);
             let best = book.best_yes_ask().unwrap_or((0, 0));
             drop(book);
-            market.poly.update_yes(millis_to_cents(best.0), millis_size_to_cents(best.1));
+            market.poly.update_yes(best.0, best.1);
         }
 
         let arb = ArbOpportunity::detect(
@@ -2952,53 +2951,24 @@ mod poly_shadow_book_tests {
         // Snapshot with two levels
         {
             let mut book = market.poly_book.lock();
-            book.set_yes_asks(&[(450, 10000), (500, 20000)]);
-            let (p_millis, s_millis) = book.best_yes_ask().unwrap();
+            book.set_yes_asks(&[(45, 1000), (50, 2000)]);
+            let (p, s) = book.best_yes_ask().unwrap();
             drop(book);
-            market.poly.update_yes(millis_to_cents(p_millis), millis_size_to_cents(s_millis));
+            market.poly.update_yes(p, s);
         }
 
         // Remove both levels
         {
             let mut book = market.poly_book.lock();
-            book.update_yes_level(450, 0);
-            book.update_yes_level(500, 0);
+            book.update_yes_level(45, 0);
+            book.update_yes_level(50, 0);
             let best = book.best_yes_ask().unwrap_or((0, 0));
             drop(book);
-            market.poly.update_yes(millis_to_cents(best.0), millis_size_to_cents(best.1));
+            market.poly.update_yes(best.0, best.1);
         }
 
         let (yes_ask, _, yes_size, _) = market.poly.load();
         assert_eq!(yes_ask, 0, "Empty book → price 0");
         assert_eq!(yes_size, 0, "Empty book → size 0");
-    }
-
-    /// Regression: sub-cent prices that previously collided at same cent value.
-    /// API sends 0.999, 0.998, 0.99 — all mapped to 99¢ before fix.
-    #[test]
-    fn test_poly_subcent_no_collision() {
-        let (state, id) = setup_state();
-        let market = &state.markets[id as usize];
-
-        // Snapshot with sub-cent prices near 97¢
-        {
-            let mut book = market.poly_book.lock();
-            book.set_no_asks(&[(970, 10000), (978, 5000), (979, 12900)]);
-            let (p, s) = book.best_no_ask().unwrap();
-            drop(book);
-            market.poly.update_no(millis_to_cents(p), millis_size_to_cents(s));
-        }
-        assert_eq!(market.poly.load().1, 97); // 970 millis → 97¢
-
-        // Remove 0.97 level — 0.978 should become best (not empty!)
-        {
-            let mut book = market.poly_book.lock();
-            book.update_no_level(970, 0);
-            let best = book.best_no_ask().unwrap_or((0, 0));
-            drop(book);
-            market.poly.update_no(millis_to_cents(best.0), millis_size_to_cents(best.1));
-        }
-        // Before fix: NO ask would jump to 0 or 99 (lost depth). After fix: 97¢ from 0.978
-        assert_eq!(market.poly.load().1, 97, "Sub-cent level at 0.978 should still show as 97¢");
     }
 }

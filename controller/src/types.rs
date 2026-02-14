@@ -76,12 +76,6 @@ pub type PriceCents = u16;
 /// Size representation in cents (dollar amount × 100), maximum ~$655k per side
 pub type SizeCents = u16;
 
-/// Price in milli-cents for Polymarket sub-cent precision (1 unit = $0.001). Range: 0–999.
-pub type PolyPriceMillis = u32;
-
-/// Size in milli-dollars for Polymarket (1 unit = $0.001). Handles large sizes like 260323.77.
-pub type PolySizeMillis = u32;
-
 /// Maximum number of concurrently tracked markets
 pub const MAX_MARKETS: usize = 1024;
 
@@ -313,15 +307,12 @@ impl KalshiBook {
 /// Maintains full ask-side depth for YES and NO tokens so the true best ask
 /// is always derivable — even after the current best is removed.
 ///
-/// Uses milli-cent precision (u32 keys, 1 unit = $0.001) to avoid collisions
-/// when Polymarket sends sub-cent prices like 0.999 and 0.998.
-///
 /// Polymarket sends asks directly (unlike Kalshi bids). Deltas use absolute
 /// replacement (`qty = new_size`), not incremental (`qty += delta`).
 /// `size = 0` means remove the level.
 pub struct PolyBook {
-    yes_asks: BTreeMap<PolyPriceMillis, PolySizeMillis>,
-    no_asks: BTreeMap<PolyPriceMillis, PolySizeMillis>,
+    yes_asks: BTreeMap<u16, u16>,
+    no_asks: BTreeMap<u16, u16>,
 }
 
 impl PolyBook {
@@ -334,7 +325,7 @@ impl PolyBook {
 
     /// Replace all YES ask levels from a book snapshot.
     /// Clears existing state first — snapshots are full replacements.
-    pub fn set_yes_asks(&mut self, levels: &[(PolyPriceMillis, PolySizeMillis)]) {
+    pub fn set_yes_asks(&mut self, levels: &[(u16, u16)]) {
         self.yes_asks.clear();
         for &(price, size) in levels {
             if price > 0 && size > 0 {
@@ -344,7 +335,7 @@ impl PolyBook {
     }
 
     /// Replace all NO ask levels from a book snapshot.
-    pub fn set_no_asks(&mut self, levels: &[(PolyPriceMillis, PolySizeMillis)]) {
+    pub fn set_no_asks(&mut self, levels: &[(u16, u16)]) {
         self.no_asks.clear();
         for &(price, size) in levels {
             if price > 0 && size > 0 {
@@ -355,7 +346,7 @@ impl PolyBook {
 
     /// Apply a YES ask level update (absolute replacement).
     /// size = 0 removes the level.
-    pub fn update_yes_level(&mut self, price: PolyPriceMillis, size: PolySizeMillis) {
+    pub fn update_yes_level(&mut self, price: u16, size: u16) {
         if size == 0 {
             self.yes_asks.remove(&price);
         } else {
@@ -364,7 +355,7 @@ impl PolyBook {
     }
 
     /// Apply a NO ask level update (absolute replacement).
-    pub fn update_no_level(&mut self, price: PolyPriceMillis, size: PolySizeMillis) {
+    pub fn update_no_level(&mut self, price: u16, size: u16) {
         if size == 0 {
             self.no_asks.remove(&price);
         } else {
@@ -372,14 +363,14 @@ impl PolyBook {
         }
     }
 
-    /// Best YES ask: lowest price in the book (milli-cent precision).
+    /// Best YES ask: lowest price in the book.
     /// BTreeMap is ascending, so `iter().next()` is the lowest key.
-    pub fn best_yes_ask(&self) -> Option<(PolyPriceMillis, PolySizeMillis)> {
+    pub fn best_yes_ask(&self) -> Option<(u16, u16)> {
         self.yes_asks.iter().next().map(|(&p, &s)| (p, s))
     }
 
-    /// Best NO ask: lowest price in the book (milli-cent precision).
-    pub fn best_no_ask(&self) -> Option<(PolyPriceMillis, PolySizeMillis)> {
+    /// Best NO ask: lowest price in the book.
+    pub fn best_no_ask(&self) -> Option<(u16, u16)> {
         self.no_asks.iter().next().map(|(&p, &s)| (p, s))
     }
 
@@ -523,45 +514,6 @@ pub fn parse_price(s: &str) -> PriceCents {
     s.parse::<f64>()
         .map(price_to_cents)
         .unwrap_or(0)
-}
-
-/// Parse Polymarket price string to milli-cents (1 unit = $0.001).
-/// "0.999" → 999, "0.99" → 990, "0.05" → 50, "0.5" → 500
-/// Returns 0 if parsing fails or price >= 1.0.
-#[inline(always)]
-pub fn parse_price_millis(s: &str) -> PolyPriceMillis {
-    let val: f64 = match s.parse() {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
-    if val <= 0.0 || val >= 1.0 {
-        return 0;
-    }
-    (val * 1000.0).round() as PolyPriceMillis
-}
-
-/// Parse Polymarket size string to milli-dollars (1 unit = $0.001).
-/// "260323.77" → 260_323_770, "100" → 100_000
-/// Returns 0 if parsing fails.
-#[inline(always)]
-pub fn parse_size_millis(s: &str) -> PolySizeMillis {
-    s.parse::<f64>()
-        .map(|size| (size * 1000.0).round() as PolySizeMillis)
-        .unwrap_or(0)
-}
-
-/// Convert milli-cent price to whole cents (floor division).
-/// 999 → 99, 990 → 99, 49 → 4, 0 → 0
-#[inline(always)]
-pub fn millis_to_cents(millis: PolyPriceMillis) -> PriceCents {
-    (millis / 10).min(99) as PriceCents
-}
-
-/// Convert milli-dollar size to cents, clamped to u16::MAX.
-/// 100_000 → 10_000, 700_000 → 65_535
-#[inline(always)]
-pub fn millis_size_to_cents(millis: PolySizeMillis) -> SizeCents {
-    (millis / 10).min(u16::MAX as u32) as SizeCents
 }
 
 /// Arbitrage opportunity type, determining the execution strategy
@@ -2437,81 +2389,7 @@ mod tests {
     }
 
     // =========================================================================
-    // =========================================================================
-    // Milli-cent Parse Tests
-    // =========================================================================
-
-    #[test]
-    fn test_parse_price_millis_two_decimals() {
-        assert_eq!(parse_price_millis("0.99"), 990);
-        assert_eq!(parse_price_millis("0.05"), 50);
-        assert_eq!(parse_price_millis("0.50"), 500);
-        assert_eq!(parse_price_millis("0.01"), 10);
-    }
-
-    #[test]
-    fn test_parse_price_millis_three_decimals() {
-        assert_eq!(parse_price_millis("0.999"), 999);
-        assert_eq!(parse_price_millis("0.998"), 998);
-        assert_eq!(parse_price_millis("0.001"), 1);
-        assert_eq!(parse_price_millis("0.049"), 49);
-        assert_eq!(parse_price_millis("0.988"), 988);
-    }
-
-    #[test]
-    fn test_parse_price_millis_one_decimal() {
-        assert_eq!(parse_price_millis("0.5"), 500);
-        assert_eq!(parse_price_millis("0.1"), 100);
-        assert_eq!(parse_price_millis("0.9"), 900);
-    }
-
-    #[test]
-    fn test_parse_price_millis_invalid() {
-        assert_eq!(parse_price_millis(""), 0);
-        assert_eq!(parse_price_millis("abc"), 0);
-        assert_eq!(parse_price_millis("1.5"), 0);
-    }
-
-    #[test]
-    fn test_parse_size_millis_integer() {
-        assert_eq!(parse_size_millis("100"), 100_000);
-        assert_eq!(parse_size_millis("1"), 1_000);
-    }
-
-    #[test]
-    fn test_parse_size_millis_fractional() {
-        assert_eq!(parse_size_millis("123.45"), 123_450);
-        assert_eq!(parse_size_millis("260323.77"), 260_323_770);
-        assert_eq!(parse_size_millis("0.5"), 500);
-    }
-
-    #[test]
-    fn test_parse_size_millis_invalid() {
-        assert_eq!(parse_size_millis(""), 0);
-        assert_eq!(parse_size_millis("abc"), 0);
-    }
-
-    #[test]
-    fn test_millis_to_cents() {
-        assert_eq!(millis_to_cents(990), 99);
-        assert_eq!(millis_to_cents(999), 99);
-        assert_eq!(millis_to_cents(50), 5);
-        assert_eq!(millis_to_cents(49), 4);
-        assert_eq!(millis_to_cents(0), 0);
-        assert_eq!(millis_to_cents(10), 1);
-        assert_eq!(millis_to_cents(1), 0);
-    }
-
-    #[test]
-    fn test_millis_size_to_cents() {
-        assert_eq!(millis_size_to_cents(100_000), 10_000);
-        assert_eq!(millis_size_to_cents(123_450), 12_345);
-        assert_eq!(millis_size_to_cents(700_000), 65_535);
-        assert_eq!(millis_size_to_cents(0), 0);
-    }
-
-    // =========================================================================
-    // PolyBook Tests - Shadow orderbook for Polymarket (milli-cent precision)
+    // PolyBook Tests - Shadow orderbook for Polymarket
     // =========================================================================
 
     #[test]
@@ -2524,101 +2402,76 @@ mod tests {
     #[test]
     fn test_poly_book_set_and_best_ask() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(470, 20000), (450, 15000), (500, 30000)]);
-        assert_eq!(book.best_yes_ask(), Some((450, 15000)));
+        book.set_yes_asks(&[(47, 2000), (45, 1500), (50, 3000)]);
+        assert_eq!(book.best_yes_ask(), Some((45, 1500)));
     }
 
     #[test]
     fn test_poly_book_update_level_insert() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(500, 10000)]);
-        book.update_yes_level(480, 5000);
-        assert_eq!(book.best_yes_ask(), Some((480, 5000)));
+        book.set_yes_asks(&[(50, 1000)]);
+        book.update_yes_level(48, 500);
+        assert_eq!(book.best_yes_ask(), Some((48, 500)));
     }
 
     #[test]
     fn test_poly_book_update_level_replace() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(450, 10000)]);
-        book.update_yes_level(450, 20000);
-        assert_eq!(book.best_yes_ask(), Some((450, 20000)));
+        book.set_yes_asks(&[(45, 1000)]);
+        book.update_yes_level(45, 2000);
+        assert_eq!(book.best_yes_ask(), Some((45, 2000)));
     }
 
     #[test]
     fn test_poly_book_update_level_remove() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(450, 10000), (500, 20000)]);
-        book.update_yes_level(450, 0);
-        assert_eq!(book.best_yes_ask(), Some((500, 20000)));
+        book.set_yes_asks(&[(45, 1000), (50, 2000)]);
+        book.update_yes_level(45, 0);
+        assert_eq!(book.best_yes_ask(), Some((50, 2000)));
     }
 
     #[test]
     fn test_poly_book_remove_best_reveals_next() {
         let mut book = PolyBook::new();
-        book.set_no_asks(&[(420, 5000), (450, 10000), (480, 15000)]);
-        assert_eq!(book.best_no_ask(), Some((420, 5000)));
-        book.update_no_level(420, 0);
-        assert_eq!(book.best_no_ask(), Some((450, 10000)));
+        book.set_no_asks(&[(42, 500), (45, 1000), (48, 1500)]);
+        assert_eq!(book.best_no_ask(), Some((42, 500)));
+        book.update_no_level(42, 0);
+        assert_eq!(book.best_no_ask(), Some((45, 1000)));
     }
 
     #[test]
     fn test_poly_book_remove_last_level() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(500, 10000)]);
-        book.update_yes_level(500, 0);
+        book.set_yes_asks(&[(50, 1000)]);
+        book.update_yes_level(50, 0);
         assert_eq!(book.best_yes_ask(), None);
     }
 
     #[test]
     fn test_poly_book_snapshot_replaces_all() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(450, 10000), (500, 20000)]);
-        book.set_yes_asks(&[(600, 5000), (650, 8000)]);
-        assert_eq!(book.best_yes_ask(), Some((600, 5000)));
-        book.update_yes_level(450, 0);
-        assert_eq!(book.best_yes_ask(), Some((600, 5000)));
+        book.set_yes_asks(&[(45, 1000), (50, 2000)]);
+        book.set_yes_asks(&[(60, 500), (65, 800)]);
+        assert_eq!(book.best_yes_ask(), Some((60, 500)));
+        book.update_yes_level(45, 0);
+        assert_eq!(book.best_yes_ask(), Some((60, 500)));
     }
 
     #[test]
     fn test_poly_book_skips_zero_price_and_size() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(0, 10000), (450, 0), (500, 20000)]);
-        assert_eq!(book.best_yes_ask(), Some((500, 20000)));
+        book.set_yes_asks(&[(0, 1000), (45, 0), (50, 2000)]);
+        assert_eq!(book.best_yes_ask(), Some((50, 2000)));
     }
 
     #[test]
     fn test_poly_book_clear() {
         let mut book = PolyBook::new();
-        book.set_yes_asks(&[(450, 10000)]);
-        book.set_no_asks(&[(550, 20000)]);
+        book.set_yes_asks(&[(45, 1000)]);
+        book.set_no_asks(&[(55, 2000)]);
         book.clear();
         assert_eq!(book.best_yes_ask(), None);
         assert_eq!(book.best_no_ask(), None);
-    }
-
-    #[test]
-    fn test_poly_book_subcent_prices_are_unique() {
-        let mut book = PolyBook::new();
-        book.set_yes_asks(&[(999, 100000), (998, 55000), (990, 92075)]);
-        assert_eq!(book.best_yes_ask(), Some((990, 92075)));
-    }
-
-    #[test]
-    fn test_poly_book_remove_subcent_preserves_others() {
-        let mut book = PolyBook::new();
-        book.set_no_asks(&[(970, 10000), (978, 5000), (979, 12900)]);
-        assert_eq!(book.best_no_ask(), Some((970, 10000)));
-        book.update_no_level(970, 0);
-        assert_eq!(book.best_no_ask(), Some((978, 5000)));
-    }
-
-    #[test]
-    fn test_poly_book_subcent_delta_does_not_affect_neighbors() {
-        let mut book = PolyBook::new();
-        book.set_yes_asks(&[(50, 8500), (49, 2000)]);
-        assert_eq!(book.best_yes_ask(), Some((49, 2000)));
-        book.update_yes_level(49, 0);
-        assert_eq!(book.best_yes_ask(), Some((50, 8500)));
     }
 }
 
