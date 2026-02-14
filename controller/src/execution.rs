@@ -294,35 +294,60 @@ impl ExecutionEngine {
             });
         }
 
-        // Circuit breaker: get remaining capacity and cap if needed
+        // Circuit breaker: get remaining dollar capacity and cap if needed
         let capacity = self.circuit_breaker.get_remaining_capacity(&pair.pair_id).await;
         let min_contracts = self.circuit_breaker.min_contracts();
 
-        // Skip trade if insufficient capacity
-        if capacity.effective < min_contracts {
-            warn!(
-                "[EXEC] ⛔ Insufficient capacity: {} | market={} | remaining={} | min={}",
-                pair.description, pair.pair_id, capacity.effective, min_contracts
-            );
-            self.release_in_flight(market_id);
-            self.release_event(&event_ticker);
-            return Ok(ExecutionResult {
-                market_id,
-                success: false,
-                profit_cents: 0,
-                latency_ns: self.clock.now_ns() - req.detected_ns,
-                error: Some("Insufficient capacity"),
-            });
-        }
+        // Cost per contract in dollars = (yes_price + no_price) / 100
+        let cost_per_contract = (req.yes_price as f64 + req.no_price as f64) / 100.0;
 
-        // Cap contracts to remaining capacity if needed
-        if max_contracts > capacity.effective {
-            info!(
-                "[EXEC] 📉 Capped: {} -> {} contracts | market={} | per_market={} total={}",
-                max_contracts, capacity.effective, pair.description,
-                capacity.per_market, capacity.total
-            );
-            max_contracts = capacity.effective;
+        // When CB is disabled, capacity.effective is f64::MAX — skip capping entirely
+        if capacity.effective < f64::MAX {
+            if cost_per_contract <= 0.0 {
+                error!(
+                    "[EXEC] Zero cost_per_contract (yes={}c, no={}c) - refusing trade for {}",
+                    req.yes_price, req.no_price, pair.description
+                );
+                self.release_in_flight(market_id);
+                self.release_event(&event_ticker);
+                return Ok(ExecutionResult {
+                    market_id,
+                    success: false,
+                    profit_cents: 0,
+                    latency_ns: self.clock.now_ns() - req.detected_ns,
+                    error: Some("Zero cost per contract"),
+                });
+            }
+
+            // Convert dollar capacity to contract capacity
+            let capacity_contracts = (capacity.effective / cost_per_contract).floor() as i64;
+
+            // Skip trade if insufficient capacity
+            if capacity_contracts < min_contracts {
+                warn!(
+                    "[EXEC] ⛔ Insufficient capacity: {} | market={} | remaining=${:.2} (~{} contracts) | min={}",
+                    pair.description, pair.pair_id, capacity.effective, capacity_contracts, min_contracts
+                );
+                self.release_in_flight(market_id);
+                self.release_event(&event_ticker);
+                return Ok(ExecutionResult {
+                    market_id,
+                    success: false,
+                    profit_cents: 0,
+                    latency_ns: self.clock.now_ns() - req.detected_ns,
+                    error: Some("Insufficient capacity"),
+                });
+            }
+
+            // Cap contracts to remaining dollar capacity if needed
+            if max_contracts > capacity_contracts {
+                info!(
+                    "[EXEC] 📉 Capped: {} -> {} contracts | market={} | remaining=${:.2} (per_market=${:.2} total=${:.2})",
+                    max_contracts, capacity_contracts, pair.description,
+                    capacity.effective, capacity.per_market, capacity.total
+                );
+                max_contracts = capacity_contracts;
+            }
         }
 
         // Re-check Polymarket $1 minimum after capacity capping
@@ -355,7 +380,8 @@ impl ExecutionEngine {
         }
 
         // Safety net: verify with can_execute (should always pass after capping)
-        if let Err(reason) = self.circuit_breaker.can_execute(&pair.pair_id, max_contracts).await {
+        let trade_cost_basis = max_contracts as f64 * cost_per_contract;
+        if let Err(reason) = self.circuit_breaker.can_execute(&pair.pair_id, trade_cost_basis).await {
             warn!(
                 "[EXEC] ⛔ Circuit breaker blocked (post-cap): {} | market={} | contracts={}",
                 reason, pair.description, max_contracts
@@ -589,7 +615,12 @@ impl ExecutionEngine {
                 }
 
                 if success {
-                    self.circuit_breaker.record_success(&pair.pair_id, matched, matched, actual_profit as f64 / 100.0).await;
+                    self.circuit_breaker.record_success(
+                        &pair.pair_id,
+                        matched, req.yes_price as i64,
+                        matched, req.no_price as i64,
+                        actual_profit as f64 / 100.0,
+                    ).await;
                     // Clear mismatch count on successful matched execution
                     self.circuit_breaker.clear_market_mismatches(&pair.pair_id).await;
                 }

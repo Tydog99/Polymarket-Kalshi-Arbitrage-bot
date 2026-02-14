@@ -40,8 +40,8 @@ fn make_test_pair() -> MarketPair {
 
 fn cb_disabled() -> Arc<CircuitBreaker> {
     Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
-        max_position_per_market: 1_000_000,
-        max_total_position: 1_000_000,
+        max_position_per_market: 1_000_000.0,
+        max_total_position: 1_000_000.0,
         max_daily_loss: 1_000_000.0,
         max_consecutive_errors: 999,
         cooldown_secs: 0,

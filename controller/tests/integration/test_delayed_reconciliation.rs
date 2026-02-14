@@ -77,8 +77,8 @@ fn create_test_market_pair() -> MarketPair {
 /// Create a disabled circuit breaker config for testing.
 fn create_disabled_circuit_breaker() -> CircuitBreaker {
     let config = CircuitBreakerConfig {
-        max_position_per_market: i64::MAX,
-        max_total_position: i64::MAX,
+        max_position_per_market: f64::MAX,
+        max_total_position: f64::MAX,
         max_daily_loss: f64::MAX,
         max_consecutive_errors: u32::MAX,
         cooldown_secs: 0,

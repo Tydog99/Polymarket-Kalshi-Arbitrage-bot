@@ -218,7 +218,7 @@ dotenvx run -- cargo run --release
 - `ARB_THRESHOLD_CENTS` (default: 99, valid: 1-100) - arb exists when total cost ≤ threshold. Invalid values logged and replaced with default.
 - `ARB_MIN_CONTRACTS` (default: 1.0, must be > 0) - minimum executable contracts for valid arb. Invalid values logged and replaced with default.
 
-**Circuit breaker:** `CB_ENABLED`, `CB_MAX_POSITION_PER_MARKET`, `CB_MAX_TOTAL_POSITION`, `CB_MAX_DAILY_LOSS`, `CB_MAX_CONSECUTIVE_ERRORS`, `CB_COOLDOWN_SECS`, `CB_MIN_CONTRACTS` (minimum contracts to execute, trades are capped to remaining capacity), `CB_MARKET_BLACKLIST_THRESHOLD` (default: 3, consecutive mismatches before blacklisting a market), `CB_MARKET_BLACKLIST_SECS` (default: 300, blacklist duration)
+**Circuit breaker:** `CB_ENABLED`, `CB_MAX_POSITION_PER_MARKET` (default: 500, in dollars — maximum dollar exposure per market), `CB_MAX_TOTAL_POSITION` (default: 1000, in dollars — maximum total dollar exposure across all markets), `CB_MAX_DAILY_LOSS`, `CB_MAX_CONSECUTIVE_ERRORS`, `CB_COOLDOWN_SECS`, `CB_MIN_CONTRACTS` (minimum contracts to execute, trades are capped to remaining dollar capacity), `CB_MARKET_BLACKLIST_THRESHOLD` (default: 3, consecutive mismatches before blacklisting a market), `CB_MARKET_BLACKLIST_SECS` (default: 300, blacklist duration)
 
 **HTTP Capture (for debugging/replay):**
 - `CAPTURE_DIR` - Base directory for HTTP capture (unset = disabled)
