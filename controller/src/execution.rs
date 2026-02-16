@@ -26,6 +26,8 @@ use crate::types::{
 use crate::circuit_breaker::CircuitBreaker;
 use crate::position_tracker::{FillRecord, PositionChannel, TradeReason, TradeStatus};
 use crate::config::{KALSHI_WEB_BASE, build_polymarket_url};
+use crate::strategy::{ExecStrategy, StrategyConfig, StrategyResult};
+use crate::strategy_tracker::StrategyTracker;
 
 // =============================================================================
 // HELPER FUNCTIONS
@@ -106,6 +108,8 @@ pub struct ExecutionEngine {
     clock: Arc<NanoClock>,
     pub dry_run: bool,
     test_mode: bool,
+    strategy_config: StrategyConfig,
+    strategy_tracker: StrategyTracker,
 }
 
 impl ExecutionEngine {
@@ -117,6 +121,8 @@ impl ExecutionEngine {
         position_channel: PositionChannel,
         dry_run: bool,
         clock: Arc<NanoClock>,
+        strategy_config: StrategyConfig,
+        strategy_tracker: StrategyTracker,
     ) -> Self {
         let test_mode = std::env::var("TEST_ARB")
             .map(|v| v == "1" || v == "true")
@@ -133,6 +139,8 @@ impl ExecutionEngine {
             clock,
             dry_run,
             test_mode,
+            strategy_config,
+            strategy_tracker,
         }
     }
 
@@ -418,8 +426,33 @@ impl ExecutionEngine {
             });
         }
 
-        // Execute both legs concurrently
-        let result = self.execute_both_legs_async(&req, &pair, max_contracts).await;
+        // Select execution strategy
+        let strategy = self.strategy_config.select();
+        let contracts_requested = max_contracts;
+        let exec_contracts = match strategy {
+            ExecStrategy::Simultaneous => max_contracts,
+            ExecStrategy::MinDepth => {
+                let yes_depth = if req.yes_price > 0 { req.yes_size as i64 / req.yes_price as i64 } else { 0 };
+                let no_depth = if req.no_price > 0 { req.no_size as i64 / req.no_price as i64 } else { 0 };
+                max_contracts.min(yes_depth.min(no_depth))
+            }
+            ExecStrategy::SizeCapped => {
+                let yes_depth = if req.yes_price > 0 { req.yes_size as i64 / req.yes_price as i64 } else { 0 };
+                let no_depth = if req.no_price > 0 { req.no_size as i64 / req.no_price as i64 } else { 0 };
+                max_contracts.min(yes_depth.min(no_depth)).min(self.strategy_config.size_cap)
+            }
+            ExecStrategy::PolyFirst => max_contracts, // sizing happens after Poly fills
+        };
+        let exec_contracts = exec_contracts.max(1); // ensure at least 1
+        info!("[EXEC] Strategy: {} | contracts: {} (requested: {})", strategy, exec_contracts, contracts_requested);
+
+        // Branch execution by strategy
+        let result = if strategy == ExecStrategy::PolyFirst {
+            self.execute_poly_first(&req, &pair, exec_contracts).await
+        } else {
+            self.execute_both_legs_async(&req, &pair, exec_contracts).await
+        };
+        let max_contracts = exec_contracts; // rebind for downstream fill recording
 
         // Release in-flight after delay
         self.release_in_flight_delayed(market_id);
@@ -527,6 +560,25 @@ impl ExecutionEngine {
                             position_channel_for_spawn,
                             timeout_ms,
                         ).await;
+                    });
+
+                    // Record strategy result for delayed order
+                    self.strategy_tracker.record(&StrategyResult {
+                        strategy,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        market_id,
+                        description: pair.description.to_string(),
+                        arb_type: format!("{:?}", req.arb_type),
+                        contracts_requested,
+                        contracts_executed: max_contracts,
+                        yes_filled,
+                        no_filled,
+                        fill_mismatch: yes_filled != no_filled,
+                        auto_close_triggered: false,
+                        profit_cents: 0,
+                        detection_to_exec_ns: self.clock.now_ns() - req.detected_ns,
+                        poly_delayed: true,
+                        error: None,
                     });
 
                     // Return early with success (reconciliation will update position tracker later)
@@ -662,6 +714,25 @@ impl ExecutionEngine {
                     no_failure_reason,
                 ));
 
+                let auto_close_triggered = yes_filled != no_filled && yes_filled > 0 && no_filled > 0;
+                self.strategy_tracker.record(&StrategyResult {
+                    strategy,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    market_id,
+                    description: pair.description.to_string(),
+                    arb_type: format!("{:?}", req.arb_type),
+                    contracts_requested,
+                    contracts_executed: max_contracts,
+                    yes_filled,
+                    no_filled,
+                    fill_mismatch: yes_filled != no_filled,
+                    auto_close_triggered,
+                    profit_cents: actual_profit as i64,
+                    detection_to_exec_ns: self.clock.now_ns() - req.detected_ns,
+                    poly_delayed,
+                    error: None,
+                });
+
                 Ok(ExecutionResult {
                     market_id,
                     success,
@@ -671,6 +742,24 @@ impl ExecutionEngine {
                 })
             }
             Err(_e) => {
+                self.strategy_tracker.record(&StrategyResult {
+                    strategy,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    market_id,
+                    description: pair.description.to_string(),
+                    arb_type: format!("{:?}", req.arb_type),
+                    contracts_requested,
+                    contracts_executed: max_contracts,
+                    yes_filled: 0,
+                    no_filled: 0,
+                    fill_mismatch: false,
+                    auto_close_triggered: false,
+                    profit_cents: 0,
+                    detection_to_exec_ns: self.clock.now_ns() - req.detected_ns,
+                    poly_delayed: false,
+                    error: Some(_e.to_string()),
+                });
+
                 self.circuit_breaker.record_error().await;
                 Ok(ExecutionResult {
                     market_id,
@@ -758,6 +847,141 @@ impl ExecutionEngine {
                 );
                 let (yes_res, no_res) = tokio::join!(yes_fut, no_fut);
                 self.extract_kalshi_only_results(yes_res, no_res)
+            }
+        }
+    }
+
+    /// Sequential execution: await Poly first, then fire Kalshi only for confirmed fills.
+    /// Eliminates phantom-arb losses but is slower (arb may vanish while waiting).
+    async fn execute_poly_first(
+        &self,
+        req: &ArbOpportunity,
+        pair: &MarketPair,
+        contracts: i64,
+    ) -> Result<(i64, i64, i64, i64, i64, i64, String, String, Option<String>, Option<String>, bool)> {
+        match req.arb_type {
+            ArbType::PolyYesKalshiNo => {
+                // Step 1: Execute Poly YES
+                let poly_res = self.poly_async.buy_fak(
+                    &pair.poly_yes_token,
+                    cents_to_price(req.yes_price),
+                    contracts as f64,
+                ).await;
+
+                let (poly_filled, poly_cost, poly_order_id, poly_error, poly_delayed) = match poly_res {
+                    Ok(fill) if fill.is_delayed => {
+                        // Poll delayed order
+                        let timeout_ms: u64 = std::env::var("POLY_DELAYED_TIMEOUT_MS")
+                            .ok().and_then(|v| v.parse().ok()).unwrap_or(5000);
+                        info!("[EXEC] poly_first: Poly delayed, polling order {}", fill.order_id);
+                        match self.poly_async.poll_delayed_order(&fill.order_id, cents_to_price(req.yes_price), timeout_ms).await {
+                            Ok((size, cost)) => ((size as i64), (cost * 100.0) as i64, fill.order_id, None, true),
+                            Err(e) => (0, 0, fill.order_id, Some(e.to_string()), true),
+                        }
+                    }
+                    Ok(fill) => ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id, None, false),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        warn!("[EXEC] poly_first: Poly YES failed: {}", msg);
+                        (0, 0, String::new(), Some(msg), false)
+                    }
+                };
+
+                // Step 2: If Poly filled, fire Kalshi NO for confirmed amount
+                if poly_filled > 0 {
+                    info!("[EXEC] poly_first: Poly filled {} contracts, firing Kalshi NO", poly_filled);
+                    let kalshi_res = self.kalshi.buy_ioc(
+                        &pair.kalshi_market_ticker,
+                        "no",
+                        req.no_price as i64,
+                        poly_filled,
+                    ).await;
+
+                    let (no_filled, no_cost, no_fees, no_order_id, no_error) = match kalshi_res {
+                        Ok(resp) => {
+                            let filled = resp.order.filled_count();
+                            let cost = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
+                            let fees = resp.order.total_fees();
+                            (filled, cost, fees, resp.order.order_id, None)
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            warn!("[EXEC] poly_first: Kalshi NO failed: {}", msg);
+                            (0, 0, 0, String::new(), Some(msg))
+                        }
+                    };
+
+                    Ok((poly_filled, no_filled, poly_cost, no_cost, 0, no_fees,
+                        poly_order_id, no_order_id, poly_error, no_error, poly_delayed))
+                } else {
+                    info!("[EXEC] poly_first: Poly got 0 fills, skipping Kalshi");
+                    Ok((0, 0, 0, 0, 0, 0,
+                        poly_order_id, String::new(), poly_error, None, poly_delayed))
+                }
+            }
+
+            ArbType::KalshiYesPolyNo => {
+                // Step 1: Execute Poly NO first
+                let poly_res = self.poly_async.buy_fak(
+                    &pair.poly_no_token,
+                    cents_to_price(req.no_price),
+                    contracts as f64,
+                ).await;
+
+                let (poly_filled, poly_cost, poly_order_id, poly_error, poly_delayed) = match poly_res {
+                    Ok(fill) if fill.is_delayed => {
+                        let timeout_ms: u64 = std::env::var("POLY_DELAYED_TIMEOUT_MS")
+                            .ok().and_then(|v| v.parse().ok()).unwrap_or(5000);
+                        info!("[EXEC] poly_first: Poly delayed, polling order {}", fill.order_id);
+                        match self.poly_async.poll_delayed_order(&fill.order_id, cents_to_price(req.no_price), timeout_ms).await {
+                            Ok((size, cost)) => ((size as i64), (cost * 100.0) as i64, fill.order_id, None, true),
+                            Err(e) => (0, 0, fill.order_id, Some(e.to_string()), true),
+                        }
+                    }
+                    Ok(fill) => ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id, None, false),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        warn!("[EXEC] poly_first: Poly NO failed: {}", msg);
+                        (0, 0, String::new(), Some(msg), false)
+                    }
+                };
+
+                // Step 2: If Poly filled, fire Kalshi YES
+                if poly_filled > 0 {
+                    info!("[EXEC] poly_first: Poly filled {} contracts, firing Kalshi YES", poly_filled);
+                    let kalshi_res = self.kalshi.buy_ioc(
+                        &pair.kalshi_market_ticker,
+                        "yes",
+                        req.yes_price as i64,
+                        poly_filled,
+                    ).await;
+
+                    let (yes_filled, yes_cost, yes_fees, yes_order_id, yes_error) = match kalshi_res {
+                        Ok(resp) => {
+                            let filled = resp.order.filled_count();
+                            let cost = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
+                            let fees = resp.order.total_fees();
+                            (filled, cost, fees, resp.order.order_id, None)
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            warn!("[EXEC] poly_first: Kalshi YES failed: {}", msg);
+                            (0, 0, 0, String::new(), Some(msg))
+                        }
+                    };
+
+                    Ok((yes_filled, poly_filled, yes_cost, poly_cost, yes_fees, 0,
+                        yes_order_id, poly_order_id, yes_error, poly_error, poly_delayed))
+                } else {
+                    info!("[EXEC] poly_first: Poly got 0 fills, skipping Kalshi");
+                    Ok((0, 0, 0, 0, 0, 0,
+                        String::new(), poly_order_id, None, poly_error, poly_delayed))
+                }
+            }
+
+            // Same-platform arbs: fall back to simultaneous execution
+            ArbType::PolyOnly | ArbType::KalshiOnly => {
+                self.execute_both_legs_async(req, pair, contracts).await
             }
         }
     }

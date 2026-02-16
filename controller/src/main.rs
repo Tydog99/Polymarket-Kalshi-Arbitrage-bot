@@ -1017,6 +1017,8 @@ async fn main() -> Result<()> {
             position_channel,
             dry_run,
             clock.clone(),
+            controller::strategy::StrategyConfig::from_env(),
+            controller::strategy_tracker::StrategyTracker::new(),
         ));
         tokio::spawn(run_execution_loop(exec_rx, engine))
     };
