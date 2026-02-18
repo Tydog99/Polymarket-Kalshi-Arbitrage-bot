@@ -22,4 +22,6 @@ pub mod position_tracker;
 pub mod remote_execution;
 pub mod remote_protocol;
 pub mod remote_trader;
+pub mod strategy;
+pub mod strategy_tracker;
 pub mod types;

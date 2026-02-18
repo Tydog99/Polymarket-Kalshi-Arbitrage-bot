@@ -41,6 +41,8 @@ mod position_tracker;
 mod remote_execution;
 mod remote_protocol;
 mod remote_trader;
+mod strategy;
+mod strategy_tracker;
 mod types;
 
 use anyhow::{Context, Result};
@@ -1017,6 +1019,8 @@ async fn main() -> Result<()> {
             position_channel,
             dry_run,
             clock.clone(),
+            strategy::StrategyConfig::from_env(),
+            strategy_tracker::StrategyTracker::new(),
         ));
         tokio::spawn(run_execution_loop(exec_rx, engine))
     };
