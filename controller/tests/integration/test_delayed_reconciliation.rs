@@ -110,8 +110,8 @@ fn create_test_engine(
         position_channel,
         false, // dry_run = false
         clock,
-        controller::strategy::StrategyConfig { active_strategies: vec![controller::strategy::ExecStrategy::Simultaneous], size_cap: 5 },
-        controller::strategy_tracker::StrategyTracker::new(),
+        arb_bot::strategy::StrategyConfig { active_strategies: vec![arb_bot::strategy::ExecStrategy::Simultaneous], size_cap: 5 },
+        arb_bot::strategy_tracker::StrategyTracker::new(),
     );
 
     (engine, fill_rx)

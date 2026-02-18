@@ -133,8 +133,8 @@ fn create_test_engine(
         position_channel,
         false, // dry_run = false
         clock,
-        controller::strategy::StrategyConfig { active_strategies: vec![controller::strategy::ExecStrategy::Simultaneous], size_cap: 5 },
-        controller::strategy_tracker::StrategyTracker::new(),
+        arb_bot::strategy::StrategyConfig { active_strategies: vec![arb_bot::strategy::ExecStrategy::Simultaneous], size_cap: 5 },
+        arb_bot::strategy_tracker::StrategyTracker::new(),
     );
 
     (engine, fill_rx)
@@ -1156,8 +1156,8 @@ async fn test_event_level_dedup_blocks_second_outcome() {
         position_channel,
         false,
         clock,
-        controller::strategy::StrategyConfig { active_strategies: vec![controller::strategy::ExecStrategy::Simultaneous], size_cap: 5 },
-        controller::strategy_tracker::StrategyTracker::new(),
+        arb_bot::strategy::StrategyConfig { active_strategies: vec![arb_bot::strategy::ExecStrategy::Simultaneous], size_cap: 5 },
+        arb_bot::strategy_tracker::StrategyTracker::new(),
     ));
 
     // Create requests for both outcomes
@@ -1260,8 +1260,8 @@ async fn test_execution_logs_arrive_on_log_tx_when_tui_active() {
         position_channel,
         false,
         clock,
-        controller::strategy::StrategyConfig { active_strategies: vec![controller::strategy::ExecStrategy::Simultaneous], size_cap: 5 },
-        controller::strategy_tracker::StrategyTracker::new(),
+        arb_bot::strategy::StrategyConfig { active_strategies: vec![arb_bot::strategy::ExecStrategy::Simultaneous], size_cap: 5 },
+        arb_bot::strategy_tracker::StrategyTracker::new(),
     ));
 
     // Set up global TUI log channel and tracing subscriber with TuiAwareWriter
